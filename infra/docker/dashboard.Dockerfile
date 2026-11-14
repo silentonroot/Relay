@@ -38,7 +38,7 @@ WORKDIR /app/apps/dashboard
 RUN ./node_modules/.bin/vite build
 
 # ---------------------------------------------------------------------------------------
-FROM nginxinc/nginx-unprivileged:1.30-alpine@sha256:f5116ed4606f3eb015dd4a8e28cb9b351476dc0ad4bc6e9f93b19cec130cdf03 AS runtime
+FROM nginxinc/nginx-unprivileged:1.31-alpine@sha256:b5047b9b76845eac124358373c6852377c52e4b05834a47647e955dd91cb8f1e AS runtime
 
 # nginx-unprivileged runs as uid 101 and listens on 8080. No secrets live in this image:
 # it holds static files and proxy configuration only.
