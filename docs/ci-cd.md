@@ -4,11 +4,16 @@ How changes are checked, how a release is published, and what runs on a schedule
 are GitHub Actions workflows in `.github/workflows/`, written for the repository
 `silentonroot/Relay`.
 
-**Status on 2026-11-14: `ci.yml` has run on GitHub and passed all five jobs; `nightly.yml` and
-`release.yml` have not run.** The repository was pushed on 2026-11-13. The first scheduled
-`nightly` run is due at 03:17 UTC on 2026-11-14. Dependabot has run for all four configured
-ecosystems. The table in [What has and has not been run](#what-has-and-has-not-been-run) says,
-for each job, where it has run. Expect to adjust the jobs marked "not run" on their first runs.
+**Status on 2026-11-14: `ci.yml` has run on GitHub and passed all five jobs; `nightly.yml` ran once
+(run 43585891090, 2026-11-14 10:34 UTC, commit 640bd27) and failed; `release.yml` has not run.**
+In that run "Sandbox isolation tests", "Advisories and secret scan" and "Report a failed
+scheduled run" worked, "End-to-end test" skipped itself (the `NORTHSTAR_DEMO_REPOSITORY`
+variable is not set), and "Rebuild and scan images" failed because the scanner found HIGH and
+CRITICAL vulnerabilities with fixes available, not because the script is broken (see
+[The first nightly failure](#the-first-nightly-failure)). The failure opened issue #4. Dependabot
+has run for all four configured ecosystems. The table in
+[What has and has not been run](#what-has-and-has-not-been-run) says, for each job, where it has
+run.
 
 ## Overview
 
@@ -147,6 +152,39 @@ These cannot be set from files in the repository.
 6. **Package visibility:** the first release creates the three packages on GitHub's registry as
    private; make them public if anyone else should pull them.
 
+### The first nightly failure
+
+The "Rebuild and scan images" job failed on 2026-11-14 at "Build and scan each image". GitHub
+shows only "Process completed with exit code 1" without a signed-in session, so the cause was
+reproduced locally: the three images were built as the job builds them (`docker build --pull`,
+all succeeded) and `infra/ci/scan-image.sh` was run on each. The script works with its
+read-only root filesystem, tmpfs mounts and dropped capabilities: it downloads the database,
+reads the archive and prints a report. It exits 1 because the report is not empty.
+
+Findings with a fix available (Trivy 0.76.2, database of 2026-11-14):
+
+- `dashboard` (Alpine 3.24.2 base): 13 findings in `brotli-libs`, `curl`/`libcurl`, `libexpat`,
+  `libxslt`, `musl`/`musl-utils` and `zlib`. The pinned base image was already the current digest
+  of its tag, but Alpine had published fixed packages. `apk upgrade --no-cache` in the Dockerfile
+  clears all of them (the rescan reports 0).
+- `broker-api` and `browser-runner` (Debian 12.15 base): no operating-system findings, including
+  the Chromium packages. The remaining findings are the same in both images and are not cleared by
+  a newer digest (the pinned digest is the current one for `node:24-bookworm-slim`):
+  - `brace-expansion` 5.0.9 (2 HIGH) and `undici` 6.28.0 (4 HIGH) inside the `npm` that ships with
+    the Node.js base image, under `/usr/local/lib/node_modules/npm`. The images do not run `npm`.
+  - Go standard library CVEs (2 CRITICAL, many HIGH) in the `esbuild` binaries, built with Go
+    1.20.7 (`esbuild@0.18.20`) and Go 1.23.12 (`esbuild@0.25.12`). These come from the root
+    development dependency chain `drizzle-kit@0.31.11` (a devDependency of `packages/database`) which
+    depends on `esbuild@0.25.12` and, through `@esbuild-kit/esm-loader`, on `esbuild@0.18.20`. They
+    are installed because the images install with `--include-workspace-root` and without `--prod`.
+    `esbuild@0.28.2` (used by `tsx`) is not flagged. No released `drizzle-kit` avoids the old
+    esbuild versions (0.31.11 is the latest; the 1.0 beta still depends on `esbuild@^0.25`).
+    Clearing this needs a decision on the lockfile (a `pnpm` override of `esbuild`, or keeping
+    development dependencies out of the images), which is not made here.
+
+The gate is unchanged (`--exit-code 1`, HIGH and CRITICAL, fixed only), so the nightly job keeps
+failing until the Node-based images are clean.
+
 ## What has and has not been run
 
 "Run locally" means the job's commands were executed on a developer machine (Docker 28.5,
@@ -160,10 +198,11 @@ These cannot be set from files in the repository.
 | `ci` / `containers`       | Ran on GitHub and passed. `compose-smoke.sh`, the runner image build and the Docker launcher tests also passed locally.                                                                                        |
 | `ci` / `secret-scan`      | Ran on GitHub and passed.                                                                                                                                                                                      |
 | `ci` / `dependency-audit` | Ran on GitHub and passed.                                                                                                                                                                                      |
-| `nightly` / `sandbox`     | The tests pass locally on Debian with the distribution's Chromium. **`sandbox-prereqs.sh` has never run**, and neither has the suite with Playwright's Chromium build on Ubuntu.                               |
-| `nightly` / `e2e`         | The test passes locally. Never run on a runner; additionally depends on the demo repository's location.                                                                                                        |
-| `nightly` / `image-scan`  | Not run. The scanner has never been run against these images, so the first run may report findings.                                                                                                            |
-| `nightly` / `report`      | Not run.                                                                                                                                                                                                       |
+| `nightly` / `sandbox`     | Ran on GitHub on 2026-11-14 and passed, so `sandbox-prereqs.sh` (without `--postgres`) has run on a runner. The `--postgres` path has not run. Also passes locally on Debian with the distribution's Chromium. |
+| `nightly` / `e2e`         | Ran on 2026-11-14 but skipped itself: the `NORTHSTAR_DEMO_REPOSITORY` variable is not set, so the test has not run on a runner. It passes locally.                                                             |
+| `nightly` / `image-scan`  | Ran on 2026-11-14 and failed. The scanner works (it also ran locally with the same hardening flags); it found fixed HIGH and CRITICAL vulnerabilities in all three images. See the section below.              |
+| `nightly` / `audit`       | Ran on GitHub on 2026-11-14 ("Advisories and secret scan") and passed.                                                                                                                                         |
+| `nightly` / `report`      | Ran on 2026-11-14 and worked: it opened issue #4 "Nightly run failed".                                                                                                                                         |
 | `release`                 | Not run. The two-step build with a `docker-container` builder, the registry push and the attestations are untested.                                                                                            |
 | Dependabot                | Ran for all four ecosystems on 2026-11-13 and opened three pull requests (see below). It finds the `*.Dockerfile` names and updates the pnpm lockfile (the npm pull request passed a frozen-lockfile install). |
 | Workflow syntax           | Parsed as YAML and reviewed by hand. Not checked with `actionlint`.                                                                                                                                            |

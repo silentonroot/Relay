@@ -10,9 +10,9 @@ name: Nightly
 #   audit       dependency advisories, and a secret scan of the full history
 #   report      opens or updates one issue when a scheduled run fails
 #
-# STATUS: the `sandbox` and `e2e` jobs have never run on a GitHub runner. They pass on a
-# developer machine; the runner preparation in infra/ci/sandbox-prereqs.sh is untested. Expect
-# to adjust it on the first runs. See docs/ci-cd.md.
+# STATUS: ran once on GitHub (2026-11-14). `sandbox`, `audit` and `report` worked; `e2e` skipped
+# itself because NORTHSTAR_DEMO_REPOSITORY is not set, so it has not run on a runner; `image-scan`
+# failed on real findings (see docs/ci-cd.md, "The first nightly failure").
 
 on:
   schedule:

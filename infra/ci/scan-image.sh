@@ -14,7 +14,9 @@
 # it is given neither the Docker socket nor the repository. It needs network access to fetch
 # its vulnerability database.
 #
-# STATUS: NOT YET RUN. Written with the nightly and release workflows.
+# STATUS: run on 2026-11-14 by the first nightly run (it failed because the scanner found fixed
+# vulnerabilities, not because of the script) and locally with the same hardening flags, where it
+# produced a full report for all three images. The release workflow has not run it yet.
 set -euo pipefail
 
 scanner='ghcr.io/aquasecurity/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb'

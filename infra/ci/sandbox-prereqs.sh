@@ -7,7 +7,8 @@
 #   infra/ci/sandbox-prereqs.sh             sandbox tests
 #   infra/ci/sandbox-prereqs.sh --postgres  also start PostgreSQL for the end-to-end test
 #
-# STATUS: written for continuous integration and NOT YET RUN there. It uses sudo and changes a
+# STATUS: ran on a GitHub runner in the nightly of 2026-11-14 (without --postgres) and the sandbox
+# tests passed. The --postgres path has not run on a runner. It uses sudo and changes a
 # kernel setting, so it is meant for disposable runners only. Do not run it on a workstation:
 # docs/operations.md describes the local prerequisites instead.
 #

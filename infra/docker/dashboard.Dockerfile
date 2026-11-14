@@ -42,6 +42,15 @@ FROM nginxinc/nginx-unprivileged:1.30-alpine@sha256:f5116ed4606f3eb015dd4a8e28cb
 
 # nginx-unprivileged runs as uid 101 and listens on 8080. No secrets live in this image:
 # it holds static files and proxy configuration only.
+
+# The pinned base image can lag behind Alpine's security fixes, so installed packages are
+# upgraded at build time (the nightly scan found fixed HIGH/CRITICAL findings in curl,
+# libexpat, libxslt, musl, zlib and others on 2026-11-14). The upgrade needs root; the image
+# then returns to the base image's unprivileged user.
+USER root
+RUN apk upgrade --no-cache
+USER 101
+
 COPY infra/docker/nginx/security-headers.conf /etc/nginx/snippets/security-headers.conf
 COPY infra/docker/nginx/default.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/apps/dashboard/dist /usr/share/nginx/html
