@@ -8,7 +8,7 @@
 #
 
 # Base images are pinned by tag and digest. Dependabot proposes digest updates
-# (.github/dependabot.yml); the weekly scan reports known vulnerabilities in the built image.
+# (.github/dependabot.yml); the nightly scan reports known vulnerabilities in the built image.
 
 # ---------------------------------------------------------------------------------------
 FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS build
@@ -47,6 +47,11 @@ FROM nginxinc/nginx-unprivileged:1.30-alpine@sha256:f5116ed4606f3eb015dd4a8e28cb
 # upgraded at build time (the nightly scan found fixed HIGH/CRITICAL findings in curl,
 # libexpat, libxslt, musl, zlib and others on 2026-11-14). The upgrade needs root; the image
 # then returns to the base image's unprivileged user.
+#
+# Trade-off: the package versions in this image now depend on the build date as well as on the
+# pinned base digest, so two builds from the same commit can differ. The scan of each build is
+# the gate, and the SBOM records what was installed. nginx itself is version-pinned by the base
+# image, so only Alpine's own packages move.
 USER root
 RUN apk upgrade --no-cache
 USER 101

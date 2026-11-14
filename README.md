@@ -220,7 +220,7 @@ printf 'AAB_HOST_SECRETS_DIR=%s\nAAB_UID=%s\nAAB_GID=%s\n' \
 
 docker compose --env-file ~/.config/aab/compose.env -f infra/compose.yaml up --build -d
 docker compose --env-file ~/.config/aab/compose.env -f infra/compose.yaml \
-  run --rm broker-api npm run create-owner
+  run --rm broker-api node --import tsx src/scripts/create-owner.ts
 ```
 
 Compose does not run the browser worker, and no key directory is mounted into any container; the
@@ -239,7 +239,7 @@ the dashboard is plain HTTP on loopback; do not expose it beyond loopback withou
 line in `infra/docker/nginx/default.conf` (both are marked in that file) and rebuild with
 `up --build`. Stop with `docker compose --env-file ... -f infra/compose.yaml down`
 (add `--volumes` only to delete the database). The migration runs as the `migrate` service on every
-`up`; it runs `npm run migrate`.
+`up`; it runs `node --import tsx src/scripts/migrate.ts`.
 
 ## Configuration
 

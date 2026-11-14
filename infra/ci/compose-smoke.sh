@@ -102,7 +102,7 @@ compose exec -T broker-api node -e "
   );" || fail "the API container has outbound network access"
 
 say "owner bootstrap, login and a denied operation"
-compose exec -T broker-api npm run --silent create-owner -- --email owner@example.test \
+compose exec -T broker-api node --import tsx src/scripts/create-owner.ts --email owner@example.test \
   <"${work}/owner_password" >/dev/null
 python3 - "${base}" "${work}/owner_password" <<'PY'
 import http.cookiejar, json, sys, urllib.error, urllib.request

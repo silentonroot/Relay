@@ -165,25 +165,43 @@ Findings with a fix available (Trivy 0.76.2, database of 2026-11-14):
 
 - `dashboard` (Alpine 3.24.2 base): 13 findings in `brotli-libs`, `curl`/`libcurl`, `libexpat`,
   `libxslt`, `musl`/`musl-utils` and `zlib`. The pinned base image was already the current digest
-  of its tag, but Alpine had published fixed packages. `apk upgrade --no-cache` in the Dockerfile
-  clears all of them (the rescan reports 0).
+  of its tag, but Alpine had published fixed packages.
 - `broker-api` and `browser-runner` (Debian 12.15 base): no operating-system findings, including
-  the Chromium packages. The remaining findings are the same in both images and are not cleared by
+  the Chromium packages. The remaining findings were the same in both images and are not cleared by
   a newer digest (the pinned digest is the current one for `node:24-bookworm-slim`):
   - `brace-expansion` 5.0.9 (2 HIGH) and `undici` 6.28.0 (4 HIGH) inside the `npm` that ships with
-    the Node.js base image, under `/usr/local/lib/node_modules/npm`. The images do not run `npm`.
+    the Node.js base image, under `/usr/local/lib/node_modules/npm`.
   - Go standard library CVEs (2 CRITICAL, many HIGH) in the `esbuild` binaries, built with Go
-    1.20.7 (`esbuild@0.18.20`) and Go 1.23.12 (`esbuild@0.25.12`). These come from the root
-    development dependency chain `drizzle-kit@0.31.11` (a devDependency of `packages/database`) which
-    depends on `esbuild@0.25.12` and, through `@esbuild-kit/esm-loader`, on `esbuild@0.18.20`. They
-    are installed because the images install with `--include-workspace-root` and without `--prod`.
-    `esbuild@0.28.2` (used by `tsx`) is not flagged. No released `drizzle-kit` avoids the old
-    esbuild versions (0.31.11 is the latest; the 1.0 beta still depends on `esbuild@^0.25`).
-    Clearing this needs a decision on the lockfile (a `pnpm` override of `esbuild`, or keeping
-    development dependencies out of the images), which is not made here.
+    1.20.7 (`esbuild@0.18.20`) and Go 1.23.12 (`esbuild@0.25.12`). These came from the development
+    dependency chain `drizzle-kit@0.31.11` (a devDependency of `packages/database`), which depends
+    on `esbuild@0.25.12` and, through `@esbuild-kit/esm-loader`, on `esbuild@0.18.20`. They were
+    installed because the images installed the whole workspace with `--include-workspace-root` and
+    without `--prod`. `esbuild@0.28.2` (used by `tsx`) is not flagged.
 
-The gate is unchanged (`--exit-code 1`, HIGH and CRITICAL, fixed only), so the nightly job keeps
-failing until the Node-based images are clean.
+What was changed. The gate (`--exit-code 1`, HIGH and CRITICAL, fixed only) is unchanged, and no
+ignore file or `pnpm` override was added; the unused software was removed rather than updated.
+
+- **Dashboard:** `apk upgrade --no-cache` in `infra/docker/dashboard.Dockerfile`. The trade-off is
+  that the image's Alpine package versions now depend on the build date as well as on the pinned
+  base digest, so two builds from the same commit can differ. The scan of each build is the gate,
+  and the SBOM that the release workflow attaches records what was installed. nginx itself is
+  version-pinned by the base image; only Alpine's own packages move.
+- **Production-only installs (`broker-api`, `browser-runner`):** `pnpm install --frozen-lockfile
+--prod --filter "@aab/<service>..."` without the workspace root. `tsx`, which runs the
+  TypeScript sources, is now a dependency of `@aab/broker-api` and `@aab/browser-worker` (the root
+  devDependency stays for local use). Neither image needs a development dependency to run. The
+  one development-only script that does, `services/broker-api/src/scripts/dev-memory.ts` (it needs
+  PGlite), does not work inside the image.
+- **Package managers removed:** the runtime stage of both Node images deletes npm, corepack and
+  yarn in a layer right after `FROM`. This hides them from the image's filesystem; the files remain
+  in the base image's layer, so the image is not smaller because of it. Because npm is gone, the
+  Compose `migrate` service and the owner bootstrap start the scripts with
+  `node --import tsx src/scripts/<name>.ts` instead of `npm run`.
+
+Result of the local rescan (same commands as the nightly job: `docker build --pull`, then
+`infra/ci/scan-image.sh`): all three images exit 0 with no findings. Sizes: `broker-api` 457 MB to
+297 MB, `browser-runner` 1.15 GB to 991 MB, `dashboard` unchanged at 65.6 MB. The nightly job has
+not yet run on GitHub with these changes.
 
 ## What has and has not been run
 

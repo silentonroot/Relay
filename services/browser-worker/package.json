@@ -21,6 +21,7 @@
     "@aab/database": "workspace:*",
     "pino": "^10.4.0",
     "playwright-core": "^1.60.0",
+    "tsx": "^4.23.15",
     "zod": "^4.6.7",
     "@aab/policy-engine": "workspace:*"
   },

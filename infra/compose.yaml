@@ -87,7 +87,7 @@ services:
     build: *broker-api-build
     image: aab/broker-api:local
     user: '${AAB_UID:-1000}:${AAB_GID:-1000}'
-    command: ['npm', 'run', 'migrate']
+    command: ['node', '--import', 'tsx', 'src/scripts/migrate.ts']
     env_file: *broker-api-env-file
     environment:
       AAB_LOG_LEVEL: '${AAB_LOG_LEVEL:-info}'

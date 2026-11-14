@@ -17,7 +17,7 @@
 # snapshot) arrives on stdin and the egress socket is bind-mounted per job at /run/aab.
 
 # Base images are pinned by tag and digest. Dependabot proposes digest updates
-# (.github/dependabot.yml); the weekly scan reports known vulnerabilities in the built image.
+# (.github/dependabot.yml); the nightly scan reports known vulnerabilities in the built image.
 
 # ---------------------------------------------------------------------------------------
 FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS build
@@ -39,8 +39,14 @@ COPY packages/database/package.json packages/database/
 COPY packages/policy-engine/package.json packages/policy-engine/
 COPY services/browser-worker/package.json services/browser-worker/
 
-# `tsx` is a root devDependency today, hence --include-workspace-root.
-RUN pnpm install --frozen-lockfile --filter "@aab/browser-worker..." --include-workspace-root
+# Production dependencies only, and not the workspace root: `tsx`, which runs the TypeScript
+# sources, is a dependency of @aab/browser-worker, and the development toolchain is not needed.
+RUN pnpm install --frozen-lockfile --prod --filter "@aab/browser-worker..."
+
+# The launcher starts the runner with the working directory /app (services/browser-worker/src/
+# sandbox/docker.ts), where `node --import tsx` looks for `tsx` in /app/node_modules. Without
+# the workspace root there is no `tsx` there, so link the service's copy.
+RUN ln -s ../services/browser-worker/node_modules/tsx node_modules/tsx
 
 COPY packages/contracts packages/contracts
 COPY packages/adapter-sdk packages/adapter-sdk
@@ -54,6 +60,14 @@ COPY services/browser-worker/src services/browser-worker/src
 # ---------------------------------------------------------------------------------------
 FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS runtime
 
+# The Node base image bundles npm, corepack and yarn. This container runs `node` directly and
+# never uses them, and the scanner flags the dependencies inside npm. This layer hides them
+# from the image's filesystem; the files remain in the base image's layer (the image is not
+# smaller), but they are not visible in the final image, so nothing there can run them.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+      /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+      /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn-v*
+
 # Debian's Chromium (the runner always passes executablePath; Playwright downloads nothing)
 # and fonts. No other packages.
 RUN apt-get update \
@@ -62,8 +76,7 @@ RUN apt-get update \
 
 ENV NODE_ENV=production \
     HOME=/home/runner \
-    TMPDIR=/tmp \
-    npm_config_update_notifier=false
+    TMPDIR=/tmp
 
 # Application files are owned by root and read-only to the runtime user. The supervisor runs
 # the container with --user <its own uid:gid> (never root) so the runner can open the
