@@ -1,0 +1,214 @@
+name: Nightly
+
+# Scheduled maintenance. Everything here either takes too long for a pull request or reports
+# on things that change without a commit (new advisories, new base-image vulnerabilities).
+#
+#   sandbox     the bubblewrap + Chromium isolation tests, with skipping turned into failure
+#   e2e         the 15-step end-to-end test against the Northstar demo (needs the repository
+#               variable NORTHSTAR_DEMO_REPOSITORY; skipped with a notice without it)
+#   image-scan  rebuilds the three images and scans them for known vulnerabilities
+#   audit       dependency advisories, and a secret scan of the full history
+#   report      opens or updates one issue when a scheduled run fails
+#
+# STATUS: the `sandbox` and `e2e` jobs have never run on a GitHub runner. They pass on a
+# developer machine; the runner preparation in infra/ci/sandbox-prereqs.sh is untested. Expect
+# to adjust it on the first runs. See docs/ci-cd.md.
+
+on:
+  schedule:
+    # 03:17 UTC every day. An odd minute, because the top of the hour is congested.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+
+jobs:
+  sandbox:
+    name: Sandbox isolation tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      - name: Prepare the runner
+        run: infra/ci/sandbox-prereqs.sh
+
+      - name: Run the browser-worker suite with the sandbox tests required
+        # AAB_REQUIRE_INTEGRATION turns a missing prerequisite into a failure. Without it
+        # these tests skip, and a skipped isolation test proves nothing.
+        env:
+          AAB_REQUIRE_INTEGRATION: '1'
+        run: pnpm --filter @aab/browser-worker run test
+
+  e2e:
+    name: End-to-end test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Explain why this job does nothing
+        if: vars.NORTHSTAR_DEMO_REPOSITORY == ''
+        run: |
+          echo "::notice::The end-to-end test was skipped: set the repository variable NORTHSTAR_DEMO_REPOSITORY (owner/name of the Northstar demo repository) to enable it."
+
+      - name: Check out the broker
+        if: vars.NORTHSTAR_DEMO_REPOSITORY != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: broker
+          persist-credentials: false
+
+      - name: Check out the Northstar demo
+        if: vars.NORTHSTAR_DEMO_REPOSITORY != ''
+        # The demo is a separate repository on purpose (it must not depend on the broker).
+        # It must be public, or this step needs a token with read access to it.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.NORTHSTAR_DEMO_REPOSITORY }}
+          path: northstar-demo
+          persist-credentials: false
+
+      - name: Set up Node.js
+        if: vars.NORTHSTAR_DEMO_REPOSITORY != ''
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install dependencies of both repositories
+        if: vars.NORTHSTAR_DEMO_REPOSITORY != ''
+        run: |
+          corepack enable
+          (cd broker && pnpm install --frozen-lockfile)
+          (cd northstar-demo && pnpm install --frozen-lockfile)
+
+      - name: Prepare the runner
+        if: vars.NORTHSTAR_DEMO_REPOSITORY != ''
+        working-directory: broker
+        run: infra/ci/sandbox-prereqs.sh --postgres
+
+      - name: Run the end-to-end test
+        if: vars.NORTHSTAR_DEMO_REPOSITORY != ''
+        working-directory: broker
+        env:
+          AAB_E2E_DEMO_DIR: ${{ github.workspace }}/northstar-demo
+          AAB_E2E_KEEP_LOGS: ${{ runner.temp }}/e2e-logs
+        run: pnpm run test:e2e
+
+      - name: Keep the service logs when the test fails
+        if: failure() && vars.NORTHSTAR_DEMO_REPOSITORY != ''
+        # The test scans these same logs for secrets and fails if it finds any, and all data
+        # is synthetic. They are kept for seven days to make a failure diagnosable.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-logs
+          path: ${{ runner.temp }}/e2e-logs
+          retention-days: 7
+          if-no-files-found: ignore
+
+  image-scan:
+    name: Rebuild and scan images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and scan each image
+        # Fails on a HIGH or CRITICAL vulnerability that has a fix available. The scanner image
+        # is pinned by digest and reads an image archive, so it needs no Docker socket.
+        run: |
+          status=0
+          for name in broker-api dashboard browser-runner; do
+            echo "::group::${name}"
+            docker build --pull --file "infra/docker/${name}.Dockerfile" --tag "aab/${name}:scan" .
+            infra/ci/scan-image.sh "aab/${name}:scan" || status=1
+            echo "::endgroup::"
+          done
+          exit "${status}"
+
+  audit:
+    name: Advisories and secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Audit runtime dependencies
+        run: |
+          corepack enable
+          pnpm audit --prod --audit-level high
+
+      - name: Scan history with gitleaks
+        if: always()
+        run: |
+          docker run --rm --network none \
+            --user "$(id -u):$(id -g)" --env HOME=/tmp \
+            --volume "$GITHUB_WORKSPACE:/repo:ro" \
+            ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /repo --redact --no-banner --exit-code 1
+
+  report:
+    name: Report a failed scheduled run
+    needs: [sandbox, e2e, image-scan, audit]
+    # Only for scheduled runs: a manual run is watched by whoever started it.
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the tracking issue
+        # One open issue at a time, found by its title; later failures add a comment. The
+        # text contains job results and a link only, never log content.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESULTS: >-
+            sandbox=${{ needs.sandbox.result }},
+            e2e=${{ needs.e2e.result }},
+            image-scan=${{ needs.image-scan.result }},
+            audit=${{ needs.audit.result }}
+        run: |
+          title="Nightly run failed"
+          body="The scheduled run failed: ${RESULTS}. Run: ${RUN_URL}"
+          number="$(gh issue list --state open --search "\"${title}\" in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "${number}" ]; then
+            gh issue comment "${number}" --body "${body}"
+          else
+            gh issue create --title "${title}" --body "${body}"
+          fi

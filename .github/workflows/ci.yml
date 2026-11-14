@@ -1,0 +1,227 @@
+name: CI
+
+# Runs on every pull request and on every push to main. The release workflow calls it too, so
+# a version tag is published only from a commit that passes exactly these jobs.
+#
+# What is deliberately NOT here: the bubblewrap sandbox tests and the end-to-end test. They need
+# a browser, a display and user namespaces, take minutes, and run every night instead
+# (nightly.yml). See docs/ci-cd.md.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_call:
+
+# Least privilege: every job only reads the repository. No job needs or references secrets.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+
+# Third-party code is limited to GitHub's own actions, pinned to commit SHAs; the trailing
+# comment names the tag each SHA was resolved from. Update the SHA and the comment together
+# (Dependabot does). Everything else is a command or a container image pinned by digest.
+
+jobs:
+  verify:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          # The pnpm store is cached explicitly below.
+          package-manager-cache: false
+
+      - name: Enable pnpm through corepack
+        # The pnpm version comes from the `packageManager` field in package.json.
+        run: corepack enable
+
+      - name: Locate the pnpm store
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the pnpm store
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - name: Install dependencies
+        # --frozen-lockfile fails if package.json and the lockfile disagree. pnpm also
+        # verifies the lockfile against the minimum-release-age policy here.
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Check formatting
+        run: pnpm run format:check
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Test
+        # Database tests run on in-process PGlite here; the `database` job repeats them on a
+        # real server. The sandbox and Docker launcher tests skip in this job: the first run
+        # nightly, the second in the `containers` job.
+        run: pnpm run test
+
+      - name: Build the dashboard
+        run: pnpm --filter @aab/dashboard run build
+
+  database:
+    name: Database suite on PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18-bookworm@sha256:ece55f7868da684e400f82f1030a050718adbdd65c23aa500c486f6e2950dc0f
+        env:
+          # A throwaway server that exists for this job only. Not a secret.
+          POSTGRES_PASSWORD: ci-throwaway
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username=postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      - name: Run the database suite, including the concurrent job-claim test
+        # The same suite as in `verify`, on node-postgres with real connections. The
+        # concurrency test only runs here.
+        env:
+          AAB_TEST_DATABASE_URL: postgres://postgres:ci-throwaway@127.0.0.1:5432/postgres
+        run: pnpm --filter @aab/database run test
+
+  containers:
+    name: Images, Compose stack, Docker launcher
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the images, start the Compose stack and check it
+        # Builds the API and dashboard images, starts infra/compose.yaml with secrets generated
+        # for this run, and checks health, security headers, Host rejection, migrations,
+        # container hardening, owner bootstrap, login and a denied operation.
+        run: infra/ci/compose-smoke.sh
+
+      - name: Build the browser-runner image
+        run: docker build --file infra/docker/browser-runner.Dockerfile --tag aab/browser-runner:local .
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      - name: Run a job through the Docker launcher
+        # AAB_REQUIRE_DOCKER makes a skipped test a failure. The runtime directory holds the
+        # per-job socket and must be short and private.
+        env:
+          AAB_REQUIRE_DOCKER: '1'
+        run: |
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/rt"
+          mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+          pnpm --filter @aab/browser-worker exec vitest run \
+            test/integration/docker.test.ts test/sandbox-args.test.ts
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan history with gitleaks
+        # Runs the scanner image directly instead of a wrapper action, so the job needs no
+        # token. The image is pinned by digest, the repository is mounted read-only, and
+        # the container has no network. Findings are redacted in the log.
+        #
+        # The container runs as the runner's own uid so git does not reject the mounted
+        # repository as owned by another user ("dubious ownership").
+        run: |
+          docker run --rm --network none \
+            --user "$(id -u):$(id -g)" --env HOME=/tmp \
+            --volume "$GITHUB_WORKSPACE:/repo:ro" \
+            ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /repo --redact --no-banner --exit-code 1
+
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Enable pnpm through corepack
+        run: corepack enable
+
+      - name: Audit runtime dependencies (blocking)
+        # Threshold: a known high or critical advisory in anything that ships blocks the
+        # change.
+        run: pnpm audit --prod --audit-level high
+
+      - name: Audit all dependencies (report only)
+        # Non-blocking on purpose. This pass includes development tooling (linters, test
+        # runners, bundlers) at a lower threshold. An advisory there is published on the
+        # registry's schedule, not ours, and would otherwise fail unrelated pull requests
+        # for code that never runs in the broker. The output is for triage; the blocking
+        # gate for shipped code is the step above.
+        continue-on-error: true
+        run: pnpm audit --audit-level moderate

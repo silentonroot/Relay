@@ -1,0 +1,30 @@
+{
+  "name": "@aab/browser-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start": "node --import tsx src/main.ts",
+    "init-kek": "node --import tsx src/scripts/init-kek.ts"
+  },
+  "dependencies": {
+    "@aab/contracts": "workspace:*",
+    "@aab/adapter-sdk": "workspace:*",
+    "@aab/adapter-northstar": "workspace:*",
+    "@aab/audit": "workspace:*",
+    "@aab/crypto": "workspace:*",
+    "@aab/database": "workspace:*",
+    "pino": "^10.4.0",
+    "playwright-core": "^1.60.0",
+    "zod": "^4.6.7",
+    "@aab/policy-engine": "workspace:*"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16"
+  }
+}

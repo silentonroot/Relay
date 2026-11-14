@@ -1,0 +1,37 @@
+{
+  "name": "@aab/broker-api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "tsx watch src/main.ts",
+    "start": "node --import tsx src/main.ts",
+    "migrate": "node --import tsx src/scripts/migrate.ts",
+    "create-owner": "node --import tsx src/scripts/create-owner.ts",
+    "dev:memory": "node --import tsx src/scripts/dev-memory.ts"
+  },
+  "dependencies": {
+    "@aab/contracts": "workspace:*",
+    "@aab/database": "workspace:*",
+    "@aab/audit": "workspace:*",
+    "@aab/crypto": "workspace:*",
+    "@aab/policy-engine": "workspace:*",
+    "fastify": "^5.12.8",
+    "@fastify/cookie": "^11.1.5",
+    "@fastify/helmet": "^13.2.0",
+    "@fastify/rate-limit": "^11.2.2",
+    "@fastify/swagger": "^9.9.3",
+    "fastify-type-provider-zod": "^7.0.0",
+    "zod": "^4.6.7",
+    "@aab/adapter-sdk": "workspace:*",
+    "@aab/adapter-northstar": "workspace:*"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16"
+  }
+}

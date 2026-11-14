@@ -1,0 +1,178 @@
+# Agent Access Broker: local, loopback-only Compose setup.
+#
+#   docker compose -f infra/compose.yaml up --build
+#
+# Status: built and started on 2026-11-13 (Docker 28.5, Compose 2.40): all services came up
+# healthy, migrations ran, and the API answered through the dashboard's nginx. Not yet run in CI.
+# See README.md ("Run with Docker Compose") for the one-time setup.
+#
+# Compose reads `.env` from this file's directory, not the repository root, so pass
+# variables with `--env-file` or the shell environment.
+#
+# Required variables (shell environment or `--env-file`); there are no committed defaults
+# for anything sensitive:
+#   AAB_HOST_SECRETS_DIR  host directory holding `postgres_password` and `broker-api.env`
+# Optional:
+#   AAB_UID / AAB_GID     uid/gid the API runs as (default 1000:1000)
+#   AAB_DASHBOARD_PORT    loopback port for the dashboard (default 8080); keep it in step with
+#                         the allowed host names in infra/docker/nginx/default.conf
+#
+# This file does not build or reference the Northstar demo. The demo is a separate
+# repository with its own Compose file.
+
+name: aab
+
+x-hardening: &hardening
+  init: true
+  restart: unless-stopped
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+x-broker-api-build: &broker-api-build
+  context: ..
+  dockerfile: infra/docker/broker-api.Dockerfile
+
+x-broker-api-env-file: &broker-api-env-file
+  # Created locally by the operator; contains DATABASE_URL (which embeds the database
+  # password). Never committed.
+  - '${AAB_HOST_SECRETS_DIR:?set AAB_HOST_SECRETS_DIR to a directory outside the repository}/broker-api.env'
+
+services:
+  postgres:
+    <<: *hardening
+    image: postgres:18-bookworm@sha256:ece55f7868da684e400f82f1030a050718adbdd65c23aa500c486f6e2950dc0f
+    # The official entrypoint starts as root to prepare the data directory, then drops to
+    # the postgres user. These are the capabilities that step needs; everything else is
+    # dropped.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    environment:
+      POSTGRES_USER: aab
+      POSTGRES_DB: aab
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      # PostgreSQL 18 images keep data under /var/lib/postgresql/<major>/docker.
+      - postgres-data:/var/lib/postgresql
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+    shm_size: 128mb
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready --username=aab --dbname=aab']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    # No host port is published. To inspect the database:
+    #   docker compose -f infra/compose.yaml exec postgres psql --username=aab aab
+    networks:
+      - backend
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 200
+
+  # One-shot: applies database migrations, then exits. The API waits for it.
+  migrate:
+    <<: *hardening
+    restart: 'no'
+    build: *broker-api-build
+    image: aab/broker-api:local
+    user: '${AAB_UID:-1000}:${AAB_GID:-1000}'
+    command: ['npm', 'run', 'migrate']
+    env_file: *broker-api-env-file
+    environment:
+      AAB_LOG_LEVEL: '${AAB_LOG_LEVEL:-info}'
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 200
+
+  broker-api:
+    <<: *hardening
+    build: *broker-api-build
+    image: aab/broker-api:local
+    user: '${AAB_UID:-1000}:${AAB_GID:-1000}'
+    env_file: *broker-api-env-file
+    environment:
+      AAB_HOST: 0.0.0.0
+      AAB_PORT: '4000'
+      AAB_SESSION_TTL_MINUTES: '${AAB_SESSION_TTL_MINUTES:-480}'
+      # The dashboard is served over plain HTTP on loopback here, so the session cookie
+      # cannot be marked Secure. Anything reachable beyond loopback must terminate TLS
+      # and set this to true.
+      AAB_COOKIE_SECURE: '${AAB_COOKIE_SECURE:-false}'
+      AAB_LOG_LEVEL: '${AAB_LOG_LEVEL:-info}'
+      # The API is reachable only through the dashboard's nginx on the internal network,
+      # which overwrites X-Forwarded-For. Trusting it gives rate limiting the real client.
+      AAB_TRUST_PROXY: 'true'
+    # No key directory is mounted here, and the API refuses to start if AAB_KEK_DIR is set.
+    # Only the browser worker's supervisor holds the key-encryption key in Phase 2 (ADR-013),
+    # and this file does not run the worker. Phase 3 moves the key behind the vault service.
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # No host port is published; the browser reaches the API through the dashboard.
+    networks:
+      - backend
+    # Each owner login runs scrypt with about 128 MiB of memory. The API limits concurrent
+    # password verifications to 2 by default, so worst case is 2 x 128 MiB = 256 MiB for
+    # hashing, plus the Node.js heap, the PostgreSQL client pool, request buffers and
+    # the 64 MiB /tmp tmpfs (up to 64 MiB, counted against the container). 768 MiB leaves
+    # about 450 MiB for everything else. If you raise the concurrency limit, raise this
+    # by 128 MiB for each additional verification.
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 200
+
+  dashboard:
+    <<: *hardening
+    build:
+      context: ..
+      dockerfile: infra/docker/dashboard.Dockerfile
+    image: aab/dashboard:local
+    ports:
+      - '127.0.0.1:${AAB_DASHBOARD_PORT:-8080}:8080'
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    depends_on:
+      broker-api:
+        condition: service_healthy
+    networks:
+      - backend
+      - edge
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 100
+
+networks:
+  # No route out: the database and the API cannot open outbound connections.
+  backend:
+    internal: true
+  # Exists only so the dashboard can publish its loopback port.
+  edge: {}
+
+volumes:
+  postgres-data: {}
+
+secrets:
+  postgres_password:
+    file: '${AAB_HOST_SECRETS_DIR:?set AAB_HOST_SECRETS_DIR to a directory outside the repository}/postgres_password'

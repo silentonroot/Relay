@@ -1,0 +1,67 @@
+# Dependency update proposals. Dependabot opens pull requests; nothing is merged automatically,
+# and every proposal goes through the same CI as any other change.
+#
+# `cooldown` keeps a new release from being proposed for a few days after it is published. The
+# package manager enforces a separate, shorter minimum release age at install time
+# (pnpm-workspace.yaml), so a proposal that arrives too early fails CI instead of installing.
+#
+# STATUS: not yet exercised. In particular, check on the first run that Dependabot can update
+# this repository's pnpm lockfile format.
+
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 5
+    open-pull-requests-limit: 5
+    groups:
+      # One pull request for routine tooling updates; runtime dependencies stay separate so
+      # each can be read on its own.
+      development-tooling:
+        dependency-type: development
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 5
+    commit-message:
+      prefix: ci
+
+  # Base images in the Dockerfiles, pinned by tag and digest.
+  - package-ecosystem: docker
+    directory: /infra/docker
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Etc/UTC
+    commit-message:
+      prefix: docker
+
+  # The PostgreSQL image in infra/compose.yaml.
+  - package-ecosystem: docker-compose
+    directory: /infra
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Etc/UTC
+    commit-message:
+      prefix: docker

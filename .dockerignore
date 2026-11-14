@@ -1,0 +1,36 @@
+# Build context is the repository root. Keep it small and free of local state.
+
+# Dependencies and build output are produced inside the image.
+**/node_modules
+**/dist
+**/coverage
+**/*.tsbuildinfo
+
+# Version control and CI metadata.
+.git
+.github
+
+# Local configuration and key material must never enter an image layer.
+.env
+.env.*
+!.env.example
+**/*.pem
+**/*.key
+**/*.kek
+.aab
+var
+
+# Browser automation artifacts can contain session data.
+playwright-report
+test-results
+traces
+**/*.har
+
+# Not needed at runtime.
+docs
+tests
+**/test
+**/*.test.ts
+**/*.test.tsx
+**/*.md
+infra/compose.yaml

@@ -1,0 +1,8 @@
+packages:
+  - 'apps/*'
+  - 'services/*'
+  - 'packages/*'
+  - 'packages/adapters/*'
+allowBuilds:
+  esbuild: true
+minimumReleaseAge: 1440

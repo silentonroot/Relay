@@ -1,0 +1,22 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local configuration and key material. Never commit these.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.kek
+.aab/
+var/
+
+# Browser automation artifacts can contain session data.
+playwright-report/
+test-results/
+traces/
+*.har
+
+.DS_Store
