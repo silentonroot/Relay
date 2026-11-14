@@ -9,7 +9,8 @@ service yet: the worker's supervisor reads the key directly, and the cryptograph
 externally reviewed. The Compose setup does not run the worker and does not mount or configure a
 key directory. On 2026-11-13 the container images were built and the Compose stack was started once
 by hand and checked (see "Run with Docker Compose" below); that was a manual check, not an automated
-test, and CI does not build the images or start the stack. The Docker launcher for sandboxed jobs was
+test; the `containers` job in CI now builds the images and starts the stack, and passed on its
+first run on GitHub (2026-11-13). The Docker launcher for sandboxed jobs was
 also run that day. It works only in its default mode, with Chromium's own sandbox off, and it cannot
 show the sign-in window (see `AAB_WORKER_SANDBOX` below). On a local machine the worker uses
 bubblewrap by default.
@@ -123,8 +124,9 @@ an ungranted `POST /v1/operations/execute` got 403 `denied` with no job row, and
 the CSRF header got 403 `csrf_failed`; and 30 concurrent wrong-password logins gave 4 responses of 401
 and 26 of 429 with a peak of 365 MiB against the 768 MiB limit. The stack was then removed.
 
-These were manual checks, not automated tests. CI does not build the images or start the stack, so a
-change can break them unnoticed (AAB-031). Compose still has no worker service and no container holds
+These were manual checks. The `containers` job in CI now builds the images, starts the stack and
+asserts the main ones, so a change that breaks them fails CI (AAB-031; first GitHub run passed on
+2026-11-13). Compose still has no worker service and no container holds
 a key; run the worker on the host. Base images are pinned by tag and digest. Two Dockerfiles needed
 a fix on that first build: the API and runner images did not copy the workspace packages added in
 Phase 2 (`packages/adapter-sdk`, `packages/adapters/northstar`, `packages/policy-engine`). If a build

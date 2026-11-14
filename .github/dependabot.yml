@@ -5,8 +5,11 @@
 # package manager enforces a separate, shorter minimum release age at install time
 # (pnpm-workspace.yaml), so a proposal that arrives too early fails CI instead of installing.
 #
-# STATUS: not yet exercised. In particular, check on the first run that Dependabot can update
-# this repository's pnpm lockfile format.
+# STATUS: exercised on 2026-11-13. All four ecosystems ran and opened pull requests; Dependabot
+# finds the `*.Dockerfile` names in infra/docker and updates the pnpm lockfile.
+#
+# Major versions of the `node` image and of `@types/node` are ignored: the project targets Node 24,
+# and a move to a new Node line is deliberate. The first proposal, Node 25, failed the image build.
 
 version: 2
 
@@ -21,6 +24,11 @@ updates:
     cooldown:
       default-days: 5
     open-pull-requests-limit: 5
+    # The project targets Node 24, so a new @types/node major is a deliberate decision (it moves
+    # with the Node line), not a routine update. Minor and patch updates are still proposed.
+    ignore:
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
     groups:
       # One pull request for routine tooling updates; runtime dependencies stay separate so
       # each can be read on its own.
@@ -52,6 +60,11 @@ updates:
       day: monday
       time: '06:00'
       timezone: Etc/UTC
+    # Node 24 is the project's Node line; a major bump of the base image is a deliberate decision
+    # (Node 25 broke the image build). Minor, patch and digest updates are still proposed.
+    ignore:
+      - dependency-name: node
+        update-types: ['version-update:semver-major']
     commit-message:
       prefix: docker
 

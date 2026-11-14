@@ -94,9 +94,10 @@ Not verified, or known gaps (each is listed in the threat model and the [backlog
   session there, and can return false data that passes the output schema.
 - A compromised supervisor, host, kernel or sandbox is out of scope. The supervisor holds the key
   until Phase 3.
-- Continuous integration does not run the sandbox tests or the end-to-end test, and CI has never
-  run on a hosting service. It does not build the container images or start the Compose stack
-  either; those were checked once by hand, and base images are pinned by tag and digest.
+- Continuous integration does not run the sandbox tests or the end-to-end test; they are in the
+  nightly workflow, which has not run yet. The `ci` workflow has run on GitHub and passed, and
+  its `containers` job builds the container images and starts the Compose stack. Base images are
+  pinned by tag and digest.
 - The dashboard's Phase 2 screens are tested against a mock API only, not in a browser against the
   real API.
 - Job results are stored unencrypted in the database for 60 minutes by default.
@@ -192,8 +193,9 @@ same scripts under `node --import tsx` rather than through `pnpm`.
 Status: validated with `docker compose config` in CI. On 2026-11-13 the images built and the stack
 started on the first attempt (PostgreSQL healthy, `migrate` exited 0, API and dashboard healthy, only
 `127.0.0.1:8080` published) and the checks in the [threat model](docs/threat-model.md) (section 6.1)
-passed by hand; the stack was then removed. That was a manual check, not an automated test, and CI
-does not build the images or start the stack.
+passed by hand; the stack was then removed. That was a manual check, not an automated test; the
+`containers` job in CI now builds the images and starts the stack, and passed on its first run on
+GitHub (2026-11-13).
 
 The Compose file runs PostgreSQL, a one-shot migration, the API, and an nginx container that serves
 the dashboard build and proxies `/v1` to the API. Only the dashboard is published on the host, on
@@ -280,8 +282,9 @@ Three workflows and a Dependabot configuration are written for the repository's 
   attestation, and a GitHub release. There is no deployment workflow, because AAB runs on its
   owner's machine.
 
-None of them has run on GitHub yet. The commands behind the `ci.yml` jobs were run on a developer
-machine; the nightly runner preparation and the release workflow were not.
+`ci.yml` has run on GitHub: its first run, on 2026-11-13, passed all five jobs. `nightly.yml` and
+`release.yml` have not run yet, so the nightly runner preparation and the image scanner have never
+run anywhere. Dependabot has run and opened its first pull requests.
 
 ## Documentation
 

@@ -614,8 +614,8 @@ resource limits. The file is validated with `docker compose config` in CI. On 20
 images (`aab/broker-api:local`, `aab/dashboard:local`, `aab/browser-runner:local`) were built and the
 stack was started once by hand: PostgreSQL, `migrate`, the API and the dashboard came up healthy on the
 first attempt and `127.0.0.1:8080` was the only published port. The checks that followed were manual
-(see the threat model, section 6.1), not automated tests, and CI does not build the images or start
-the stack (AAB-031). Two Dockerfiles needed a fix first: the API and runner images did not copy the
+(see the threat model, section 6.1), not automated tests; the `containers` job in CI now builds the images and starts
+the stack and passed on its first GitHub run (AAB-031). Two Dockerfiles needed a fix first: the API and runner images did not copy the
 workspace packages added in Phase 2. It is still a draft for loopback use. **It has no worker service**:
 the browser worker runs as a host process, and no container holds a key. The Docker launcher that runs
 each job in a container uses its own image definition (`infra/docker/browser-runner.Dockerfile`), which

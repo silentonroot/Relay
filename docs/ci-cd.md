@@ -4,10 +4,11 @@ How changes are checked, how a release is published, and what runs on a schedule
 are GitHub Actions workflows in `.github/workflows/`, written for the repository
 `silentonroot/Relay`.
 
-**Status on 2026-11-13: no workflow has run on GitHub yet.** The repository has not been pushed.
-The table in [What has and has not been run](#what-has-and-has-not-been-run) says, for each job,
-whether its commands were run on a developer machine. Expect to adjust the jobs marked "not run"
-on their first runs.
+**Status on 2026-11-14: `ci.yml` has run on GitHub and passed all five jobs; `nightly.yml` and
+`release.yml` have not run.** The repository was pushed on 2026-11-13. The first scheduled
+`nightly` run is due at 03:17 UTC on 2026-11-14. Dependabot has run for all four configured
+ecosystems. The table in [What has and has not been run](#what-has-and-has-not-been-run) says,
+for each job, where it has run. Expect to adjust the jobs marked "not run" on their first runs.
 
 ## Overview
 
@@ -109,6 +110,17 @@ change. Nothing merges automatically.
   by tag and digest. Dependabot proposes new digests. The nightly scan rebuilds with `--pull`
   and reports vulnerabilities in between.
 
+**The first three proposals (2026-11-13).** Dependabot opened #1 (`node` base image 24 to 25,
+in `infra/docker`), #2 (`nginxinc/nginx-unprivileged` 1.30 to 1.31) and #3 (`@types/node` 24 to
+26). #2 and #3 passed CI. #1 failed in the `containers` job, at the step that builds the images
+and starts the Compose stack, so the Node 25 base image breaks the image build. The project
+targets Node 24 (`engines`, CI and the Dockerfiles), so `.github/dependabot.yml` now ignores
+major-version updates of the `node` image and of `@types/node`; minor, patch and digest updates
+are still proposed. Moving to a new Node line is a deliberate change: update `engines`, the CI
+Node version, the Dockerfiles and `@types/node` together, and remove the ignore rules. Close a
+major-version proposal for any other dependency unless it is wanted; CI passing does not make it
+wanted.
+
 Three pins are outside Dependabot's reach and are updated by hand: the gitleaks image in
 `ci.yml` and `nightly.yml`, the Trivy image in `infra/ci/scan-image.sh`, and the PostgreSQL
 service image in `ci.yml` (keep it in step with `infra/compose.yaml`).
@@ -138,22 +150,23 @@ These cannot be set from files in the repository.
 ## What has and has not been run
 
 "Run locally" means the job's commands were executed on a developer machine (Docker 28.5,
-2026-11-13), not that the workflow ran on GitHub.
+2026-11-13), not that the workflow ran on GitHub. The first `ci` run on GitHub was on the push to
+`main` at commit 640bd27 (2026-11-13 23:18 UTC): <https://github.com/silentonroot/Relay/actions/runs/43526169259>.
 
-| Workflow and job          | State                                                                                                                                                                            |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ci` / `verify`           | Commands run locally (`pnpm run check`, dashboard build). Workflow never run.                                                                                                    |
-| `ci` / `database`         | Run locally against the same pinned PostgreSQL image over TCP: 119 tests passed.                                                                                                 |
-| `ci` / `containers`       | `compose-smoke.sh` run locally and passed; the runner image built; the Docker launcher tests passed. Workflow never run.                                                         |
-| `ci` / `secret-scan`      | Not run.                                                                                                                                                                         |
-| `ci` / `dependency-audit` | Not run in this form.                                                                                                                                                            |
-| `nightly` / `sandbox`     | The tests pass locally on Debian with the distribution's Chromium. **`sandbox-prereqs.sh` has never run**, and neither has the suite with Playwright's Chromium build on Ubuntu. |
-| `nightly` / `e2e`         | The test passes locally. Never run on a runner; additionally depends on the demo repository's location.                                                                          |
-| `nightly` / `image-scan`  | Not run. The scanner has never been run against these images, so the first run may report findings.                                                                              |
-| `nightly` / `report`      | Not run.                                                                                                                                                                         |
-| `release`                 | Not run. The two-step build with a `docker-container` builder, the registry push and the attestations are untested.                                                              |
-| Dependabot                | Not exercised. Whether it handles this repository's pnpm lockfile format, and whether it finds the `*.Dockerfile` names, is unconfirmed.                                         |
-| Workflow syntax           | Parsed as YAML and reviewed by hand. Not checked with `actionlint`.                                                                                                              |
+| Workflow and job          | State                                                                                                                                                                                                          |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ci` / `verify`           | Ran on GitHub and passed. Commands also run locally (`pnpm run check`, dashboard build).                                                                                                                       |
+| `ci` / `database`         | Ran on GitHub and passed. Also run locally against the same pinned PostgreSQL image over TCP: 119 tests passed.                                                                                                |
+| `ci` / `containers`       | Ran on GitHub and passed. `compose-smoke.sh`, the runner image build and the Docker launcher tests also passed locally.                                                                                        |
+| `ci` / `secret-scan`      | Ran on GitHub and passed.                                                                                                                                                                                      |
+| `ci` / `dependency-audit` | Ran on GitHub and passed.                                                                                                                                                                                      |
+| `nightly` / `sandbox`     | The tests pass locally on Debian with the distribution's Chromium. **`sandbox-prereqs.sh` has never run**, and neither has the suite with Playwright's Chromium build on Ubuntu.                               |
+| `nightly` / `e2e`         | The test passes locally. Never run on a runner; additionally depends on the demo repository's location.                                                                                                        |
+| `nightly` / `image-scan`  | Not run. The scanner has never been run against these images, so the first run may report findings.                                                                                                            |
+| `nightly` / `report`      | Not run.                                                                                                                                                                                                       |
+| `release`                 | Not run. The two-step build with a `docker-container` builder, the registry push and the attestations are untested.                                                                                            |
+| Dependabot                | Ran for all four ecosystems on 2026-11-13 and opened three pull requests (see below). It finds the `*.Dockerfile` names and updates the pnpm lockfile (the npm pull request passed a frozen-lockfile install). |
+| Workflow syntax           | Parsed as YAML and reviewed by hand. Not checked with `actionlint`.                                                                                                                                            |
 
 ## Northstar demo
 
