@@ -1,12 +1,11 @@
 import { accessSync, constants, existsSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
-import path from 'node:path';
 import { pino } from 'pino';
 import type { EgressDecision } from '../../src/egress/proxy.js';
-import { createJobRunner, defaultRuntimeBaseDir } from '../../src/sandbox/index.js';
+import { createJobRunner } from '../../src/sandbox/index.js';
 import type { JobRunnerConfigInput } from '../../src/sandbox/index.js';
 import type { JobRunner, OperationJobSpec } from '../../src/types.js';
-import { FIXTURE_ORIGIN } from '../fixtures/registry/constants.js';
+import { fixtureOrigin, registryModule, runtimeBaseDir } from '../fixtures/run-context.js';
 import { sessionStorageState } from '../fixtures/app-server.js';
 
 export const BWRAP = '/usr/bin/bwrap';
@@ -44,7 +43,8 @@ requireOrSkip(integrationSkipReason);
 export const integrationTitle = (title: string): string =>
   integrationSkipReason === null ? title : `${title} (SKIPPED: ${integrationSkipReason})`;
 
-export const FIXTURE_REGISTRY = path.resolve(import.meta.dirname, '../fixtures/registry/index.ts');
+/** This run's copy of the fixture registry, with this run's fixture origin (test/global-setup.ts). */
+export const fixtureRegistry = registryModule;
 
 export interface Harness {
   readonly runner: JobRunner;
@@ -58,7 +58,8 @@ export function createHarness(overrides: JobRunnerConfigInput = {}): Harness {
   const logs: string[] = [];
   const decisions: (EgressDecision & { jobId: string })[] = [];
   const runner = createJobRunner({
-    adapterRegistryModule: FIXTURE_REGISTRY,
+    adapterRegistryModule: fixtureRegistry(),
+    runtimeBaseDir: runtimeBaseDir(),
     chromiumPath: CHROMIUM,
     bwrapPath: BWRAP,
     logger: pino({ level: 'debug' }, { write: (line: string) => logs.push(line) }),
@@ -81,7 +82,7 @@ export function operationSpec(
     connectionId: 'conn-1',
     adapterId: 'fixture-app',
     adapterVersion: '1.0.0',
-    allowedOrigins: [FIXTURE_ORIGIN],
+    allowedOrigins: [fixtureOrigin()],
     operation,
     arguments: {},
     storageState: sessionStorageState(token),
@@ -108,6 +109,6 @@ export async function processesForJob(jobId: string): Promise<number[]> {
 }
 
 export async function runtimeDirEntries(): Promise<string[]> {
-  const base = defaultRuntimeBaseDir();
+  const base = runtimeBaseDir();
   return existsSync(base) ? readdir(base) : [];
 }

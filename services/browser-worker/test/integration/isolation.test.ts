@@ -10,6 +10,7 @@ import { createEgressProxy } from '../../src/egress/proxy.js';
 import { DEFAULT_REPO_ROOT, resolveJobRunnerConfig } from '../../src/sandbox/config.js';
 import { createLauncher } from '../../src/sandbox/job-runner.js';
 import { createJobRuntimeDir } from '../../src/sandbox/runtime-dir.js';
+import { runtimeBaseDir } from '../fixtures/run-context.js';
 import {
   BWRAP,
   CHROMIUM,
@@ -78,6 +79,7 @@ describe.skipIf(integrationSkipReason !== null)(integrationTitle('bubblewrap iso
   it('cannot read planted secrets, /home, the host loopback or any network', async () => {
     const config = resolveJobRunnerConfig({
       repoRoot: fakeRepo,
+      runtimeBaseDir: runtimeBaseDir(),
       bwrapPath: BWRAP,
       chromiumPath: CHROMIUM,
       adapterRegistryModule: path.join(

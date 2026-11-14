@@ -4,7 +4,7 @@ import { JOB_ERROR_MESSAGES } from '../../src/protocol.js';
 import type { OperationJobOutcome } from '../../src/types.js';
 import { startFixtureApp } from '../fixtures/app-server.js';
 import type { FixtureApp } from '../fixtures/app-server.js';
-import { FIXTURE_PORT } from '../fixtures/registry/constants.js';
+import { fixturePort } from '../fixtures/run-context.js';
 import {
   createHarness,
   integrationSkipReason,
@@ -134,7 +134,7 @@ describe.skipIf(integrationSkipReason !== null)(integrationTitle('operation jobs
     const decisions = harness.decisions.slice(before);
     expect(decisions).toContainEqual(
       expect.objectContaining({
-        origin: `http://localhost:${FIXTURE_PORT}`,
+        origin: `http://localhost:${fixturePort()}`,
         decision: 'deny',
         reason: 'origin_not_allowed',
       }),

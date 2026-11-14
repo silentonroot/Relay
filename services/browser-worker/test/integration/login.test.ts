@@ -9,7 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { LoginJobSpec } from '../../src/types.js';
 import { startFixtureApp } from '../fixtures/app-server.js';
 import type { FixtureApp } from '../fixtures/app-server.js';
-import { FIXTURE_ORIGIN } from '../fixtures/registry/constants.js';
+import { fixtureOrigin } from '../fixtures/run-context.js';
 import {
   createHarness,
   integrationSkipReason,
@@ -93,7 +93,7 @@ function loginSpec(timeoutMs = 60_000): LoginJobSpec {
     connectionId: 'conn-login',
     adapterId: 'fixture-app',
     adapterVersion: '1.0.0',
-    allowedOrigins: [FIXTURE_ORIGIN],
+    allowedOrigins: [fixtureOrigin()],
     timeoutMs,
   };
 }

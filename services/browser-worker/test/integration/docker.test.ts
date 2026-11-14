@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { resolveJobRunnerConfig } from '../../src/sandbox/config.js';
 import { buildDockerRunArgs } from '../../src/sandbox/docker.js';
 import { createJobRunner } from '../../src/sandbox/index.js';
+import { runtimeBaseDir } from '../fixtures/run-context.js';
 
 /*
  * The Docker launcher against a real engine, in its default mode: Docker's own seccomp and
@@ -40,10 +41,25 @@ if (reason !== null && process.env['AAB_REQUIRE_DOCKER'] === '1') {
 }
 const title = `docker sandbox${reason === null ? '' : ` (skipped: ${reason})`}`;
 
-function runnerContainers(): string[] {
-  return docker(['ps', '-a', '--filter', 'name=aab-runner-', '--format', '{{.Names}}'])
+/** Job ids and container names carry this process's pid, so a concurrent run has its own. */
+const RUN_TAG = `${process.pid}`;
+
+function runnerContainers(prefix = 'aab-runner-'): string[] {
+  return docker(['ps', '-a', '--filter', `name=${prefix}`, '--format', '{{.Names}}'])
     .split('\n')
     .filter((name) => name !== '');
+}
+
+/**
+ * Self-check containers get a random name the test cannot choose, so another run's self-check
+ * may be alive for a moment. Waits for them all to be gone instead of failing on a stranger's.
+ */
+async function expectNoSelfCheckContainers(): Promise<void> {
+  const deadline = Date.now() + 60_000;
+  while (runnerContainers('aab-runner-self-check-').length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  expect(runnerContainers('aab-runner-self-check-')).toEqual([]);
 }
 
 /** Runs a shell snippet in a container started with exactly the launcher's flags. */
@@ -51,7 +67,7 @@ function probe(script: string): string {
   const config = resolveJobRunnerConfig({ sandbox: 'docker' });
   const jobDir = '/tmp';
   const args = buildDockerRunArgs(config, {
-    jobId: 'probe',
+    jobId: `probe-${RUN_TAG}`,
     jobDir,
     socketPath: `${jobDir}/egress.sock`,
     headed: false,
@@ -64,9 +80,9 @@ function probe(script: string): string {
 
 describe.skipIf(reason !== null)(title, () => {
   it('passes the self-check: runner and Chromium start, no network, no host loopback', async () => {
-    const runner = createJobRunner({ sandbox: 'docker' });
+    const runner = createJobRunner({ sandbox: 'docker', runtimeBaseDir: runtimeBaseDir() });
     await expect(runner.selfCheck()).resolves.toBeUndefined();
-    expect(runnerContainers()).toEqual([]);
+    await expectNoSelfCheckContainers();
   }, 120_000);
 
   it('gives the job a read-only root, a private writable home and no capabilities', () => {
@@ -103,10 +119,10 @@ describe.skipIf(reason !== null)(title, () => {
   }, 60_000);
 
   it('fails a job cleanly when the application is unreachable, leaving no container', async () => {
-    const runner = createJobRunner({ sandbox: 'docker' });
+    const runner = createJobRunner({ sandbox: 'docker', runtimeBaseDir: runtimeBaseDir() });
     const outcome = await runner.runOperation(
       {
-        jobId: 'dockertest-unreachable',
+        jobId: `dockertest-unreachable-${RUN_TAG}`,
         connectionId: '00000000-0000-4000-8000-000000000001',
         adapterId: 'northstar',
         adapterVersion: '0.1.0',
@@ -136,15 +152,15 @@ describe.skipIf(reason !== null)(title, () => {
       new AbortController().signal,
     );
     expect(['failed', 'reauth_required']).toContain(outcome.status);
-    expect(runnerContainers()).toEqual([]);
+    expect(runnerContainers(`aab-runner-dockertest-unreachable-${RUN_TAG}`)).toEqual([]);
   }, 120_000);
 
   it('rejects the headed login window', async () => {
-    const runner = createJobRunner({ sandbox: 'docker' });
+    const runner = createJobRunner({ sandbox: 'docker', runtimeBaseDir: runtimeBaseDir() });
     await expect(
       runner.startLogin(
         {
-          jobId: 'dockertest-login',
+          jobId: `dockertest-login-${RUN_TAG}`,
           connectionId: '00000000-0000-4000-8000-000000000001',
           adapterId: 'northstar',
           adapterVersion: '0.1.0',
@@ -154,6 +170,6 @@ describe.skipIf(reason !== null)(title, () => {
         new AbortController().signal,
       ),
     ).rejects.toThrow();
-    expect(runnerContainers()).toEqual([]);
+    expect(runnerContainers(`aab-runner-dockertest-login-${RUN_TAG}`)).toEqual([]);
   }, 60_000);
 });
