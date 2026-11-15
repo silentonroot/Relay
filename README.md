@@ -316,3 +316,7 @@ exactly one origin, `http://localhost:4100`, and a job may reach only origins th
 and the registered application list, so register the application as `http://localhost:4100` (not
 `127.0.0.1`) and keep port 4100 free. The end-to-end test starts the demo itself from
 `../northstar-demo` (override with `AAB_E2E_DEMO_DIR`).
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

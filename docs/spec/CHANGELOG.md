@@ -66,7 +66,7 @@ These are product decisions the specification still leaves open. None is settled
 7. **Organization-wide policies.** The `policies` table is not scheduled because per-agent grants express every rule so far. Are organization-wide rules wanted, and when?
 8. **Authoritative allowed origins.** _Provisional answer in 0.3: a job may reach only origins present in both lists. This is the conservative reading; confirm or relax it._ When an adapter's allowed-origin list and a registered application definition's list differ, which is authoritative? The navigation guard currently uses only the adapter's.
 9. **Audit visibility.** Should audit events be visible to every owner in an organization, or only to the acting owner? Today list and verify are organization-wide (ADR-010).
-10. **Licence.** Which licence are the two repositories released under? There is no LICENSE file in either.
+10. **Licence.** _Decided on 2026-11-14: MIT for both repositories (`LICENSE` in each)._ Which licence are the two repositories released under?
 11. **Authentication modes per adapter.** Should the adapter contract allow more than one authentication mode per adapter, as the specification's application definition does?
 
 ## Version 0.3
