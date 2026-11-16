@@ -4,21 +4,22 @@ Each record states one decision, why it was made, what it costs, and the concret
 should reopen it. "Accepted" means the code is being built to this decision now. "Proposed" means
 the decision is not needed yet; the record holds a recommendation and the evidence still missing.
 
-| ADR                                                 | Title                                            | Status   | Needed by |
-| --------------------------------------------------- | ------------------------------------------------ | -------- | --------- |
-| [001](ADR-001-trust-boundaries-worker-isolation.md) | Trust boundaries and worker isolation            | Accepted | Phase 1   |
-| [002](ADR-002-login-handoff-session-snapshots.md)   | Browser login handoff and session snapshots      | Accepted | Phase 2   |
-| [003](ADR-003-local-vault-root-key.md)              | Vault root key for local installs                | Accepted | Phase 2   |
-| [004](ADR-004-job-queue.md)                         | Job queue and the threshold for Temporal         | Accepted | Phase 2   |
-| [005](ADR-005-policy-representation.md)             | Policy representation                            | Accepted | Phase 1   |
-| [006](ADR-006-adapter-packaging-trust.md)           | Adapter packaging, trust and upgrades            | Proposed | Phase 2   |
-| [007](ADR-007-mcp-authentication-discovery.md)      | MCP authentication and tool-discovery scoping    | Proposed | Phase 6   |
-| [008](ADR-008-model-provider-data-classes.md)       | Model providers and data classes                 | Proposed | Phase 6   |
-| [009](ADR-009-audit-integrity.md)                   | Audit integrity                                  | Accepted | Phase 1   |
-| [010](ADR-010-tenant-ready-schema.md)               | Tenant-ready schema, single local organization   | Accepted | Phase 1   |
-| [011](ADR-011-toolchain.md)                         | Toolchain                                        | Accepted | Phase 1   |
-| [012](ADR-012-synthetic-only-dependency-review.md)  | Synthetic-only development and dependency review | Accepted | Phase 0   |
-| [013](ADR-013-per-job-sandbox-egress-proxy.md)      | Per-job sandbox and egress proxy                 | Accepted | Phase 2   |
+| ADR                                                 | Title                                                   | Status   | Needed by |
+| --------------------------------------------------- | ------------------------------------------------------- | -------- | --------- |
+| [001](ADR-001-trust-boundaries-worker-isolation.md) | Trust boundaries and worker isolation                   | Accepted | Phase 1   |
+| [002](ADR-002-login-handoff-session-snapshots.md)   | Browser login handoff and session snapshots             | Accepted | Phase 2   |
+| [003](ADR-003-local-vault-root-key.md)              | Vault root key for local installs                       | Accepted | Phase 2   |
+| [004](ADR-004-job-queue.md)                         | Job queue and the threshold for Temporal                | Accepted | Phase 2   |
+| [005](ADR-005-policy-representation.md)             | Policy representation                                   | Accepted | Phase 1   |
+| [006](ADR-006-adapter-packaging-trust.md)           | Adapter packaging, trust and upgrades                   | Proposed | Phase 2   |
+| [007](ADR-007-mcp-authentication-discovery.md)      | MCP authentication and tool-discovery scoping           | Proposed | Phase 6   |
+| [008](ADR-008-model-provider-data-classes.md)       | Model providers and data classes                        | Proposed | Phase 6   |
+| [009](ADR-009-audit-integrity.md)                   | Audit integrity                                         | Accepted | Phase 1   |
+| [010](ADR-010-tenant-ready-schema.md)               | Tenant-ready schema, single local organization          | Accepted | Phase 1   |
+| [011](ADR-011-toolchain.md)                         | Toolchain                                               | Accepted | Phase 1   |
+| [012](ADR-012-synthetic-only-dependency-review.md)  | Synthetic-only development and dependency review        | Accepted | Phase 0   |
+| [013](ADR-013-per-job-sandbox-egress-proxy.md)      | Per-job sandbox and egress proxy                        | Accepted | Phase 2   |
+| [014](ADR-014-vault-service.md)                     | Vault service, service identity and worker capabilities | Proposed | Phase 3   |
 
 ## Writing a new record
 
