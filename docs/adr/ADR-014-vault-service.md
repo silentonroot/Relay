@@ -1,6 +1,6 @@
 # ADR-014: Vault service, service identity and worker capabilities
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-11-16, by the owner, with the recommended answers to the open questions in [docs/phase-3.md](../phase-3.md) section 4)
 - **Date:** 2026-11-16
 - **Needed by:** Phase 3
 - **Relates to:** [ADR-001](ADR-001-trust-boundaries-worker-isolation.md) (INV-6, INV-8, INV-10,

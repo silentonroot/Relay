@@ -294,6 +294,8 @@ Three small items that close gaps the vault design relies on.
 
 ## 4. Open questions for the owner
 
+_Answered on 2026-11-16: the owner accepted the recommendation for every question below. Question 4 (separate database roles per service) becomes a Phase 9 ticket._
+
 1. **Peer credentials versus per-role sockets.** ADR-014 uses socket file permissions per role and no
    native module. Recommendation: accept; add a peer-credential module later only if pids in vault
    audit records are wanted, after an ADR-012 review.
