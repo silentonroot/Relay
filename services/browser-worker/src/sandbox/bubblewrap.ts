@@ -8,7 +8,9 @@ import type { LaunchRequest, SandboxLauncher, SandboxProcess } from './launcher.
 /** Where the code is mounted inside the sandbox. A neutral path, never the host path. */
 export const SANDBOX_APP_DIR = '/app';
 export const SANDBOX_RUN_DIR = '/run/aab';
-export const SANDBOX_HOME = '/home/runner';
+/** The job's private, empty home (a tmpfs). Not under /home, so it can never coincide with a real
+ * user's home directory (a CI runner's is /home/runner). */
+export const SANDBOX_HOME = '/sandbox-home';
 export const RUNNER_ENTRY_RELATIVE = 'services/browser-worker/src/runner/main.ts';
 
 /**

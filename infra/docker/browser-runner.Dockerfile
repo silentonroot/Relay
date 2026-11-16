@@ -75,14 +75,14 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 ENV NODE_ENV=production \
-    HOME=/home/runner \
+    HOME=/sandbox-home \
     TMPDIR=/tmp
 
 # Application files are owned by root and read-only to the runtime user. The supervisor runs
 # the container with --user <its own uid:gid> (never root) so the runner can open the
 # per-job egress socket, which lives in a 0700 directory owned by the supervisor.
 COPY --from=build --chown=root:root /app /app
-RUN mkdir -p /home/runner /run/aab && chmod 0755 /home/runner /run/aab
+RUN mkdir -p /sandbox-home /run/aab && chmod 0755 /sandbox-home /run/aab
 
 WORKDIR /app
 USER node

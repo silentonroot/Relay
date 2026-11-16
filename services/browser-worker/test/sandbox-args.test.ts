@@ -6,6 +6,7 @@ import {
   buildBubblewrapArgs,
   displayBinding,
   registryMountFor,
+  SANDBOX_HOME,
 } from '../src/sandbox/bubblewrap.js';
 import {
   DEFAULT_REPO_ROOT,
@@ -48,7 +49,7 @@ describe('docker arguments', () => {
     expect(pairs(args, '--user')).toEqual(['1000:1000']);
     expect(pairs(args, '--tmpfs')).toEqual([
       '/tmp:rw,nosuid,nodev,size=512m,mode=1777',
-      '/home/runner:rw,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700',
+      '/sandbox-home:rw,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700',
     ]);
     expect(pairs(args, '--mount')).toEqual([
       'type=bind,source=/run/user/1000/aab-worker/abc,target=/run/aab,readonly',
@@ -190,5 +191,14 @@ describe('runtime directory', () => {
     const long = path.join(os.tmpdir(), 'x'.repeat(120));
     await expect(createJobRuntimeDir(long)).rejects.toThrow(/Unix socket limit/);
     await rm(long, { recursive: true, force: true });
+  });
+});
+
+describe('sandbox home', () => {
+  it('is not under /home, so it can never coincide with a real home directory', () => {
+    // A CI runner's home is /home/runner; a sandbox home at that path made the end-to-end
+    // check "the host's home directory is not visible" fail on a name collision.
+    expect(SANDBOX_HOME.startsWith('/home/')).toBe(false);
+    expect(SANDBOX_HOME).not.toBe(os.homedir());
   });
 });

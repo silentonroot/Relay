@@ -34,7 +34,7 @@ let port: number;
 interface ProbeResult {
   contents: Record<string, string | null>;
   exists: Record<string, boolean>;
-  home: string[];
+  home: string[] | null;
   root: string[];
   app: string[];
   interfaces: string[];
@@ -139,8 +139,10 @@ describe.skipIf(integrationSkipReason !== null)(integrationTitle('bubblewrap iso
       expect(result.exists[path.join(os.homedir(), '.bashrc')]).toBe(false);
       expect(result.exists['/etc/shadow']).toBe(false);
       expect(result.exists['/etc/passwd']).toBe(false);
-      // Only the tmpfs home exists under /home; only the selected code exists under /app.
-      expect(result.home).toEqual(['runner']);
+      // /home does not exist at all (the job's tmpfs home is /sandbox-home); only the selected
+      // code exists under /app.
+      expect(result.home).toBeNull();
+      expect(result.root).toContain('sandbox-home');
       expect(result.app.sort()).toEqual(['node_modules', 'package.json', 'packages', 'services']);
       expect(result.root).not.toContain('root');
       // No interface except loopback, and the host's loopback is unreachable.

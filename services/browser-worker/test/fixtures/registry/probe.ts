@@ -43,7 +43,7 @@ process.stdin.on('data', async (chunk: string) => {
   const result = {
     contents: Object.fromEntries(request.paths.map((path) => [path, contents(path)])),
     exists: Object.fromEntries(request.paths.map((path) => [path, existsSync(path)])),
-    home: readdirSync('/home'),
+    home: existsSync('/home') ? readdirSync('/home') : null,
     root: readdirSync('/'),
     app: readdirSync('/app'),
     interfaces: Object.keys(os.networkInterfaces()),
