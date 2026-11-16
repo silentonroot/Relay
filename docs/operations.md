@@ -30,7 +30,9 @@ sandboxed runner per job (ADR-013); see [architecture](architecture.md).
   worker cannot create a sandbox it refuses to start and says so.
 - **Node** at `/usr/bin/node`. The sandbox runs that path and no setting changes it.
 - **Chromium** at `/usr/lib/chromium/chromium`, or set `AAB_CHROMIUM_PATH`. The worker uses
-  `playwright-core` with this binary and downloads no browser.
+  `playwright-core` with this binary and downloads no browser. Keep the binary outside your home
+  directory: the sandbox mounts its directory at the same path, so a Chromium under `$HOME` makes
+  that path visible inside every job's sandbox.
 - **A display for the sign-in window**, read from the worker's own environment: X11 (`DISPLAY`,
   local displays of the form `:N` only, with `XAUTHORITY` or `~/.Xauthority`) or Wayland
   (`WAYLAND_DISPLAY` with `XDG_RUNTIME_DIR`). Wayland is preferred when both are set. Operations

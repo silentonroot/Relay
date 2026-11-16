@@ -45,7 +45,12 @@ if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
 fi
 
 # Chromium: the build that matches the installed playwright-core, plus its system libraries.
-# It lands under ~/.cache/ms-playwright; the sandbox launcher mounts the binary's directory.
+# The sandbox launcher mounts the binary's directory at its real path, so it must not be under
+# the home directory: Playwright's default (~/.cache/ms-playwright) would make a path under
+# $HOME exist inside the sandbox, and the end-to-end test rightly fails on that (step J).
+export PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+sudo mkdir -p "${PLAYWRIGHT_BROWSERS_PATH}"
+sudo chown "$(id -u):$(id -g)" "${PLAYWRIGHT_BROWSERS_PATH}"
 cli="$(pwd)/services/browser-worker/node_modules/playwright-core/cli.js"
 node "${cli}" install --with-deps chromium
 chromium="$(cd services/browser-worker && node --input-type=module --eval \
@@ -54,6 +59,12 @@ chromium="$(cd services/browser-worker && node --input-type=module --eval \
   echo "Chromium was not installed at ${chromium}" >&2
   exit 1
 }
+case "${chromium}" in
+  "${HOME}"/*)
+    echo "Chromium is under the home directory (${chromium}); the sandbox would expose that path" >&2
+    exit 1
+    ;;
+esac
 
 # Unix socket paths are limited to about 100 bytes, so the per-job runtime directories need a
 # short base. /run/user/<uid> exists only for login sessions; create it for the runner user.
@@ -63,6 +74,7 @@ sudo chown "$(id -u):$(id -g)" "${runtime}"
 chmod 700 "${runtime}"
 
 {
+  echo "PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH}"
   echo "AAB_TEST_CHROMIUM_PATH=${chromium}"
   echo "AAB_CHROMIUM_PATH=${chromium}"
   echo "XDG_RUNTIME_DIR=${runtime}"
