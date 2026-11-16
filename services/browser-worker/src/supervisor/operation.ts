@@ -1,7 +1,7 @@
 import { toOperationDescriptors, validateOperationInput } from '@aab/adapter-sdk';
 import { canonicalJson } from '@aab/contracts';
 import type { AuditDecision, JobError, JobErrorCode, JobStatus, JsonObject } from '@aab/contracts';
-import { ConflictError } from '@aab/database';
+import { ConflictError, verifyJobArgumentsHash } from '@aab/database';
 import { evaluate } from '@aab/policy-engine';
 import { jobError } from '../protocol.js';
 import { openSnapshot } from '../session-store/index.js';
@@ -34,6 +34,12 @@ function failure(code: JobErrorCode): OperationRecord {
     eventType: 'operation.failed',
   };
 }
+
+/** Audit reason code of a job whose row no longer matches its `arguments_hash`. */
+export const ARGUMENTS_HASH_MISMATCH = 'arguments_hash_mismatch';
+
+/** Audit reason code of a job whose arguments policy would change now (see step 3). */
+export const ARGUMENTS_CHANGED_BY_POLICY = 'arguments_changed_by_policy';
 
 function denied(reasonCode: string, extra: JsonObject = {}): OperationRecord {
   return {
@@ -192,6 +198,33 @@ async function stopped(ctx: JobContext): Promise<void> {
 export async function runOperationJob(ctx: JobContext): Promise<void> {
   const { job, repos, logger } = ctx;
 
+  // 0. The row must still hold the arguments policy judged, for the job they were judged for:
+  // organization, agent, connection, operation, decision, timeout and retry flag (PE-14). Checked before anything else is loaded, so an edited row never
+  // reaches the snapshot or a sandbox.
+  if (
+    job.operation === null ||
+    job.arguments === null ||
+    job.argumentsHash === null ||
+    job.agentId === null ||
+    !verifyJobArgumentsHash(
+      {
+        organizationId: job.organizationId,
+        agentId: job.agentId,
+        connectionId: job.connectionId,
+        operation: job.operation,
+        arguments: job.arguments,
+        policyDecisionId: job.policyDecisionId,
+        timeoutMs: job.timeoutMs,
+        retrySafe: job.retrySafe,
+      },
+      job.argumentsHash,
+    )
+  ) {
+    logger.warn({ jobId: job.id }, 'job arguments do not match the judged hash; job refused');
+    await record(ctx, denied(ARGUMENTS_HASH_MISMATCH));
+    return;
+  }
+
   // 1. Load everything fresh.
   const target = await repos.connections.getForExecution(job.connectionId);
   if (target === null) {
@@ -282,9 +315,12 @@ export async function runOperationJob(ctx: JobContext): Promise<void> {
     await record(ctx, denied('operation_not_executable', { policyOutcome: decision.outcome }));
     return;
   }
+  // The runner receives exactly the arguments the hash covers. Obligations are applied when the
+  // job is enqueued; if applying them again now would change the arguments (a grant changed
+  // since), the job was judged on other arguments than it would run with, so it is refused.
   const finalArguments: JsonObject = { ...job.arguments, ...decision.obligations };
-  if (!validateOperationInput(adapter, operation, finalArguments).ok) {
-    await record(ctx, failure('invalid_arguments'));
+  if (canonicalJson(finalArguments) !== canonicalJson(job.arguments)) {
+    await record(ctx, denied(ARGUMENTS_CHANGED_BY_POLICY));
     return;
   }
   if (ctx.signal.aborted) return stopped(ctx);
@@ -339,7 +375,7 @@ export async function runOperationJob(ctx: JobContext): Promise<void> {
             adapterVersion: adapter.version,
             allowedOrigins,
             operation,
-            arguments: finalArguments,
+            arguments: job.arguments,
             storageState: snapshot.storageState,
             expectedAccountHint: connection.externalAccountHint,
             timeoutMs: job.timeoutMs,

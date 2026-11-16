@@ -390,7 +390,12 @@ A URL is allowed only when all of these hold:
 - its scheme is `https`, or `http` on a loopback host;
 - its origin equals one of the adapter's allowed origins exactly (port and scheme included);
 - it is **already in canonical form**;
-- it contains no dot segments, and no percent-encoded dot, slash or backslash in the path;
+- it contains no dot segments, and no percent-encoded dot, slash or backslash in the path, as written
+  or after up to three rounds of percent-decoding (`%252e%252e` and `%252f` count, and so do `..;`,
+  `.;`, `..%00` and a segment of dots only). Each round also refuses `%u` escapes, invalid or
+  overlong UTF-8 (`%c0%ae`), dots followed by Unicode whitespace, and Unicode lookalikes of a dot or
+  separator (fullwidth `．` `／` `＼`, U+2024, U+FE52) found by decoding as UTF-8 and normalizing with
+  NFKC; ordinary non-ASCII letters (`/caf%C3%A9`) pass;
 - when an operation is named, its path matches one of that operation's `allowedPaths`.
 
 ### The normalised-URL requirement

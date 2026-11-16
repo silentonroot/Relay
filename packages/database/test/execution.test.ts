@@ -10,7 +10,13 @@ import {
   ValidationError,
 } from '../src/index.js';
 import type { DatabaseHandle, Repositories } from '../src/index.js';
-import { openTestDb, seedConnectionAndAgent, seedTenant, UNKNOWN_ID } from './helpers.js';
+import {
+  jobArgumentsHash,
+  openTestDb,
+  seedConnectionAndAgent,
+  seedTenant,
+  UNKNOWN_ID,
+} from './helpers.js';
 import type { Tenant } from './helpers.js';
 
 let handle: DatabaseHandle;
@@ -63,18 +69,22 @@ function operationInput(
   f: Awaited<ReturnType<typeof fixture>>,
   overrides: Partial<Parameters<Repositories['jobs']['createOperation']>[0]> = {},
 ) {
-  return {
+  const input = {
     organizationId: tenant.organization.id,
     requestedByUserId: tenant.user.id,
     agentId: f.agent.id,
     connectionId: f.connection.id,
     runId: null,
     operation: 'orders.list',
-    arguments: { limit: 5 },
+    arguments: { limit: 5 } as JsonObject,
     retrySafe: true,
     policyDecisionId: null,
     timeoutMs: 30_000,
     ...overrides,
+  };
+  return {
+    ...input,
+    argumentsHash: overrides.argumentsHash ?? jobArgumentsHash(input),
   };
 }
 
@@ -139,6 +149,48 @@ describe('jobs.createOperation and createLogin', () => {
         operationInput(f, { arguments: [] as unknown as Record<string, never> }),
       ),
     ).rejects.toBeInstanceOf(ValidationError);
+    for (const argumentsHash of [
+      '',
+      'a'.repeat(63),
+      'A'.repeat(64),
+      'g'.repeat(64),
+      'a'.repeat(65),
+    ]) {
+      await expect(
+        repositories.jobs.createOperation(operationInput(f, { argumentsHash })),
+      ).rejects.toBeInstanceOf(ValidationError);
+    }
+    await expect(
+      repositories.jobs.createOperation({
+        ...operationInput(f),
+        argumentsHash: undefined as unknown as string,
+      }),
+    ).rejects.toBeInstanceOf(ValidationError);
+  });
+
+  it('store the arguments hash with an operation job and none with a login job', async () => {
+    const f = await fixture();
+    const op = await repositories.jobs.createOperation(operationInput(f));
+    expect(op.argumentsHash).toBe(
+      jobArgumentsHash({
+        organizationId: tenant.organization.id,
+        agentId: f.agent.id,
+        connectionId: f.connection.id,
+        operation: 'orders.list',
+        arguments: { limit: 5 },
+        policyDecisionId: null,
+        timeoutMs: 30_000,
+        retrySafe: true,
+      }),
+    );
+    expect((await repositories.jobs.getInternal(op.id))?.argumentsHash).toBe(op.argumentsHash);
+    const login = await repositories.jobs.createLogin({
+      organizationId: tenant.organization.id,
+      requestedByUserId: tenant.user.id,
+      connectionId: f.connection.id,
+      timeoutMs: 600_000,
+    });
+    expect(login.argumentsHash).toBeNull();
   });
 
   it('allow only one non-terminal login job per connection', async () => {
@@ -177,7 +229,8 @@ describe('database constraints on execution_jobs', () => {
     const f = await fixture();
     const org = tenant.organization.id;
     const usr = tenant.user.id;
-    const base = sql`insert into execution_jobs (organization_id, requested_by_user_id, kind, agent_id, connection_id, operation, arguments, timeout_ms, status, error_code) values`;
+    const base = sql`insert into execution_jobs (organization_id, requested_by_user_id, kind, agent_id, connection_id, operation, arguments, arguments_hash, timeout_ms, status, error_code) values`;
+    const HASH = 'c'.repeat(64);
     const row = (
       kind: string,
       agent: string | null,
@@ -185,8 +238,9 @@ describe('database constraints on execution_jobs', () => {
       args: string | null,
       status = 'queued',
       errorCode: string | null = null,
+      argumentsHash: string | null = kind === 'operation' ? HASH : null,
     ) =>
-      sql`${base} (${org}, ${usr}, ${kind}, ${agent}, ${f.connection.id}, ${operation}, ${args}::jsonb, 1000, ${status}, ${errorCode})`;
+      sql`${base} (${org}, ${usr}, ${kind}, ${agent}, ${f.connection.id}, ${operation}, ${args}::jsonb, ${argumentsHash}, 1000, ${status}, ${errorCode})`;
 
     const invalid = [
       row('operation', null, 'orders.list', '{}'),
@@ -199,6 +253,13 @@ describe('database constraints on execution_jobs', () => {
       row('operation', f.agent.id, 'orders.list', '[]'),
       row('operation', f.agent.id, 'orders.list', '{}', 'paused'),
       row('operation', f.agent.id, 'orders.list', '{}', 'failed', 'boom'),
+      // PE-14: an operation job needs a well-formed hash; a login job has none.
+      row('operation', f.agent.id, 'orders.list', '{}', 'queued', null, null),
+      row('operation', f.agent.id, 'orders.list', '{}', 'queued', null, ''),
+      row('operation', f.agent.id, 'orders.list', '{}', 'queued', null, 'C'.repeat(64)),
+      row('operation', f.agent.id, 'orders.list', '{}', 'queued', null, 'c'.repeat(63)),
+      row('operation', f.agent.id, 'orders.list', '{}', 'queued', null, `${HASH}\n`),
+      row('login', null, null, null, 'queued', null, HASH),
     ];
     for (const statement of invalid) {
       await expect(handle.db.execute(statement)).rejects.toThrow();
@@ -206,6 +267,19 @@ describe('database constraints on execution_jobs', () => {
     // The same statements with valid values go through.
     await handle.db.execute(row('operation', f.agent.id, 'orders.list', '{}', 'failed', 'timeout'));
     await handle.db.execute(row('login', null, null, null));
+  });
+
+  it('reject clearing or malforming the arguments hash of an existing operation job', async () => {
+    const f = await fixture();
+    const job = await repositories.jobs.createOperation(operationInput(f));
+    for (const value of [null, '', 'x'.repeat(64)]) {
+      await expect(
+        handle.db.execute(
+          sql`update execution_jobs set arguments_hash = ${value} where id = ${job.id}`,
+        ),
+      ).rejects.toThrow();
+    }
+    expect((await repositories.jobs.getInternal(job.id))?.argumentsHash).toBe(job.argumentsHash);
   });
 
   it('reject bad idempotency hashes, versions and secret statuses', async () => {

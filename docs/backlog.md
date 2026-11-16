@@ -221,3 +221,53 @@ These record gaps that Phase 2 left. They add no Phase 3 scope: Phase 3 moves th
 - **Depends on:** AAB-002
 - **Done when:** a CI job builds the three images, starts the stack, waits for healthy, and asserts at least the health route, the security headers, 421 for an unexpected `Host`, 401 for an unauthenticated API request, and the API container's user, read-only root and absence of `AAB_KEK_DIR` and bind mounts, and the job has run at least once on a hosting service. Met on 2026-11-13.
 - **Threat model:** HO-3, HO-8, F-4, F-5, F-9, F-14.
+
+## Tickets added at Phase 3 step B0.5
+
+### AAB-032 Approvals are single-use and bound to the arguments (Phase 4)
+
+- **Status (2026-11-16):** Open.
+- **Scope:** An approval is consumed by one conditional `UPDATE ... RETURNING` that checks every condition (pending, not expired, not used, right agent, connection and operation) and marks it used in the same statement; no code path reads an approval and then writes it. An approval binds the same canonical arguments hash as a job (the v1 layout of `jobArgumentsHashInput`, with a key, as the vault capability does from step B3), so approving `quantity: 1` never authorizes `quantity: 100`. A stale resource version does not reuse an approval.
+- **Depends on:** Phase 3 step B3 (the keyed arguments hash and the capability binding).
+- **Done when:** two concurrent redemptions of one approval produce exactly one success; a changed argument, operation, connection or agent, an expired approval and a replayed approval each fail with a negative test; and the hash on the approval equals the hash on the job it releases.
+- **Threat model:** WK-3, WK-4, WK-5, PE-11, PE-14.
+
+### AAB-033 Distinct principal types (Phase 6)
+
+- **Status (2026-11-16):** Open.
+- **Scope:** The owner, the dashboard session and an agent credential are different principal types in the code, not the same value with a flag. Every owner-only check (approvals, grants, dashboard actions, revocation, connection changes) accepts only an owner principal; an agent credential can never satisfy it, and a missing or unknown principal type is a denial.
+- **Depends on:** Phase 6 (agent credentials).
+- **Done when:** a negative test per owner-only route and action shows an agent credential refused (and audited), including a credential of an agent of the same owner; the type is checked at the route boundary and again in the repository call; and a grant or approval cannot be created under an agent principal.
+- **Threat model:** AG-1, AG-7, AG-8, PE-11.
+
+### AAB-034 Credentials go only to allowed origins (Phase 8)
+
+- **Status (2026-11-16):** Open.
+- **Scope:** A credential (an access token, a refresh token, an API key, a cookie) is sent only to a destination whose parsed origin is on the allowed list. The rule holds on every client path: the first request, each redirect hop, the token endpoint and the refresh endpoint, and a token endpoint that an application's discovery document names is itself checked against the allowed origins. The origin is the parsed one (scheme, host, port), never a prefix or a substring of the text.
+- **Depends on:** Phase 8 (credential-based adapters).
+- **Done when:** tests show that a redirect to another origin, a token endpoint outside the allowed origins, a lookalike host and a downgrade to http each receive no credential and end the job; and one shared check is used by every client path.
+- **Threat model:** TA-2, TA-3, TA-5, TA-14.
+
+### AAB-035 Decide session write-back before Phase 8
+
+- **Status (2026-11-16):** Open.
+- **Scope:** Operation jobs never write session state back (architecture §12): a job opens the stored snapshot, runs, and discards what the browser changed. Sites that rotate cookies on use will lose the session that way. Decide whether write-back exists. If it is added: one writer per credential at a time, and every replacement is persisted before success is reported to the agent (a job whose new state could not be stored fails). Record the decision (in an ADR or architecture §12) even if the answer is no.
+- **Depends on:** Phase 3 (the vault), AAB-013.
+- **Done when:** the decision is recorded; if write-back is added, tests cover two concurrent jobs on one connection (one writer), a failed persist (the job does not report success), and the old snapshot staying valid until the new one is stored.
+- **Threat model:** VA-15, WK-11.
+
+### AAB-036 Separate PostgreSQL roles per service (Phase 9)
+
+- **Status (2026-11-16):** Open.
+- **Scope:** Today one database role serves every service, so any service can write capability rows, jobs and audit events. Give each service its own role: the vault owns the vault tables, and no other role can read ciphertext or wrapped-key columns; the API and the supervisor get only the grants their repositories use; only the audit writer appends to audit events. The owner accepted this as a Phase 9 ticket on 2026-11-16 (ADR-014 open question 4); the capability MAC is the Phase 3 control until then.
+- **Depends on:** Phase 3 (ADR-014), Phase 9.
+- **Done when:** the migrations create the roles and grants; a test connects as each role and shows the statements it must not run (reading ciphertext as the API, updating a capability as the supervisor, rewriting an audit event) are refused by the database; and the Compose files and the guide give each service its own connection string.
+- **Threat model:** VS-9, DB-6.
+
+### AAB-037 Re-login with a different identity (extends AAB-022)
+
+- **Status (2026-11-16):** Open.
+- **Scope:** When a re-login yields a different account from the one the connection expects, the supervisor builds the new session from nothing: no cookie, storage entry or header from the old session is carried over. It keeps the old snapshot as it is and fails the login job; it does not store the new session. The identity returned by the login is compared with the connection's expected identity (`externalAccountHint`) with a defined rule for a missing label on either side (see AAB-022 item 2).
+- **Depends on:** AAB-022.
+- **Done when:** a test logs in as a second account on a connection that holds the first account's snapshot and shows the old snapshot unchanged and still readable, the job failed with an identity error, no new secret version stored, and nothing from the old session present in the new browser context.
+- **Threat model:** VA-15, WK-11.

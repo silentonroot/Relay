@@ -29,6 +29,13 @@
       "when": 1794529120966,
       "tag": "0003_phase2_execution",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1794836501607,
+      "tag": "0004_job_arguments_hash",
+      "breakpoints": true
     }
   ]
 }

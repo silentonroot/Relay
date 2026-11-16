@@ -6,9 +6,12 @@ import {
   CreateGrantRequest,
   GrantConstraints,
   isConnectionExecutable,
+  JOB_ARGUMENTS_HASH_DOMAIN,
+  jobArgumentsHashInput,
   OperationName,
   Origin,
 } from '../src/index.js';
+import type { JobArgumentsBinding } from '../src/index.js';
 
 describe('canonicalJson', () => {
   it('sorts keys at every depth and drops whitespace', () => {
@@ -139,5 +142,63 @@ describe('grants', () => {
       operation: 'orders.list',
     });
     expect(grant).toMatchObject({ effect: 'allow', approvalMode: 'none', constraints: {} });
+  });
+});
+
+describe('jobArgumentsHashInput (PE-14)', () => {
+  const connectionId = '11111111-1111-4111-8111-111111111111';
+  const organizationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const agentId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const policyDecisionId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const binding = (overrides: Partial<JobArgumentsBinding> = {}): JobArgumentsBinding => ({
+    organizationId,
+    agentId,
+    connectionId,
+    operation: 'orders.list',
+    arguments: { b: 1, a: 2 },
+    policyDecisionId,
+    timeoutMs: 30_000,
+    retrySafe: true,
+    ...overrides,
+  });
+
+  it('is the versioned prefix followed by one canonical object of all eight fields', () => {
+    expect(JOB_ARGUMENTS_HASH_DOMAIN).toBe('aab.job-arguments.v1\n');
+    expect(jobArgumentsHashInput(binding())).toBe(
+      `aab.job-arguments.v1\n{"agentId":"${agentId}","arguments":{"a":2,"b":1},"connectionId":"${connectionId}","operation":"orders.list","organizationId":"${organizationId}","policyDecisionId":"${policyDecisionId}","retrySafe":true,"timeoutMs":30000}`,
+    );
+  });
+
+  it('writes a missing decision id as null, a boolean as a boolean and a timeout as a number', () => {
+    const parsed = JSON.parse(
+      jobArgumentsHashInput(binding({ policyDecisionId: null, retrySafe: false })).slice(
+        JOB_ARGUMENTS_HASH_DOMAIN.length,
+      ),
+    ) as Record<string, unknown>;
+    expect(parsed.policyDecisionId).toBeNull();
+    expect(parsed.retrySafe).toBe(false);
+    expect(parsed.timeoutMs).toBe(30_000);
+  });
+
+  it('escapes field values, so text cannot move from one field into another', () => {
+    const input = jobArgumentsHashInput(
+      binding({ operation: 'x","connectionId":"other', arguments: {} }),
+    );
+    expect(JSON.parse(input.slice(JOB_ARGUMENTS_HASH_DOMAIN.length))).toEqual({
+      agentId,
+      arguments: {},
+      connectionId,
+      operation: 'x","connectionId":"other',
+      organizationId,
+      policyDecisionId,
+      retrySafe: true,
+      timeoutMs: 30_000,
+    });
+  });
+
+  it('refuses arguments that are not plain JSON', () => {
+    expect(() => jobArgumentsHashInput(binding({ arguments: { n: Number.NaN } }))).toThrow(
+      TypeError,
+    );
   });
 });

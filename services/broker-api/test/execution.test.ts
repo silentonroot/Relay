@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { ConnectionAuthResponse, OperationJob, Routes } from '@aab/contracts';
-import type { AuditEvent, ConnectionStatus } from '@aab/contracts';
-import { schema } from '@aab/database';
+import type { AuditEvent, ConnectionStatus, JsonObject } from '@aab/contracts';
+import { hashJobArguments, schema } from '@aab/database';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { FakeWorker } from './fake-worker.js';
 import type { Harness, SignedIn } from './helpers.js';
@@ -390,6 +390,85 @@ describe('operation execution and login handoff', () => {
       // A limit above the cap does not satisfy the grant at all.
       expectError(await execute(world, { arguments: { limit: 50 } }), 403, 'denied');
       expect(await jobRows(world.connectionId)).toHaveLength(1);
+    });
+  });
+
+  describe('POST /operations/execute: arguments hash (PE-14)', () => {
+    const judgedHash = (row: typeof schema.executionJobs.$inferSelect) =>
+      hashJobArguments({
+        organizationId: row.organizationId,
+        agentId: row.agentId!,
+        connectionId: row.connectionId,
+        operation: row.operation!,
+        arguments: row.arguments as JsonObject,
+        policyDecisionId: row.policyDecisionId,
+        timeoutMs: row.timeoutMs,
+        retrySafe: row.retrySafe,
+      });
+
+    it('stores the hash of the stored job row, and keeps it out of policy.evaluated', async () => {
+      const world = await newWorld();
+      const response = await execute(world, { arguments: { status: 'open', limit: 5 } });
+      expect(response.statusCode, response.body).toBe(202);
+      const [row] = await jobRows(world.connectionId);
+      expect(row!.argumentsHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(row!.argumentsHash).toBe(judgedHash(row!));
+      const decision = (await events(world.connectionId)).find(
+        (event) => event.eventType === 'policy.evaluated',
+      )!;
+      expect(decision.id).toBe(row!.policyDecisionId);
+      // An unkeyed hash of low-entropy values could be brute-forced, so the audit log has none:
+      // the event holds key names, never values and never the hash.
+      expect(decision.metadata).not.toHaveProperty('argumentsHash');
+      expect(JSON.stringify(decision.metadata)).not.toContain(row!.argumentsHash!);
+      expect(JSON.stringify(decision.metadata)).not.toContain('"open"');
+      const allEvents = JSON.stringify(await events(world.connectionId));
+      expect(allEvents).not.toContain(row!.argumentsHash!);
+    });
+
+    it('hashes the final arguments, with the obligations applied', async () => {
+      const world = await newWorld({ grant: { constraints: { maxResults: 7 } } });
+      expect((await execute(world, { arguments: {} })).statusCode).toBe(202);
+      const [row] = await jobRows(world.connectionId);
+      expect(row!.arguments).toEqual({ limit: 7 });
+      expect(row!.argumentsHash).toBe(judgedHash(row!));
+      expect(row!.argumentsHash).not.toBe(judgedHash({ ...row!, arguments: {} }));
+    });
+
+    it('binds the agent, decision, timeout and retry flag of the inserted row', async () => {
+      const world = await newWorld();
+      expect((await execute(world)).statusCode).toBe(202);
+      const [row] = await jobRows(world.connectionId);
+      expect(row!.policyDecisionId).not.toBeNull();
+      expect(row!.argumentsHash).toBe(judgedHash(row!));
+      for (const changed of [
+        { agentId: randomUUID() },
+        { policyDecisionId: randomUUID() },
+        { policyDecisionId: null },
+        { timeoutMs: row!.timeoutMs + 1 },
+        { retrySafe: !row!.retrySafe },
+        { organizationId: randomUUID() },
+      ]) {
+        expect(judgedHash({ ...row!, ...changed })).not.toBe(row!.argumentsHash);
+      }
+    });
+
+    it('never hashes a connection id spelled differently from the database', async () => {
+      // The hash binds the id as the worker reads it back. An uppercase spelling in the request
+      // does not get that far: policy refuses it, and no job is written.
+      const world = await newWorld();
+      const response = await execute(world, { connectionId: world.connectionId.toUpperCase() });
+      expectError(response, 403, 'denied');
+      expect(await jobRows(world.connectionId)).toHaveLength(0);
+    });
+
+    it('writes no hash for a denied request', async () => {
+      const world = await newWorld({ grant: false });
+      expectError(await execute(world, { arguments: { limit: 5 } }), 403, 'denied');
+      const decision = (await events(world.connectionId)).find(
+        (event) => event.eventType === 'policy.evaluated',
+      )!;
+      expect(decision.metadata).not.toHaveProperty('argumentsHash');
     });
   });
 

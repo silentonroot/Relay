@@ -405,8 +405,18 @@ Two migrations, both written to run on an empty database and on a database holdi
 
 - `0004_job_arguments_hash` (step B0.5): `execution_jobs.arguments_hash` (hex SHA-256 of the canonical
   JSON of the arguments the policy engine judged, obligations applied; required for operation jobs
-  created from now on; existing rows backfilled from their stored arguments). The `policy.evaluated`
-  event's metadata gains the same hash.
+  created from now on; existing rows backfilled from their stored arguments). As built (2026-11-16): the hashed text is
+  `aab.job-arguments.v1\n` followed by the canonical JSON of `{agentId, arguments, connectionId,
+operation, organizationId, policyDecisionId, retrySafe, timeoutMs}` (`jobArgumentsHashInput` in
+  `packages/contracts`, `hashJobArguments` in `packages/database`, outside `@aab/crypto` so the
+  supervisor keeps the ADR-013 import boundary), so the hash also binds the job row the arguments
+  were judged for; a check constraint requires it on operation jobs and forbids it on login jobs;
+  the backfill reproduces the canonical JSON in SQL with temporary functions that the migration
+  drops again. The hash is **not** written to the `policy.evaluated` metadata: an unkeyed SHA-256 of
+  low-entropy arguments can be brute-forced from the audit log. It may be added to audit once B3
+  keys it (the capability MAC binds it). The supervisor also refuses a job whose arguments policy
+  would change at run time (`arguments_changed_by_policy`), so the runner receives exactly the
+  hashed arguments.
 - `0005_phase3_vault` (step B1):
   - `vault_access_capabilities`: id, organization_id, job_id, agent_id (null for login), connection_id,
     secret_id, purpose (`read` or `seal`), operation (null for login), arguments_hash, issued_at,
@@ -440,6 +450,14 @@ mode and the ADR-003 statement of what the key protects. Actions: revoke the con
 delete the stored session, revoke outstanding capabilities. Rewrap and key retirement stay on the
 admin command; the `api` role cannot start them. Nothing on the dashboard or in an API response
 carries plaintext, ciphertext, a wrapped key, a token, a token hash or a MAC.
+
+### Implementation notes
+
+- The vault caches no plaintext, no policy decision and no capability. (B0.5 (c), 2026-11-16: the
+  only in-process cache in the code base is the adapter registry, keyed by adapter id and exact
+  version; `packages/adapter-sdk/test/define.test.ts` shows two versions of one id never resolve to
+  each other.) Every read goes to the database and the KEK, and a plaintext lives only for the one
+  call that needs it.
 
 ## What a compromised component can and cannot do after Phase 3
 

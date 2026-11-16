@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { canonicalJson } from './canonical.js';
 import { Connection } from './entities.js';
 import { IsoDateTime, JsonObject, OperationName, Uuid } from './primitives.js';
 
@@ -123,3 +124,58 @@ export const DEFAULT_JOB_WAIT_MS = 20_000;
 export const LOGIN_HANDOFF_TIMEOUT_MS = 10 * 60_000;
 /** The only secret type Phase 2 stores. */
 export const SESSION_SNAPSHOT_SECRET_TYPE = 'session_snapshot';
+
+/**
+ * Domain-separation prefix of the job arguments hash (threat model PE-14). It names the purpose
+ * and the layout version; a change to what is hashed needs a new version, never a reuse of v1.
+ */
+export const JOB_ARGUMENTS_HASH_DOMAIN = 'aab.job-arguments.v1\n';
+
+/**
+ * What the job arguments hash binds: the final arguments and the job row they were judged for.
+ * Every field is the exact value the execute route inserts and the worker reads back from the
+ * claimed row.
+ */
+export interface JobArgumentsBinding {
+  /** The organization id as the database returns it (lowercase). */
+  organizationId: string;
+  /** The agent id as the database returns it (lowercase). */
+  agentId: string;
+  /** The connection id as the database returns it (lowercase). */
+  connectionId: string;
+  /** The operation name exactly as stored in the job. */
+  operation: string;
+  /** The final arguments, obligations applied, exactly as stored in the job. */
+  arguments: JsonObject;
+  /** The id of the `policy.evaluated` event that allowed the job; null when the row has none. */
+  policyDecisionId: string | null;
+  /** The job's timeout in milliseconds. */
+  timeoutMs: number;
+  /** Whether the supervisor may retry the job after an interrupted run. */
+  retrySafe: boolean;
+}
+
+/**
+ * The exact text whose SHA-256 is `execution_jobs.arguments_hash`: the domain prefix followed by
+ * the canonical JSON of one object with the keys `agentId`, `arguments`, `connectionId`,
+ * `operation`, `organizationId`, `policyDecisionId` (a string or null), `retrySafe` (a boolean)
+ * and `timeoutMs` (a number). One JSON object holds everything, so no choice of operation name
+ * or argument value can shift bytes from one field into another, and a hash copied to a job of
+ * another operation, connection, agent or decision does not match there. Migration
+ * `0004_job_arguments_hash` reproduces this text in SQL for its backfill.
+ */
+export function jobArgumentsHashInput(binding: JobArgumentsBinding): string {
+  return (
+    JOB_ARGUMENTS_HASH_DOMAIN +
+    canonicalJson({
+      agentId: binding.agentId,
+      arguments: binding.arguments,
+      connectionId: binding.connectionId,
+      operation: binding.operation,
+      organizationId: binding.organizationId,
+      policyDecisionId: binding.policyDecisionId,
+      retrySafe: binding.retrySafe,
+      timeoutMs: binding.timeoutMs,
+    })
+  );
+}

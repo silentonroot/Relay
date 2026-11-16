@@ -391,6 +391,13 @@ export const executionJobs = pgTable(
     runId: uuid('run_id'),
     operation: text('operation'),
     arguments: jsonb('arguments').$type<Record<string, unknown>>(),
+    /**
+     * Lowercase hex SHA-256 binding `arguments` to the operation and connection that policy
+     * judged (threat model PE-14; layout in `jobArgumentsHashInput`, `@aab/contracts`). Set
+     * for every operation job, null for a login job. The worker refuses a job whose row no
+     * longer hashes to it.
+     */
+    argumentsHash: text('arguments_hash'),
     retrySafe: boolean('retry_safe').notNull().default(false),
     policyDecisionId: uuid('policy_decision_id'),
     approvalRequestId: uuid('approval_request_id'),
@@ -427,6 +434,10 @@ export const executionJobs = pgTable(
     check(
       'execution_jobs_kind_fields_check',
       sql`(${table.kind} = 'operation' and ${table.agentId} is not null and ${table.operation} is not null and ${table.arguments} is not null) or (${table.kind} = 'login' and ${table.agentId} is null and ${table.operation} is null and ${table.arguments} is null)`,
+    ),
+    check(
+      'execution_jobs_arguments_hash_check',
+      sql`(${table.kind} = 'operation' and ${table.argumentsHash} is not null and ${table.argumentsHash} ~ '^[0-9a-f]{64}$') or (${table.kind} = 'login' and ${table.argumentsHash} is null)`,
     ),
     check(
       'execution_jobs_arguments_check',

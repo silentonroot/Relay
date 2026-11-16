@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { rowsOf } from '../src/client.js';
 import { createRepositories } from '../src/index.js';
 import type { DatabaseHandle, ExecutionJob, Repositories } from '../src/index.js';
-import { openTestDb, seedConnectionAndAgent, seedTenant } from './helpers.js';
+import { jobArgumentsHash, openTestDb, seedConnectionAndAgent, seedTenant } from './helpers.js';
 import type { Tenant } from './helpers.js';
 
 /*
@@ -39,6 +39,16 @@ describe.skipIf(!hasServer)('jobs.claimNext under contention', () => {
           runId: null,
           operation: 'orders.list',
           arguments: {},
+          argumentsHash: jobArgumentsHash({
+            organizationId: tenant.organization.id,
+            agentId: agent.id,
+            connectionId: connection.id,
+            operation: 'orders.list',
+            arguments: {},
+            policyDecisionId: null,
+            timeoutMs: 30_000,
+            retrySafe: true,
+          }),
           retrySafe: true,
           policyDecisionId: null,
           timeoutMs: 30_000,

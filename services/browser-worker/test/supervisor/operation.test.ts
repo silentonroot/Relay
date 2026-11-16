@@ -1,9 +1,16 @@
+import { randomUUID } from 'node:crypto';
 import { SESSION_SNAPSHOT_SECRET_TYPE } from '@aab/contracts';
-import type { AuditEventType } from '@aab/contracts';
+import type { AuditEventType, JsonObject } from '@aab/contracts';
+import { hashJobArguments } from '@aab/database';
 import type { Repositories } from '@aab/database';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { jobError } from '../../src/protocol.js';
-import { createSupervisor, OPERATION_REASONS } from '../../src/supervisor/index.js';
+import {
+  ARGUMENTS_CHANGED_BY_POLICY,
+  ARGUMENTS_HASH_MISMATCH,
+  createSupervisor,
+  OPERATION_REASONS,
+} from '../../src/supervisor/index.js';
 import type { OperationJobOutcome } from '../../src/types.js';
 import {
   activeConnection,
@@ -307,6 +314,221 @@ describe('operation jobs', () => {
     expect(runner.operationCalls).toHaveLength(0);
     expect((await job(jobId)).error?.code).toBe('invalid_arguments');
     expect(await eventTypes()).not.toContain('vault.secret_read');
+  });
+
+  describe('the job row changed after the decision (PE-14, P3-17)', () => {
+    /** A direct write to the job row, as a database writer outside the broker would make it. */
+    const editRow = (jobId: string, assignments: string) =>
+      world.handle.db.execute(`update execution_jobs set ${assignments} where id = '${jobId}'`);
+
+    /** The hash of the row as stored, but with other arguments: what a careless forger writes. */
+    const hashWith = async (jobId: string, args: JsonObject) => {
+      const row = await job(jobId);
+      return hashJobArguments({
+        organizationId: row.organizationId,
+        agentId: row.agentId!,
+        connectionId: row.connectionId,
+        operation: row.operation!,
+        arguments: args,
+        policyDecisionId: row.policyDecisionId,
+        timeoutMs: row.timeoutMs,
+        retrySafe: row.retrySafe,
+      });
+    };
+
+    async function expectRefused(jobId: string) {
+      await runOnce();
+      // The runner is what starts a sandbox; it is never called.
+      expect(runner.operationCalls).toHaveLength(0);
+      const finished = await job(jobId);
+      expect(finished.status).toBe('denied');
+      expect(finished.error?.code).toBe('denied');
+      expect(finished.result).toBeNull();
+      const events = await auditEvents(world);
+      const types = events.map((event) => event.eventType);
+      expect(types).not.toContain('vault.secret_read');
+      const denied = events.filter((event) => event.eventType === 'operation.denied');
+      expect(denied).toHaveLength(1);
+      expect(denied[0]!.decision).toBe('deny');
+      expect(denied[0]!.actorType).toBe('worker');
+      expect(denied[0]!.metadata).toMatchObject({
+        jobId,
+        status: 'denied',
+        errorCode: 'denied',
+        reasonCode: ARGUMENTS_HASH_MISMATCH,
+      });
+      expect(finished.auditEventId).toBe(denied[0]!.id);
+      const described = await world.repos.vault.describeForConnection(finished.connectionId);
+      expect(described[0]?.lastAccessedAt ?? null).toBeNull();
+      return denied[0]!;
+    }
+
+    it('a job whose arguments differ from the judged hash does not run', async () => {
+      const connection = await activeConnection(world, kek);
+      const jobId = await queueOperation(world, connection.id, { arguments: { limit: 5 } });
+      // Still valid for the adapter and still allowed by the grant: without the hash the
+      // worker would run it.
+      await editRow(jobId, `arguments = '{"limit": 50}'::jsonb`);
+      const denied = await expectRefused(jobId);
+      // The audit event carries the reason, never the argument values.
+      expect(JSON.stringify(denied.metadata)).not.toContain('50');
+      expect(log.lines.join('')).toContain('job arguments do not match the judged hash');
+    });
+
+    it('an added argument is refused too', async () => {
+      const connection = await activeConnection(world, kek);
+      const jobId = await queueOperation(world, connection.id, { arguments: {} });
+      await editRow(jobId, `arguments = '{"limit": 1}'::jsonb`);
+      await expectRefused(jobId);
+    });
+
+    it('a job moved to another connection does not run there', async () => {
+      const judged = await activeConnection(world, kek);
+      const other = await activeConnection(world, kek, { state: stateWith(COOKIE_CANARY) });
+      const jobId = await queueOperation(world, judged.id);
+      await editRow(jobId, `connection_id = '${other.id}'`);
+      await expectRefused(jobId);
+      expect(log.lines.join('')).not.toContain(COOKIE_CANARY);
+    });
+
+    it('a job switched to another operation does not run', async () => {
+      const connection = await activeConnection(world, kek, { operation: 'orders.cancel' });
+      const jobId = await queueOperation(world, connection.id, { operation: 'orders.cancel' });
+      // Rewritten to a read the grant set would also allow.
+      await world.repos.grants.create(world.scope, world.agentId, {
+        connectionId: connection.id,
+        operation: 'orders.list',
+      });
+      await editRow(jobId, `operation = 'orders.list'`);
+      await expectRefused(jobId);
+    });
+
+    it('a hash replaced by the hash of other arguments is refused', async () => {
+      const connection = await activeConnection(world, kek);
+      const jobId = await queueOperation(world, connection.id, { arguments: { limit: 5 } });
+      const otherHash = await hashWith(jobId, { limit: 6 });
+      await editRow(jobId, `arguments_hash = '${otherHash}'`);
+      await expectRefused(jobId);
+    });
+
+    it('an unchanged row still runs, whatever the key order the database stores', async () => {
+      const connection = await activeConnection(world, kek);
+      const jobId = await queueOperation(world, connection.id, { arguments: { limit: 5 } });
+      // Rewriting the same value is not a change.
+      await editRow(jobId, `arguments = '{"limit": 5.0}'::jsonb`);
+      await runOnce();
+      expect(runner.operationCalls).toHaveLength(1);
+      expect((await job(jobId)).status).toBe('succeeded');
+    });
+
+    it('a job reassigned to another agent does not run', async () => {
+      const connection = await activeConnection(world, kek);
+      const jobId = await queueOperation(world, connection.id);
+      // The other agent holds a grant too, so only the hash stands in the way.
+      const other = await world.repos.agents.create(world.scope, {
+        name: 'Other',
+        clientIdentity: 'agent-2',
+      });
+      await world.repos.grants.create(world.scope, other.id, {
+        connectionId: connection.id,
+        operation: 'orders.list',
+      });
+      await editRow(jobId, `agent_id = '${other.id}'`);
+      await expectRefused(jobId);
+    });
+
+    it('a job pointed at another policy decision does not run', async () => {
+      const connection = await activeConnection(world, kek);
+      const jobId = await queueOperation(world, connection.id);
+      await editRow(jobId, `policy_decision_id = '${randomUUID()}'`);
+      await expectRefused(jobId);
+    });
+
+    it('a job whose decision id was removed does not run', async () => {
+      const connection = await activeConnection(world, kek);
+      const jobId = await queueOperation(world, connection.id);
+      await editRow(jobId, `policy_decision_id = null`);
+      await expectRefused(jobId);
+    });
+
+    it('a job with a longer timeout does not run', async () => {
+      const connection = await activeConnection(world, kek);
+      const jobId = await queueOperation(world, connection.id);
+      await editRow(jobId, `timeout_ms = 3600000`);
+      await expectRefused(jobId);
+    });
+
+    it('a job whose retry flag was flipped does not run', async () => {
+      const connection = await activeConnection(world, kek);
+      const jobId = await queueOperation(world, connection.id, { retrySafe: false });
+      await editRow(jobId, `retry_safe = true`);
+      await expectRefused(jobId);
+      const readOnly = await queueOperation(world, connection.id, { retrySafe: true });
+      await editRow(readOnly, `retry_safe = false`);
+      await runOnce();
+      expect(runner.operationCalls).toHaveLength(0);
+      expect((await job(readOnly)).status).toBe('denied');
+    });
+
+    it('residual risk until step B3: an edit that also recomputes the hash is not detected', async () => {
+      // The hash is unkeyed and stored beside the arguments, so a writer who knows the layout
+      // can replace both. The vault capability (ADR-014) is what will bind it with a MAC.
+      const connection = await activeConnection(world, kek);
+      const jobId = await queueOperation(world, connection.id, { arguments: { limit: 5 } });
+      const forged = await hashWith(jobId, { limit: 50 });
+      await editRow(jobId, `arguments = '{"limit": 50}'::jsonb, arguments_hash = '${forged}'`);
+      await runOnce();
+      expect(runner.operationCalls).toHaveLength(1);
+      expect(runner.operationCalls[0]!.arguments).toEqual({ limit: 50 });
+    });
+  });
+
+  describe('the runner receives exactly the hashed arguments', () => {
+    it('a maxResults grant added after enqueue refuses the job', async () => {
+      // No grant yet: the job was judged and stored without the limit.
+      const connection = await activeConnection(world, kek, { grant: false });
+      const jobId = await queueOperation(world, connection.id, { arguments: {} });
+      await world.repos.grants.create(world.scope, world.agentId, {
+        connectionId: connection.id,
+        operation: 'orders.list',
+        constraints: { maxResults: 7 },
+      });
+      await runOnce();
+      // Applying the new obligation would make the arguments { limit: 7 }, which the hash does
+      // not cover: no sandbox, no snapshot read.
+      expect(runner.operationCalls).toHaveLength(0);
+      const finished = await job(jobId);
+      expect(finished.status).toBe('denied');
+      expect(finished.error?.code).toBe('denied');
+      const events = await auditEvents(world);
+      expect(events.map((event) => event.eventType)).not.toContain('vault.secret_read');
+      const denied = events.find((event) => event.eventType === 'operation.denied')!;
+      expect(denied.metadata).toMatchObject({ reasonCode: ARGUMENTS_CHANGED_BY_POLICY });
+      expect(JSON.stringify(denied.metadata)).not.toContain('limit');
+    });
+
+    it('a maxResults grant that adds nothing to the stored arguments does not refuse the job', async () => {
+      const connection = await activeConnection(world, kek, {
+        grant: false,
+      });
+      await world.repos.grants.create(world.scope, world.agentId, {
+        connectionId: connection.id,
+        operation: 'orders.list',
+        constraints: { maxResults: 5 },
+      });
+      const jobId = await queueOperation(world, connection.id, { arguments: { limit: 5 } });
+      await runOnce();
+      expect(runner.operationCalls).toHaveLength(1);
+      expect(runner.operationCalls[0]!.arguments).toEqual({ limit: 5 });
+      expect((await job(jobId)).status).toBe('succeeded');
+    });
+
+    it('passes the stored arguments to the runner unchanged', async () => {
+      const connection = await activeConnection(world, kek);
+      await queueOperation(world, connection.id, { arguments: { limit: 3 } });
+      await runOnce();
+      expect(runner.operationCalls[0]!.arguments).toEqual({ limit: 3 });
+    });
   });
 
   it('fails adapter_unavailable for an unknown adapter or one without execute', async () => {

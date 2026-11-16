@@ -177,6 +177,63 @@ describe('AdapterRegistry', () => {
     expect(registry.list()).toEqual([helpdesk, next]);
   });
 
+  it('never resolves one version of an adapter id to another (cache keys, PE-14 P3 B0.5 (c))', () => {
+    // The registry is the only in-process cache: a job names an adapter id and an exact version,
+    // and must get that adapter's operations and allowed paths, never a neighbour's.
+    const registry = new AdapterRegistry();
+    const v1 = defineAdapter(
+      adapterDefinition({ version: '1.0.0', allowedOrigins: ['https://v1.example.test'] }),
+    );
+    const v10 = defineAdapter(
+      adapterDefinition({ version: '1.10.0', allowedOrigins: ['https://v10.example.test'] }),
+    );
+    const rc = defineAdapter(
+      adapterDefinition({ version: '2.0.0-rc.1', allowedOrigins: ['https://rc.example.test'] }),
+    );
+    registry.register(v1);
+    registry.register(v10);
+    registry.register(rc);
+
+    expect(registry.get('helpdesk', '1.0.0')).toBe(v1);
+    expect(registry.get('helpdesk', '1.10.0')).toBe(v10);
+    expect(registry.get('helpdesk', '2.0.0-rc.1')).toBe(rc);
+    expect(registry.get('helpdesk', '1.0.0')).not.toBe(registry.get('helpdesk', '1.10.0'));
+
+    // An unregistered version is not served from a registered one: not by prefix, not by
+    // range, not by a stand-in for "latest", and not by a key built from extra separators.
+    for (const version of [
+      '1.0',
+      '1',
+      '1.1.0',
+      '1.0.1',
+      '2.0.0',
+      '2.0.0-rc',
+      '^1.0.0',
+      '*',
+      '',
+      'latest',
+    ]) {
+      expect(registry.get('helpdesk', version), version).toBeUndefined();
+    }
+    for (const [id, version] of [
+      ['helpdesk@1.0.0', ''],
+      ['helpdesk@', '1.0.0'],
+      ['helpdesk', '1.0.0@'],
+      ['help', 'desk@1.0.0'],
+      ['Helpdesk', '1.0.0'],
+      ['helpdesk ', '1.0.0'],
+    ] as const) {
+      expect(registry.get(id, version), `${id}|${version}`).toBeUndefined();
+    }
+
+    // Two ids that share a version do not resolve to each other either.
+    const other = defineAdapter(adapterDefinition({ id: 'other', version: '1.0.0' }));
+    registry.register(other);
+    expect(registry.get('other', '1.0.0')).toBe(other);
+    expect(registry.get('helpdesk', '1.0.0')).toBe(v1);
+    expect(registry.get('other', '1.10.0')).toBeUndefined();
+  });
+
   it('rejects a duplicate id and version', () => {
     const registry = new AdapterRegistry();
     registry.register(helpdesk);

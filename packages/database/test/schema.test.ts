@@ -77,6 +77,7 @@ describe('migrations', () => {
       '0001_owner_scoped_agent_identity',
       '0002_audit_events_append_only',
       '0003_phase2_execution',
+      '0004_job_arguments_hash',
     ]);
     const applied = rowsOf(
       await handle.db.execute(sql`select count(*)::int as n from drizzle.__drizzle_migrations`),

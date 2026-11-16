@@ -1,5 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import type { Organization, User } from '@aab/contracts';
+import { PGlite } from '@electric-sql/pglite';
+import { drizzle } from 'drizzle-orm/pglite';
 import pg from 'pg';
 import { createDatabase, migrate } from '../src/index.js';
 import type { DatabaseHandle, Repositories, Scope } from '../src/index.js';
@@ -15,6 +17,20 @@ import { createTestDatabase } from '../src/testing.js';
 export async function openTestDb(): Promise<DatabaseHandle> {
   const serverUrl = process.env.AAB_TEST_DATABASE_URL;
   if (serverUrl === undefined || serverUrl === '') return createTestDatabase();
+  const handle = await openEmptyTestDb();
+  await migrate(handle.db);
+  return handle;
+}
+
+/**
+ * Like openTestDb, but no migration has been applied: for tests that migrate step by step.
+ */
+export async function openEmptyTestDb(): Promise<DatabaseHandle> {
+  const serverUrl = process.env.AAB_TEST_DATABASE_URL;
+  if (serverUrl === undefined || serverUrl === '') {
+    const client = await PGlite.create();
+    return { db: drizzle(client), close: () => client.close() };
+  }
 
   const name = `aab_test_${randomBytes(6).toString('hex')}`;
   const runAdmin = async (statement: string): Promise<void> => {
@@ -31,7 +47,6 @@ export async function openTestDb(): Promise<DatabaseHandle> {
   const target = new URL(serverUrl);
   target.pathname = `/${name}`;
   const handle = createDatabase({ connectionString: target.toString(), maxConnections: 30 });
-  await migrate(handle.db);
   return {
     db: handle.db,
     close: async () => {
@@ -40,6 +55,9 @@ export async function openTestDb(): Promise<DatabaseHandle> {
     },
   };
 }
+
+/** The job arguments hash, as the execute route computes it. */
+export { hashJobArguments as jobArgumentsHash } from '../src/index.js';
 
 /** Placeholder that only has the shape of a hash. No real password was ever involved. */
 export const SYNTHETIC_PASSWORD_HASH = 'scrypt$synthetic$not-a-real-hash';

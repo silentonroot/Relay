@@ -203,6 +203,171 @@ describe('isNavigationAllowed', () => {
     });
   });
 
+  describe('dot segments, encoded and embedded (phase 3 B0.5 (b), TA-2)', () => {
+    const ORIGIN = 'https://app.example.test';
+    // Each is refused with path_traversal for every operation and with none. The comment
+    // says what a browser or a server could turn the segment into.
+    const TRAVERSALS: [string, string][] = [
+      ['/tickets/..', 'a plain dot-dot segment'],
+      ['/tickets/.', 'a plain single-dot segment'],
+      ['/tickets/%2e%2e', 'percent-encoded dot-dot (the browser resolves it)'],
+      ['/tickets/%2E%2E', 'uppercase percent-encoded dot-dot'],
+      ['/tickets/%2E.', 'half-encoded dot-dot, uppercase first'],
+      ['/tickets/.%2e', 'half-encoded dot-dot, encoded second'],
+      ['/tickets/%2e', 'percent-encoded single dot'],
+      ['/tickets/%2e%2e%2f', 'encoded dot-dot and encoded slash'],
+      ['/tickets/%252e%252e', 'double-encoded dot-dot (a decoding proxy or server)'],
+      ['/tickets/%252E%252e', 'double-encoded dot-dot, mixed case'],
+      ['/tickets/%25252e%25252e', 'triple-encoded dot-dot'],
+      ['/tickets/%2525252e%2525252e', 'quadruple-encoded dot-dot, the last layer looked at'],
+      ['/tickets/%252525252e', 'more layers of encoding than the guard decodes'],
+      ['/tickets%252fadmin', 'double-encoded slash'],
+      ['/tickets%255cadmin', 'double-encoded backslash'],
+      ['/tickets/..%252f', 'dot-dot and a double-encoded slash'],
+      ['/tickets/..%5c', 'dot-dot and an encoded backslash'],
+      ['/tickets/%5c..', 'an encoded backslash before dot-dot'],
+      ['/tickets/..;', 'dot-dot with an empty path parameter (Tomcat, Jetty)'],
+      ['/tickets/.;', 'single dot with an empty path parameter'],
+      ['/tickets/..;x=1/admin', 'dot-dot with a path parameter, then a path'],
+      ['/tickets/%2e%2e%3b', 'encoded dot-dot with an encoded semicolon'],
+      ['/tickets/..%00', 'dot-dot with an encoded NUL a server may cut at'],
+      ['/tickets/..%20', 'dot-dot with an encoded space a server may trim'],
+      ['/tickets/...', 'a segment of dots only (trailing dots trimmed on some servers)'],
+      ['/tickets/../admin', 'dot-dot inside an allowed prefix'],
+      ['/tickets/%2e%2e/admin', 'encoded dot-dot inside an allowed prefix'],
+      ['/tickets/%252e%252e/admin', 'double-encoded dot-dot inside an allowed prefix'],
+      ['/tickets/T-1/..%2f..%2fadmin', 'dot-dots joined by encoded slashes after a placeholder'],
+      ['/tickets/T-1/%2e%2e/close', 'encoded dot-dot between a placeholder and a literal'],
+      ['/tickets/T-1/../close', 'dot-dot between a placeholder and a literal'],
+      ['/admin/../tickets', 'dot-dot that resolves back into the allowed path'],
+      ['/admin/%2e%2e/tickets', 'encoded dot-dot that resolves back into the allowed path'],
+      // Overlong UTF-8: invalid, but a lenient decoder reads the lead bytes as the ASCII character.
+      ['/tickets/%c0%ae%c0%ae', 'overlong UTF-8 dot-dot (two-byte, lead byte c0)'],
+      ['/tickets/%C0%AE%C0%AE', 'overlong UTF-8 dot-dot, uppercase'],
+      ['/tickets/%c0%af', 'overlong UTF-8 slash'],
+      ['/tickets/%c1%9c', 'overlong UTF-8 backslash (lead byte c1)'],
+      ['/tickets/%c1%1c', 'a c1 lead byte followed by a non-continuation byte'],
+      ['/tickets/%c0', 'a lone c0 lead byte'],
+      ['/tickets/%e0%80%ae%e0%80%ae', 'overlong three-byte UTF-8 dot-dot'],
+      ['/tickets/%e0%80%af', 'overlong three-byte UTF-8 slash'],
+      ['/tickets/%e0%9f%bf', 'e0 followed by a byte below a0 (overlong, no ASCII imitated)'],
+      ['/tickets/%f0%80%80%ae', 'overlong four-byte UTF-8 dot'],
+      ['/tickets/%f0%80%80%af', 'overlong four-byte UTF-8 slash'],
+      [
+        '/tickets/%25c0%25ae%25c0%25ae',
+        'double-encoded overlong dot-dot, invalid at the second round',
+      ],
+      ['/tickets/%ff', 'a byte that is never valid UTF-8'],
+      ['/tickets/%80', 'a lone continuation byte'],
+      ['/tickets/%c3', 'a truncated two-byte sequence'],
+      ['/tickets/%ed%a0%80', 'an encoded UTF-16 surrogate'],
+      // IIS-style %u escapes.
+      ['/tickets/%u002e%u002e', 'IIS %u escapes of dot-dot'],
+      ['/tickets/%U002E%U002E', 'IIS %u escapes, uppercase'],
+      ['/tickets/%u002f', 'IIS %u escape of a slash'],
+      ['/tickets/%u005c', 'IIS %u escape of a backslash'],
+      ['/tickets/%u2215', 'IIS %u escape of a division slash lookalike'],
+      ['/tickets/%u0041', 'any %u escape, even of a harmless letter'],
+      ['/tickets/%25u002e%25u002e', 'double-encoded IIS %u escapes'],
+      // Unicode lookalikes: NFKC folds each of these to an ASCII dot or separator.
+      ['/tickets/%ef%bc%8e%ef%bc%8e', 'fullwidth full stops U+FF0E, percent-encoded UTF-8'],
+      ['/tickets/\uff0e\uff0e', 'fullwidth full stops written raw'],
+      ['/tickets/\uff0e.', 'a fullwidth full stop beside an ASCII one'],
+      ['/tickets/%e2%80%a4%e2%80%a4', 'one dot leaders U+2024'],
+      ['/tickets/\u2024\u2024', 'one dot leaders written raw'],
+      ['/tickets/%ef%b9%92%ef%b9%92', 'small full stops U+FE52'],
+      ['/tickets/\ufe52\ufe52', 'small full stops written raw'],
+      ['/tickets/%ef%bc%8fadmin', 'fullwidth solidus U+FF0F'],
+      ['/tickets/a\uff0fb', 'fullwidth solidus written raw'],
+      ['/tickets/%ef%bc%bcadmin', 'fullwidth reverse solidus U+FF3C'],
+      ['/tickets/a\uff3cb', 'fullwidth reverse solidus written raw'],
+      ['/tickets/%ef%bc%8e%ef%bc%8e%ef%bc%8f', 'fullwidth dot-dot and solidus'],
+      ['/tickets/%25ef%25bc%258e%25ef%25bc%258e', 'double-encoded fullwidth dot-dot'],
+      ['/tickets/\uff05\uff12\uff45\uff05\uff12\uff45', 'fullwidth percent-encoded dot-dot'],
+      ['/tickets/\uff05\uff12\uff46', 'fullwidth percent-encoded slash'],
+      // Dots followed by Unicode whitespace, which a server may trim.
+      ['/tickets/..%c2%a0', 'dot-dot and a no-break space'],
+      ['/tickets/.%c2%a0', 'a dot and a no-break space'],
+      ['/tickets/..%e2%80%80', 'dot-dot and an en quad'],
+      ['/tickets/..%e3%80%80', 'dot-dot and an ideographic space'],
+      ['/tickets/..%c2%85', 'dot-dot and a next-line character'],
+      ['/tickets/..%e2%80%8b', 'dot-dot and a zero-width space'],
+      ['/tickets/%252e%25c2%25a0', 'double-encoded dot and no-break space'],
+    ];
+
+    it.each(TRAVERSALS)('blocks %s (%s)', (path) => {
+      const url = `${ORIGIN}${path}`;
+      for (const operation of [READ, WRITE, null]) {
+        expect(isNavigationAllowed(helpdesk, operation, url)).toEqual({
+          allowed: false,
+          reason: 'path_traversal',
+        });
+      }
+    });
+
+    it.each<[string, string | null, string]>([
+      ['/tickets/T-1.2', WRITE, 'a dot inside a placeholder value'],
+      ['/tickets/T-1..', WRITE, 'trailing dots after other characters (not a dot segment)'],
+      ['/.well-known/security.txt', null, 'a segment that starts with a dot'],
+      ['/tickets/100%25', null, 'an encoded percent sign that encodes nothing further'],
+      ['/tickets/100%2525', null, 'a double-encoded percent sign'],
+      ['/tickets?path=../admin', READ, 'dot segments in the query string, which is not a path'],
+      ['/tickets#../admin', READ, 'dot segments in the fragment'],
+      ['/tickets/caf%C3%A9', null, 'valid UTF-8 for a letter that is no lookalike'],
+      ['/caf%C3%A9', null, 'valid UTF-8 for a letter, no operation'],
+      ['/tickets/caf\u00e9', null, 'the same letter written raw'],
+      ['/tickets/%E4%B8%AD%E6%96%87', null, 'valid UTF-8 for CJK letters'],
+      ['/tickets/%F0%9F%98%80', null, 'valid four-byte UTF-8 (an emoji)'],
+      ['/tickets/T-1.2.3', null, 'dots between digits'],
+      ['/tickets/..a', null, 'dots followed by a letter are a name, not a dot segment'],
+      [
+        '/tickets?x=%c0%ae%c0%ae&y=%u002e',
+        READ,
+        'lookalikes in the query string, which is not a path',
+      ],
+      ['/tickets#%ef%bc%8e%ef%bc%8e', READ, 'lookalikes in the fragment'],
+    ])('still allows %s (%s)', (path, operation) => {
+      expect(isNavigationAllowed(helpdesk, operation, `${ORIGIN}${path}`)).toEqual({
+        allowed: true,
+      });
+    });
+
+    it('refuses a path parameter carrying a dot segment wherever the adapter places it', () => {
+      // Adapters build paths as text (`/tickets/${id}`) and the facade loads origin + path, so
+      // the guard sees the value exactly where it was placed.
+      for (const value of [
+        '..',
+        '.',
+        '%2e%2e',
+        '.%2E',
+        '%252e%252e',
+        '..%2fadmin',
+        '..%252fadmin',
+        '..;',
+        '..%00',
+      ]) {
+        for (const path of [`/tickets/${value}`, `/tickets/${value}/close`]) {
+          expect(isNavigationAllowed(helpdesk, WRITE, `${ORIGIN}${path}`)).toEqual({
+            allowed: false,
+            reason: 'path_traversal',
+          });
+          expect(matchesPathPattern('/tickets/:ticketId', path)).toBe(false);
+          expect(matchesPathPattern('/tickets/:ticketId/close', path)).toBe(false);
+        }
+      }
+    });
+
+    it('refuses an encoded dot segment that the URL parser does not resolve, before matching', () => {
+      // The parser leaves %252e%252e alone, so the pathname still looks like a placeholder
+      // value; the guard refuses it on the raw text, not on the parsed pathname.
+      expect(new URL(`${ORIGIN}/tickets/%252e%252e`).pathname).toBe('/tickets/%252e%252e');
+      expect(isNavigationAllowed(helpdesk, WRITE, `${ORIGIN}/tickets/%252e%252e`)).toEqual({
+        allowed: false,
+        reason: 'path_traversal',
+      });
+    });
+  });
+
   it('allows http only for a loopback origin that is on the allowlist', () => {
     const local = defineAdapter(adapterDefinition({ allowedOrigins: ['http://localhost:4100'] }));
     expect(isNavigationAllowed(local, READ, 'http://localhost:4100/tickets')).toEqual({

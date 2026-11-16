@@ -24,6 +24,8 @@ export interface ExecutionJob {
   runId: string | null;
   operation: string | null;
   arguments: JsonObject | null;
+  /** Hash of the judged arguments, operation and connection (PE-14). Null for a login job. */
+  argumentsHash: string | null;
   retrySafe: boolean;
   policyDecisionId: string | null;
   approvalRequestId: string | null;
@@ -58,6 +60,11 @@ export interface CreateOperationJobInput {
   runId: string | null;
   operation: string;
   arguments: JsonObject;
+  /**
+   * `hashJobArguments` (this package) of exactly `operation`, `connectionId` and `arguments`,
+   * computed by the caller that had them judged. Lowercase hex SHA-256.
+   */
+  argumentsHash: string;
   retrySafe: boolean;
   policyDecisionId: string | null;
   timeoutMs: number;
@@ -106,6 +113,7 @@ export function toExecutionJob(row: typeof executionJobs.$inferSelect): Executio
     runId: row.runId,
     operation: row.operation,
     arguments: row.arguments as JsonObject | null,
+    argumentsHash: row.argumentsHash,
     retrySafe: row.retrySafe,
     policyDecisionId: row.policyDecisionId,
     approvalRequestId: row.approvalRequestId,
@@ -184,6 +192,11 @@ export function createJobRepository(db: Db) {
           { path: 'arguments', message: 'expected an object' },
         ]);
       }
+      if (typeof input.argumentsHash !== 'string' || !SHA256_HEX.test(input.argumentsHash)) {
+        throw new ValidationError('invalid job', [
+          { path: 'argumentsHash', message: 'expected a lowercase hex SHA-256' },
+        ]);
+      }
       return translateDbErrors('job', () =>
         db.transaction(async (tx) => {
           const [connection] = await tx
@@ -217,6 +230,7 @@ export function createJobRepository(db: Db) {
               runId: input.runId,
               operation: input.operation,
               arguments: input.arguments,
+              argumentsHash: input.argumentsHash,
               retrySafe: input.retrySafe,
               policyDecisionId: input.policyDecisionId,
               timeoutMs: input.timeoutMs,

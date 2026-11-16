@@ -15,7 +15,7 @@ import {
   Routes,
 } from '@aab/contracts';
 import type { AuditDecision, JsonObject, PolicyDecision } from '@aab/contracts';
-import { ConflictError, NotFoundError } from '@aab/database';
+import { ConflictError, hashJobArguments, NotFoundError } from '@aab/database';
 import type { ExecutionJob, OwnerScope, Repositories } from '@aab/database';
 import { evaluate } from '@aab/policy-engine';
 import type { EvaluateInput } from '@aab/policy-engine';
@@ -317,15 +317,32 @@ export function registerExecutionRoutes(
                 obligationKeys: Object.keys(decision.obligations).sort(),
               }),
             );
+            // Binds the stored arguments to the job they were judged for (PE-14). Computed once
+            // the decision id exists, from the very values inserted below; the ids come from
+            // database rows, so they are spelled as the worker will read them back. The hash is
+            // not written to the audit event: unkeyed, it could be brute-forced from low-entropy
+            // arguments (it may be added once B3 keys it).
+            const retrySafe = definition.idempotent && definition.sensitivity === 'read';
+            const argumentsHash = hashJobArguments({
+              organizationId: auth.scope.organizationId,
+              agentId: agent!.id,
+              connectionId: connection!.id,
+              operation: body.operation,
+              arguments: finalArguments,
+              policyDecisionId: event.id,
+              timeoutMs: definition.timeoutMs,
+              retrySafe,
+            });
             const created = await tx.jobs.createOperation({
               organizationId: auth.scope.organizationId,
               requestedByUserId: auth.scope.userId,
-              agentId: body.agentId,
-              connectionId: body.connectionId,
+              agentId: agent!.id,
+              connectionId: connection!.id,
               runId: body.runId ?? null,
               operation: body.operation,
               arguments: finalArguments,
-              retrySafe: definition.idempotent && definition.sensitivity === 'read',
+              argumentsHash,
+              retrySafe,
               policyDecisionId: event.id,
               timeoutMs: definition.timeoutMs,
             });

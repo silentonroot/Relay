@@ -3,10 +3,10 @@ import { AdapterRegistry, defineAdapter, defineOperation } from '@aab/adapter-sd
 import type { SanitizedResult } from '@aab/adapter-sdk';
 import type { Connection, JsonObject } from '@aab/contracts';
 import { InMemoryKekProvider } from '@aab/crypto';
-import { createRepositories, schema } from '@aab/database';
+import { createRepositories, hashJobArguments, schema } from '@aab/database';
 import type { DatabaseHandle, Repositories } from '@aab/database';
 import { createTestDatabase } from '@aab/database/testing';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { pino } from 'pino';
 import type { Logger } from 'pino';
 import { z } from 'zod';
@@ -38,6 +38,8 @@ function operation(name: string, sensitivity: 'read' | 'write') {
     sideEffects: sensitivity === 'read' ? [] : ['changes orders'],
     timeoutMs: 30_000,
     allowedPaths: ['/orders'],
+    // So a maxResults grant can name the limit it caps.
+    ...(sensitivity === 'read' ? { limitArgument: 'limit' } : {}),
   });
 }
 
@@ -233,16 +235,32 @@ export async function queueOperation(
   connectionId: string,
   options: { operation?: string; arguments?: JsonObject; retrySafe?: boolean } = {},
 ): Promise<string> {
+  const operation = options.operation ?? 'orders.list';
+  const args = options.arguments ?? { limit: 5 };
+  const retrySafe = options.retrySafe ?? true;
+  // The route stores the id of the policy.evaluated event; any uuid serves here.
+  const policyDecisionId = randomUUID();
   const job = await world.repos.jobs.createOperation({
     organizationId: world.scope.organizationId,
     requestedByUserId: world.scope.userId,
     agentId: world.agentId,
     connectionId,
     runId: null,
-    operation: options.operation ?? 'orders.list',
-    arguments: options.arguments ?? { limit: 5 },
-    retrySafe: options.retrySafe ?? true,
-    policyDecisionId: null,
+    operation,
+    arguments: args,
+    // As the execute route computes it for the judged arguments.
+    argumentsHash: hashJobArguments({
+      organizationId: world.scope.organizationId,
+      agentId: world.agentId,
+      connectionId,
+      operation,
+      arguments: args,
+      policyDecisionId,
+      timeoutMs: 30_000,
+      retrySafe,
+    }),
+    retrySafe,
+    policyDecisionId,
     timeoutMs: 30_000,
   });
   return job.id;
