@@ -94,9 +94,10 @@ Not verified, or known gaps (each is listed in the threat model and the [backlog
   session there, and can return false data that passes the output schema.
 - A compromised supervisor, host, kernel or sandbox is out of scope. The supervisor holds the key
   until Phase 3.
-- Continuous integration does not run the sandbox tests or the end-to-end test; they are in the
-  nightly workflow, which has not run yet. The `ci` workflow has run on GitHub and passed, and
-  its `containers` job builds the container images and starts the Compose stack. Base images are
+- The `ci` workflow does not run the sandbox tests or the end-to-end test; they are in the nightly
+  workflow. No scheduled nightly run has passed yet: a manual run on 2026-11-16 (run 43806552036,
+  commit ed7cecc) passed all four jobs, including both tests, after three earlier failed runs. The
+  `ci` workflow has run on GitHub and passed, and its `containers` job builds the container images and starts the Compose stack. Base images are
   pinned by tag and digest.
 - The dashboard's Phase 2 screens are tested against a mock API only, not in a browser against the
   real API.
@@ -282,9 +283,11 @@ Three workflows and a Dependabot configuration are written for the repository's 
   attestation, and a GitHub release. There is no deployment workflow, because AAB runs on its
   owner's machine.
 
-`ci.yml` has run on GitHub: its first run, on 2026-11-13, passed all five jobs. `nightly.yml` and
-`release.yml` have not run yet, so the nightly runner preparation and the image scanner have never
-run anywhere. Dependabot has run and opened its first pull requests.
+`ci.yml` has run on GitHub: its first run, on 2026-11-13, passed all five jobs. `nightly.yml` has
+run four times (two scheduled, two manual); the first three runs failed and a manual run on
+2026-11-16 passed all four jobs, so the runner preparation, the image scanner and the end-to-end
+test have run on a runner. No scheduled run has passed yet. `release.yml` has not run. Dependabot
+has run and opened its first pull requests.
 
 ## Documentation
 

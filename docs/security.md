@@ -176,7 +176,7 @@ container isolation, a vault service and an external review.
 | Runner output treated as hostile by the supervisor                                                 | Built: size cap, strict schemas, fixed error text, second sanitisation. Parsing is tested; no test runs a hostile runner through the whole path.                                                                                                                                                                                                                              |
 | Session snapshots sealed, filtered to allowed origins, bound to their connection                   | Built in the worker's session store and tested, including moved and tampered ciphertext. Cookies on a parent domain are dropped.                                                                                                                                                                                                                                              |
 | Ciphertext deleted on revocation, expiry and identity mismatch                                     | Built and tested (`supervisor/operation.test.ts`, `e2e/phase2.e2e.test.ts` steps G and H). A database backup taken earlier still holds it.                                                                                                                                                                                                                                    |
-| Sandbox and end-to-end tests run in CI                                                             | Not done. They skip when their prerequisites are missing and `ci.yml` does not run them; the nightly workflow does, and it has not run yet.                                                                                                                                                                                                                                   |
+| Sandbox and end-to-end tests run in CI                                                             | Partly done. They skip when their prerequisites are missing and `ci.yml` does not run them; the nightly workflow does. A manual nightly run on 2026-11-16 passed all four jobs, including both; no scheduled run has passed yet.                                                                                                                                              |
 
 ## 4. Controls that exist today
 
@@ -292,13 +292,14 @@ check that closes it exists. Backlog tickets (AAB-017 to AAB-031) are in [`backl
     provisional, awaiting the owner. Registration still accepts hostnames that resolve to private
     addresses (they are refused at connect time) and does not check that the named adapter exists.
     (AAB-030)
-14. Continuous integration does not run the sandbox integration tests or the end-to-end test (they need
+14. The `ci` workflow does not run the sandbox integration tests or the end-to-end test (they need
     bubblewrap with unprivileged user namespaces, Chromium, Xvfb, xdotool and PostgreSQL; the
     integration tests skip when the prerequisites are missing, and the end-to-end test runs only on
     request, and the Docker tests skip without a Docker engine and the image). The `ci` workflow has run on
     GitHub and passed (first run 2026-11-13); its `containers` job builds the container images and
-    starts the Compose stack. The nightly workflow, which holds the sandbox and end-to-end tests,
-    has not run. The images and the stack were also built and started by hand on 2026-11-13 (the checks, including
+    starts the Compose stack. The nightly workflow holds the sandbox and end-to-end tests; its first
+    three runs failed (2026-11-14 and 2026-11-15) and a manual run on 2026-11-16 (run 43806552036)
+    passed all four jobs. No scheduled run has passed yet. The images and the stack were also built and started by hand on 2026-11-13 (the checks, including
     those that close F-4, F-5 and F-9 as configuration-only claims, are listed in the threat model,
     section 6.1; they were manual, not automated tests). Base images are pinned by tag and digest (2026-11-13).
     (AAB-020, AAB-031)
