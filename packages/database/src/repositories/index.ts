@@ -1,5 +1,6 @@
 import type { Db } from '../client.js';
 import { createAuditRepository } from './audit.js';
+import { createCapabilityRepository } from './capabilities.js';
 import { createJobRepository, createOperationRequestRepository } from './execution.js';
 import { createGrantRepository } from './grants.js';
 import {
@@ -26,6 +27,7 @@ export interface Repositories {
   jobs: ReturnType<typeof createJobRepository>;
   operationRequests: ReturnType<typeof createOperationRequestRepository>;
   vault: ReturnType<typeof createVaultRepository>;
+  capabilities: ReturnType<typeof createCapabilityRepository>;
   /**
    * Runs `work` in one database transaction with repositories bound to it. Use it to make a
    * change and its audit event atomic: if `work` throws, both are rolled back.
@@ -46,6 +48,7 @@ export function createRepositories(db: Db): Repositories {
     jobs: createJobRepository(db),
     operationRequests: createOperationRequestRepository(db),
     vault: createVaultRepository(db),
+    capabilities: createCapabilityRepository(db),
     transaction: (work) => db.transaction((tx) => work(createRepositories(tx))),
   };
 }

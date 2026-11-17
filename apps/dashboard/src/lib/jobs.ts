@@ -36,4 +36,8 @@ export const JOB_ERROR_TEXT: Record<JobErrorCode, string> = {
   cancelled: 'This was cancelled before it finished.',
   worker_failure:
     'The browser worker failed while doing this. Nothing is known about the outcome beyond this message.',
+  vault_unavailable:
+    'The vault could not be reached, so the stored session was not used and nothing was done. You can try again.',
+  vault_denied:
+    'The vault refused access to the stored session, so nothing was done. Submit the request again.',
 };

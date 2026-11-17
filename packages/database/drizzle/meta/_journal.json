@@ -36,6 +36,13 @@
       "when": 1794836501607,
       "tag": "0004_job_arguments_hash",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1794882282798,
+      "tag": "0005_phase3_vault",
+      "breakpoints": true
     }
   ]
 }

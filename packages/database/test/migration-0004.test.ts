@@ -183,7 +183,11 @@ describe('migration 0004_job_arguments_hash on a database with Phase 2 rows', ()
     );
     loginJobId = String(login[0]!.id);
 
-    expect(await migrate(handle.db)).toEqual({ applied: 1 });
+    // 0004 and every migration after it (0005 and later) are pending on this database.
+    const pending =
+      readMigrationFiles({ migrationsFolder: MIGRATIONS_FOLDER }).length - PHASE_2_MIGRATIONS;
+    expect(pending).toBeGreaterThanOrEqual(1);
+    expect(await migrate(handle.db)).toEqual({ applied: pending });
   }, 120_000);
 
   afterAll(async () => {

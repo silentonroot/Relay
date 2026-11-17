@@ -370,8 +370,16 @@ describe('operation jobs', () => {
       // worker would run it.
       await editRow(jobId, `arguments = '{"limit": 50}'::jsonb`);
       const denied = await expectRefused(jobId);
-      // The audit event carries the reason, never the argument values.
-      expect(JSON.stringify(denied.metadata)).not.toContain('50');
+      // The audit event carries the reason, never the argument values. The job id (a random
+      // UUID) and the wall-clock duration may contain the characters "50" by chance, so they are
+      // left out of the substring check; the argument key must not appear anywhere.
+      const {
+        jobId: _jobId,
+        durationMs: _durationMs,
+        ...facts
+      } = denied.metadata as Record<string, unknown>;
+      expect(JSON.stringify(facts)).not.toContain('50');
+      expect(JSON.stringify(denied.metadata)).not.toContain('limit');
       expect(log.lines.join('')).toContain('job arguments do not match the judged hash');
     });
 

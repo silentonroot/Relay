@@ -15,6 +15,7 @@ import {
   toPage,
 } from '../support.js';
 import type { Page, PageRequest, Scope } from '../support.js';
+import { createCapabilityRepository } from './capabilities.js';
 import { parseInput } from './resources.js';
 
 /** Like the contracts request, except that fields with defaults may be omitted. */
@@ -152,6 +153,14 @@ export function createGrantRepository(db: Db) {
         throw new NotFoundError('grant');
       }
       return db.transaction(async (tx) => {
+        // The agent row first, FOR NO KEY UPDATE: `insertAuthorization` locks it FOR SHARE, so an
+        // authorization is either committed before this revocation (and revoked below) or waits
+        // for it and is refused (ADR-014 section 7, review finding M1).
+        await tx
+          .select({ id: agents.id })
+          .from(agents)
+          .where(agentInScope(scope, agentId))
+          .for('no key update');
         const [current] = await tx
           .select({ grant: agentGrants })
           .from(agentGrants)
@@ -169,6 +178,16 @@ export function createGrantRepository(db: Db) {
           .set({ revokedAt: now, updatedAt: now })
           .where(eq(agentGrants.id, grantId))
           .returning();
+        // P3-18: the agent's unused capabilities for this connection die with the grant, in
+        // the same transaction (ADR-014 section 7). Wider than the one operation on purpose:
+        // revoking too much fails a job, revoking too little leaves access nobody granted.
+        await createCapabilityRepository(tx).revokeForAgentConnection({
+          agentId: current.grant.agentId,
+          connectionId: current.grant.connectionId,
+          reason: 'grant_revoked',
+          now,
+          actor: { type: 'user', id: scope.userId },
+        });
         return { grant: toGrant(row!), changed: true };
       });
     },

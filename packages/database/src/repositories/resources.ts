@@ -34,6 +34,7 @@ import {
   toPage,
 } from '../support.js';
 import type { Page, PageRequest, Scope } from '../support.js';
+import { createCapabilityRepository } from './capabilities.js';
 
 /**
  * The slice of a Zod schema this package uses. Declared structurally because zod is not a
@@ -202,6 +203,18 @@ export function createConnectionRepository(db: Db) {
           actorId: actor.id,
           createdAt: now,
         });
+        if (input.to === 'revoked') {
+          // P3-8, P3-18: the capabilities of a revoked connection die in the same transaction.
+          // The connection row is already locked by this transaction (the lock order of
+          // ADR-014 section 7); the audit event commits with it.
+          await createCapabilityRepository(tx).revokeForConnection({
+            connectionId: current.id,
+            reason: 'connection_revoked',
+            now,
+            actor:
+              scope === null ? { type: 'system', id: null } : { type: 'user', id: scope.userId },
+          });
+        }
         return toConnection(updated!);
       }),
     );
@@ -438,13 +451,31 @@ export function createAgentRepository(db: Db) {
     /** Idempotent. A disabled agent keeps its grants but the policy engine denies it. */
     async disable(scope: Scope, id: string): Promise<Agent> {
       if (!isValidScope(scope) || !isUuid(id)) throw new NotFoundError('agent');
-      const [row] = await db
-        .update(agents)
-        .set({ status: 'disabled', updatedAt: new Date() })
-        .where(and(inScope(scope), eq(agents.id, id)))
-        .returning();
-      if (row === undefined) throw new NotFoundError('agent');
-      return toAgent(row);
+      return db.transaction(async (tx) => {
+        const now = new Date();
+        // The agent row FOR NO KEY UPDATE before anything is revoked: `insertAuthorization` locks
+        // it FOR SHARE (ADR-014 section 7, review finding M1).
+        await tx
+          .select({ id: agents.id })
+          .from(agents)
+          .where(and(inScope(scope), eq(agents.id, id)))
+          .for('no key update');
+        const [row] = await tx
+          .update(agents)
+          .set({ status: 'disabled', updatedAt: now })
+          .where(and(inScope(scope), eq(agents.id, id)))
+          .returning();
+        if (row === undefined) throw new NotFoundError('agent');
+        // P3-18: the agent's unused capabilities are revoked in the same transaction.
+        await createCapabilityRepository(tx).revokeForAgentConnection({
+          agentId: row.id,
+          connectionId: null,
+          reason: 'agent_disabled',
+          now,
+          actor: { type: 'user', id: scope.userId },
+        });
+        return toAgent(row);
+      });
     },
   };
 }

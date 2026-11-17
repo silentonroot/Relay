@@ -61,6 +61,10 @@ export const JobErrorCode = z.enum([
   'worker_failure',
   'login_not_completed',
   'login_window_closed',
+  /** The vault could not be reached, or failed or timed out (ADR-014 section 9). */
+  'vault_unavailable',
+  /** The vault refused the job's capability (ADR-014 section 9). */
+  'vault_denied',
 ]);
 export type JobErrorCode = z.infer<typeof JobErrorCode>;
 

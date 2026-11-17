@@ -71,8 +71,20 @@ export const JOB_ERROR_CODES = [
   'worker_failure',
   'login_not_completed',
   'login_window_closed',
+  'vault_unavailable',
+  'vault_denied',
 ] as const;
-export const VAULT_SECRET_STATUSES = ['pending', 'active', 'deleted'] as const;
+/** `revoked` is terminal: a trigger (migration 0005) refuses any change out of it. */
+export const VAULT_SECRET_STATUSES = ['pending', 'active', 'deleted', 'revoked'] as const;
+export const CAPABILITY_PURPOSES = ['read', 'seal'] as const;
+export const CAPABILITY_REVOCATION_REASONS = [
+  'connection_revoked',
+  'grant_revoked',
+  'agent_disabled',
+  'session_deleted',
+  'lease_recovery',
+  'owner_requested',
+] as const;
 
 /** Millisecond precision so a value survives the round trip through a JavaScript Date. */
 const instant = (name: string) =>
@@ -401,7 +413,11 @@ export const executionJobs = pgTable(
     retrySafe: boolean('retry_safe').notNull().default(false),
     policyDecisionId: uuid('policy_decision_id'),
     approvalRequestId: uuid('approval_request_id'),
-    capabilityRef: text('capability_ref'),
+    /**
+     * The `vault_access_capabilities` row that authorizes this job (ADR-014 section 5), set by
+     * the vault with a conditional update while the job is queued. Null until then.
+     */
+    capabilityRef: uuid('capability_ref').references((): AnyPgColumn => vaultAccessCapabilities.id),
     status: text('status', { enum: JOB_STATUSES }).notNull().default('queued'),
     attemptCount: integer('attempt_count').notNull().default(0),
     timeoutMs: integer('timeout_ms').notNull(),
@@ -422,6 +438,11 @@ export const executionJobs = pgTable(
   (table) => [
     index('execution_jobs_claim_idx').on(table.status, table.createdAt),
     index('execution_jobs_connection_status_idx').on(table.connectionId, table.status),
+    // One job per policy decision (ADR-014 section 5, review finding L1): a decision cannot
+    // authorize a second job.
+    uniqueIndex('execution_jobs_policy_decision_unique')
+      .on(table.policyDecisionId)
+      .where(sql`${table.policyDecisionId} is not null`),
     uniqueIndex('execution_jobs_active_login_unique')
       .on(table.connectionId)
       .where(sql`${table.kind} = 'login' and ${table.status} in ('queued', 'running')`),
@@ -524,5 +545,101 @@ export const vaultSecretVersions = pgTable(
     check('vault_secret_versions_version_check', sql`${table.version} >= 1`),
     check('vault_secret_versions_kek_version_check', sql`${table.kekVersion} >= 1`),
     check('vault_secret_versions_aad_version_check', sql`${table.aadVersion} >= 1`),
+  ],
+);
+
+/**
+ * Worker capabilities (ADR-014 sections 5 and 6, migration 0005). Stage 1 inserts the row with
+ * the authorization MAC; stage 2 adds the token hash, worker, attempt, bound secret version and
+ * token MAC; the consume sets `used_at` in one conditional UPDATE. The raw token is never
+ * stored. The MAC columns are written by the vault; this package stores and returns them.
+ * Rows are purged seven days after `expires_at`.
+ */
+export const vaultAccessCapabilities = pgTable(
+  'vault_access_capabilities',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .notNull()
+      .references(() => organizations.id),
+    jobId: uuid('job_id')
+      .notNull()
+      .references(() => executionJobs.id),
+    /** Null for a login capability. Plain uuid: the job row holds the foreign key. */
+    agentId: uuid('agent_id'),
+    connectionId: uuid('connection_id')
+      .notNull()
+      .references(() => connections.id),
+    secretId: uuid('secret_id')
+      .notNull()
+      .references(() => vaultSecrets.id),
+    purpose: text('purpose', { enum: CAPABILITY_PURPOSES }).notNull(),
+    /** Null for a login capability. */
+    operation: text('operation'),
+    /** The job's `arguments_hash`; null for a login capability. */
+    argumentsHash: text('arguments_hash'),
+    issuedAt: instant('issued_at').notNull(),
+    expiresAt: instant('expires_at').notNull(),
+    authorizationMac: text('authorization_mac').notNull(),
+    macKekVersion: integer('mac_kek_version').notNull(),
+    workerId: text('worker_id'),
+    attempt: integer('attempt'),
+    /** The active version at issue (0 for a seal capability when there was none). */
+    secretVersion: integer('secret_version'),
+    tokenHash: text('token_hash'),
+    tokenIssuedAt: instant('token_issued_at'),
+    tokenExpiresAt: instant('token_expires_at'),
+    tokenMac: text('token_mac'),
+    usedAt: instant('used_at'),
+    revokedAt: instant('revoked_at'),
+    revokedReason: text('revoked_reason', { enum: CAPABILITY_REVOCATION_REASONS }),
+    createdAt: createdAt(),
+  },
+  (table) => [
+    uniqueIndex('vault_access_capabilities_token_hash_unique').on(table.tokenHash),
+    // One unused, unrevoked capability per job.
+    uniqueIndex('vault_access_capabilities_job_open_unique')
+      .on(table.jobId)
+      .where(sql`${table.usedAt} is null and ${table.revokedAt} is null`),
+    index('vault_access_capabilities_connection_idx').on(table.connectionId),
+    index('vault_access_capabilities_agent_idx').on(table.agentId, table.connectionId),
+    index('vault_access_capabilities_expires_at_idx').on(table.expiresAt),
+    check('vault_access_capabilities_purpose_check', oneOf(table.purpose, CAPABILITY_PURPOSES)),
+    check(
+      'vault_access_capabilities_purpose_fields_check',
+      sql`(${table.purpose} = 'read' and ${table.agentId} is not null and ${table.operation} is not null and ${table.argumentsHash} is not null) or (${table.purpose} = 'seal' and ${table.agentId} is null and ${table.operation} is null and ${table.argumentsHash} is null)`,
+    ),
+    check(
+      'vault_access_capabilities_expiry_check',
+      sql`${table.expiresAt} > ${table.issuedAt} and ${table.expiresAt} <= ${table.issuedAt} + interval '1 hour'`,
+    ),
+    check(
+      'vault_access_capabilities_token_state_check',
+      sql`(${table.tokenHash} is null and ${table.tokenIssuedAt} is null and ${table.tokenExpiresAt} is null and ${table.workerId} is null and ${table.attempt} is null and ${table.secretVersion} is null and ${table.tokenMac} is null) or (${table.tokenHash} is not null and ${table.tokenIssuedAt} is not null and ${table.tokenExpiresAt} is not null and ${table.workerId} is not null and ${table.attempt} is not null and ${table.secretVersion} is not null)`,
+    ),
+    check(
+      'vault_access_capabilities_token_expiry_check',
+      sql`${table.tokenExpiresAt} is null or (${table.tokenExpiresAt} > ${table.tokenIssuedAt} and ${table.tokenExpiresAt} <= ${table.tokenIssuedAt} + interval '120 seconds' and ${table.tokenExpiresAt} <= ${table.expiresAt})`,
+    ),
+    check(
+      'vault_access_capabilities_used_check',
+      sql`${table.usedAt} is null or ${table.tokenHash} is not null`,
+    ),
+    check(
+      'vault_access_capabilities_revoked_check',
+      sql`(${table.revokedAt} is null and ${table.revokedReason} is null) or (${table.revokedAt} is not null and ${table.revokedReason} is not null)`,
+    ),
+    check(
+      'vault_access_capabilities_revoked_reason_check',
+      sql`${table.revokedReason} is null or ${oneOf(table.revokedReason, CAPABILITY_REVOCATION_REASONS)}`,
+    ),
+    check(
+      'vault_access_capabilities_hex_check',
+      sql`${table.authorizationMac} ~ '^[0-9a-f]{64}$' and (${table.tokenHash} is null or ${table.tokenHash} ~ '^[0-9a-f]{64}$') and (${table.tokenMac} is null or ${table.tokenMac} ~ '^[0-9a-f]{64}$') and (${table.argumentsHash} is null or ${table.argumentsHash} ~ '^[0-9a-f]{64}$')`,
+    ),
+    check(
+      'vault_access_capabilities_numbers_check',
+      sql`${table.macKekVersion} >= 1 and (${table.attempt} is null or ${table.attempt} >= 1) and (${table.secretVersion} is null or ${table.secretVersion} >= 0)`,
+    ),
   ],
 );

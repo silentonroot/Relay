@@ -150,8 +150,35 @@ export const AuditEventType = z.enum([
   'vault.secret_stored',
   'vault.secret_read',
   'vault.secret_deleted',
+  // Phase 3 (ADR-014 section 10). Metadata never holds a token, a token hash, a MAC, a wrapped
+  // key or plaintext.
+  'vault.capability_authorized',
+  'vault.capability_issued',
+  'vault.capability_rejected',
+  'vault.capability_revoked',
+  'vault.request_refused',
+  'vault.secret_revoked',
+  'vault.secret_rewrapped',
 ]);
 export type AuditEventType = z.infer<typeof AuditEventType>;
+
+/**
+ * Why the vault refused a capability (ADR-014 section 10). Only the audit event carries it:
+ * the caller of the vault learns nothing but `forbidden`.
+ */
+export const CapabilityRejectionReason = z.enum([
+  'unknown_token',
+  'used',
+  'revoked',
+  'expired',
+  'binding_mismatch',
+  'integrity',
+  'job_not_running',
+  'secret_not_active',
+  'connection_not_active',
+  'key_unavailable',
+]);
+export type CapabilityRejectionReason = z.infer<typeof CapabilityRejectionReason>;
 
 export const AuditEvent = z.object({
   id: Uuid,

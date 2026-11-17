@@ -459,6 +459,107 @@ carries plaintext, ciphertext, a wrapped key, a token, a token hash or a MAC.
   each other.) Every read goes to the database and the KEK, and a plaintext lives only for the one
   call that needs it.
 
+### As built in step B1 (2026-11-16)
+
+Migration `0005_phase3_vault` and the repositories in `packages/database` follow section 11. Where
+the code differs from, or is more exact than, the text above:
+
+- **Clock.** Every function takes `now: Date` from its caller (the vault passes `new Date()` just
+  before the call), as the rest of the package does, but the database clock is the authority over
+  it. A consume compares expiry with `now` and also with `statement_timestamp()`
+  (`token_expires_at > statement_timestamp() AND expires_at > statement_timestamp()`, no grace
+  interval), so a caller with a stale `now` cannot extend a capability. `insertAuthorization` and
+  `issueToken` refuse a `now` more than `MAX_CLOCK_SKEW_SECONDS` (5) away from `statement_timestamp()`,
+  computed in SQL. (`expires_at > statement_timestamp()` is implied by the token check and the
+  `token_expires_at <= expires_at` CHECK; it stays as a second line.) `describeForRejection` labels
+  `expired` when either clock says so. `authorizationWindow(now, ttlSeconds)` returns the exact
+  `issued_at` and `expires_at` strings the database will store, so the vault can compute the
+  authorization MAC before it calls `insertAuthorization`.
+- **Lifetimes** are validated in the repository as well as in the vault (a safe integer in 10 to
+  3,600 for an authorization and 1 to 120 for a token; no default); the token expiry is
+  `least(now + ttl, expires_at)` in SQL.
+- **`insertAuthorization`** receives the binding the vault computed its MAC over and requires each
+  value to equal the job row's own column in the same `INSERT ... SELECT`; for an operation it also
+  requires the `policy.evaluated` event named by `policy_decision_id` (decision `allow`, same
+  organization, agent, connection and `operation` metadata, written within one hour of the job's
+  `created_at`) and that what the decision rested on still holds: the agent is `active`, at least
+  one grant listed in the event's `matchedGrantIds` is still an `allow` grant of exactly that agent,
+  connection and operation, not revoked and not expired (at `now` and at `statement_timestamp()`),
+  and no `deny` grant of that agent, connection and operation that is live was created after the
+  decision (conservative: the grant's constraints are not re-evaluated in SQL). A decision that
+  names no grant is refused. For a read it locks the agent row `FOR SHARE` before the connection
+  row; `grants.revoke` and `agents.disable` take the agent row `FOR NO KEY UPDATE` before they
+  revoke, so an authorization either commits before the revocation (and is revoked by it) or waits
+  and is refused. `grants.revoke` does not cancel queued jobs: a queued job whose grant is revoked is
+  refused at authorization (the vault fails it `vault_denied`), unlike a revoked connection, whose
+  queued jobs the route cancels because they have no other path to end. `execution_jobs` has a
+  partial unique index on `policy_decision_id` (one decision authorizes one job). It sets
+  `capability_ref` with the conditional update of section 5 in the same transaction.
+- **`issueToken`** is one conditional `UPDATE ... RETURNING` plus a second statement that stores the
+  token MAC: it takes a `computeTokenMac(row)` callback, runs it inside the transaction on the row the
+  first statement returned (which holds the bound secret version and the token times) and refuses
+  to commit without it. The statement also requires `authorization_mac` to equal the MAC the vault
+  verified. A consume additionally requires `token_mac IS NOT NULL`. `issueToken` locks the job row
+  `FOR SHARE` in a statement of its own before the `UPDATE`: an `UPDATE ... FROM` does not re-read the
+  joined job after waiting for the capability row, so without that lock a lease recovery that
+  committed in the meantime would be judged from a stale snapshot and a token issued for a requeued
+  job. Lease recovery reads the capability `FOR UPDATE`.
+- **Consume** (`consumeRead`, `consumeSeal`) is one `UPDATE ... FROM job, connection, secret
+(LEFT JOIN active version) ... RETURNING`, after taking the connection row `FOR SHARE` (read) or
+  `FOR UPDATE` (seal), in the caller's transaction when it is called inside one (no savepoint of its
+  own, so the lock is held until the caller commits). For a seal capability the bound version (0 when none) must still be the
+  secret's active version, so a moved pointer is refused at the consume as well as at `putVersion`.
+  The function writes **no** audit event: the event depends on the MAC and open checks that follow
+  (`vault.secret_read`, or `vault.capability_rejected` when one fails), so the vault appends it inside
+  the same `repositories.transaction`; a failure of any later step rolls the consume back, which the
+  tests show. `describeForRejection` labels a refusal afterwards; its order is `unknown_token`,
+  `binding_mismatch` (purpose, job, connection, operation, a different worker or attempt, a job that
+  no longer points at the capability), `integrity` (no token MAC), `revoked`, `used`, `expired`,
+  `job_not_running` (not running, or cancellation requested), `connection_not_active`,
+  `secret_not_active` (secret status or a moved version). `key_unavailable` is set by the vault only.
+  Presented ids are echoed into the event only when they exist (and the connection when it is the
+  job's), so an unknown token cannot name an arbitrary id into the chain.
+- **Revocation** sets `revoked_at` and a `revoked_reason` (a closed list, repeated by a CHECK) on
+  _unused_ capabilities only; a capability consumed before the revocation committed stays `used`, and
+  the revocation deletes what the read or seal left, per section 7. A multi-row revocation first
+  locks its target rows with `SELECT id ... ORDER BY id FOR UPDATE`, then updates them, so two
+  overlapping revocations (an agent disabled while one of its connections is revoked) cannot
+  deadlock. `connections.revoke`,
+  `grants.revoke` and `agents.disable` call the capability revocation inside their own transactions;
+  a revoked grant of any effect revokes the agent's unused capabilities for that connection. The
+  `vault.capability_revoked` event is written inside, only when something changed. The
+  `vault.secret_revoked` event and the route-level test stay with B3.
+- **`vault_secrets.status`.** `deleteForConnection` marks the secrets `revoked` when the connection
+  is `revoked` and `deleted` otherwise ("delete stored session"); it locks the connection row first.
+  The trigger also refuses a revoked secret with a non-null `active_version_id`, and a second
+  trigger refuses inserting a version for a revoked secret (SQLSTATE `check_violation`). The data
+  migration changes only `status`; it does not delete any row.
+- **Migration guards.** `0005` refuses to run when _any_ `execution_jobs.capability_ref` is non-null
+  (not only a non-UUID), with an error naming the column and no value; when two jobs share one
+  `policy_decision_id` (before it creates the unique index); and when a revoked connection's secret
+  still has an active version pointer or version rows (Phase 2 revocation deleted them; the status
+  change is not applied over ciphertext that is still there).
+- **`ensureSecret` and `putVersion`** also refuse a `revoked` connection (the connection row is
+  locked `FOR SHARE` first), which closes the window between `connections.revoke` and the
+  `deleteForConnection` that follows it. **`putVersion`** refuses a `revoked` secret and takes an optional `expectedActiveVersion` (0 for
+  none): the pointer moves only from that version, as a conditional update under the row lock.
+  `rewrapVersion` also takes the connection `FOR SHARE` and skips revoked secrets and connections.
+- **Audit metadata** names its keys `vaultEntryId`, `entryVersion`, `accessTtlSeconds`,
+  `accessExpiresAt`, `keyVersionFrom` and `keyVersionTo`, because the audit redactor replaces the
+  value under any key containing `secret`, `token` or `kek`. `actor_id` is null for `system`
+  events (the column is a UUID, so section 10's `'vault'` cannot be stored there).
+- **Retention.** `purge` deletes capabilities of finished jobs more than seven days after
+  `expires_at` and clears the job's `capability_ref` in the same statement; it writes no event.
+- **Phase 3 claim and recovery rules** exist as the options `requireCapability` and
+  `capabilityAware`, defaulting to the Phase 2 behaviour; B3 switches them on (section 5 describes
+  the rules). Under `capabilityAware` an unissued retry-safe read is requeued with its capability
+  kept; an issued one, a non-retry-safe operation and a login have their unused capability revoked
+  (`lease_recovery`) in the same transaction, and the job ends `failed`, `outcome_unknown` and
+  `failed` respectively. The capability is read `FOR UPDATE` so the decision cannot be overtaken by
+  an `issueToken`.
+- **What B2 must guarantee** (the repositories cannot): see "B2 must guarantee" in
+  [`docs/phase-3.md`](../phase-3.md).
+
 ## What a compromised component can and cannot do after Phase 3
 
 These statements are the design. They become claims only when the tests named in

@@ -79,6 +79,8 @@ export const LOGIN_FAILURE_REASONS: Readonly<Record<JobErrorCode, string>> = {
   login_window_closed: 'The login window was closed before sign-in was confirmed.',
   not_found: 'The application did not show its sign-in page; try again.',
   unexpected_page: 'The application showed a page the adapter did not expect; try again.',
+  vault_unavailable: 'The vault could not be reached, so the login could not be stored; try again.',
+  vault_denied: 'The vault refused to store the login; start the login again.',
 };
 
 /** A login job whose lease expired (the worker stopped) and was ended by recovery. */

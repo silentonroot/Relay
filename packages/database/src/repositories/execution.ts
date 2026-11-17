@@ -4,8 +4,15 @@ import { and, asc, eq, inArray, isNotNull, isNull, lt, lte, sql } from 'drizzle-
 import type { Db } from '../client.js';
 import { rowsOf } from '../client.js';
 import { ConflictError, NotFoundError, translateDbErrors, ValidationError } from '../errors.js';
-import { agents, connections, executionJobs, operationRequests } from '../schema.js';
+import {
+  agents,
+  connections,
+  executionJobs,
+  operationRequests,
+  vaultAccessCapabilities,
+} from '../schema.js';
 import { isUuid, isValidScope } from '../support.js';
+import { createCapabilityRepository } from './capabilities.js';
 
 const NON_TERMINAL: readonly JobStatus[] = ['queued', 'running'];
 const MAX_ERROR_MESSAGE_LENGTH = 300;
@@ -81,6 +88,13 @@ export interface ClaimJobInput {
   workerId: string;
   leaseMs: number;
   now: Date;
+  /**
+   * Phase 3 claim rule (ADR-014 section 5): claim only jobs whose `capability_ref` is set, so a
+   * job the vault never authorized is never run. Default false, which is the Phase 2 behaviour;
+   * step B3 switches it on together with the vault client, because nothing authorizes a job
+   * before then.
+   */
+  requireCapability?: boolean | undefined;
 }
 
 export interface CompleteJobInput {
@@ -98,6 +112,13 @@ export interface RecoverLeasesInput {
   now: Date;
   /** An operation job that has already been attempted this often is failed, not requeued. */
   maxAttempts: number;
+  /**
+   * Phase 3 recovery rule (ADR-014 section 5): a retry-safe read is requeued only if its
+   * capability was never issued a token; otherwise the capability is revoked and the job fails
+   * with `worker_failure`. Every other recovered job also has its unused capability revoked.
+   * Default false, the Phase 2 behaviour; step B3 switches it on.
+   */
+  capabilityAware?: boolean | undefined;
 }
 
 const iso = (value: Date | null): string | null => (value === null ? null : value.toISOString());
@@ -337,6 +358,8 @@ export function createJobRepository(db: Db) {
     async claimNext(input: ClaimJobInput): Promise<ExecutionJob | null> {
       requirePositiveInt(input.leaseMs, 'leaseMs');
       const leaseExpiresAt = new Date(input.now.getTime() + input.leaseMs);
+      const authorized =
+        input.requireCapability === true ? isNotNull(executionJobs.capabilityRef) : undefined;
       return db.transaction(async (tx) => {
         const busy: string[] = [];
         for (let attempt = 0; attempt < MAX_CLAIM_ATTEMPTS; attempt += 1) {
@@ -351,7 +374,7 @@ export function createJobRepository(db: Db) {
           const [candidate] = await tx
             .select({ connectionId: executionJobs.connectionId })
             .from(executionJobs)
-            .where(and(eq(executionJobs.status, 'queued'), running, notBusy))
+            .where(and(eq(executionJobs.status, 'queued'), running, notBusy, authorized))
             .orderBy(asc(executionJobs.createdAt), asc(executionJobs.id))
             .limit(1);
           if (candidate === undefined) return null;
@@ -376,6 +399,7 @@ export function createJobRepository(db: Db) {
                 eq(executionJobs.connectionId, candidate.connectionId),
                 eq(executionJobs.status, 'queued'),
                 running,
+                authorized,
               ),
             )
             .orderBy(asc(executionJobs.createdAt), asc(executionJobs.id))
@@ -396,7 +420,9 @@ export function createJobRepository(db: Db) {
               startedAt: sql`coalesce(${executionJobs.startedAt}, ${input.now.toISOString()}::timestamptz)`,
               updatedAt: input.now,
             })
-            .where(and(eq(executionJobs.id, target.id), eq(executionJobs.status, 'queued')))
+            .where(
+              and(eq(executionJobs.id, target.id), eq(executionJobs.status, 'queued'), authorized),
+            )
             .returning();
           if (row === undefined) {
             busy.push(candidate.connectionId);
@@ -562,9 +588,27 @@ export function createJobRepository(db: Db) {
           .for('update', { skipLocked: true });
 
         const changed: ExecutionJob[] = [];
+        const capabilities = createCapabilityRepository(tx);
         for (const job of expired) {
+          // Capability-aware recovery: has the vault handed a token out for this job? The
+          // capability is read FOR UPDATE, so an `issueToken` that is racing with this decision
+          // waits for it (it also locks the job row first and then sees the outcome), and the
+          // answer cannot change between this read and the commit.
+          let tokenIssued = false;
+          if (input.capabilityAware === true && job.capabilityRef !== null) {
+            const [capability] = await tx
+              .select({ tokenHash: vaultAccessCapabilities.tokenHash })
+              .from(vaultAccessCapabilities)
+              .where(eq(vaultAccessCapabilities.id, job.capabilityRef))
+              .limit(1)
+              .for('update');
+            tokenIssued = capability?.tokenHash !== null && capability?.tokenHash !== undefined;
+          }
           const requeue =
-            job.kind === 'operation' && job.retrySafe && job.attemptCount < input.maxAttempts;
+            job.kind === 'operation' &&
+            job.retrySafe &&
+            job.attemptCount < input.maxAttempts &&
+            !tokenIssued;
           const unknown = job.kind === 'operation' && !job.retrySafe;
           const patch = requeue
             ? {
@@ -578,7 +622,9 @@ export function createJobRepository(db: Db) {
                 errorCode: 'worker_failure' as const,
                 errorMessage: unknown
                   ? 'The worker stopped before the outcome could be verified.'
-                  : 'The worker stopped before the job finished.',
+                  : tokenIssued
+                    ? 'The worker stopped after the vault had issued access; submit the request again.'
+                    : 'The worker stopped before the job finished.',
                 finishedAt: input.now,
                 updatedAt: input.now,
               };
@@ -587,6 +633,16 @@ export function createJobRepository(db: Db) {
             .set(patch)
             .where(eq(executionJobs.id, job.id))
             .returning();
+          // A job that is not requeued, and any job whose capability already holds a token,
+          // loses the capability in this transaction: a retry never inherits an issued token
+          // (a requeue is only taken when no token exists, so the retry can still be issued one).
+          if (input.capabilityAware === true && (!requeue || tokenIssued)) {
+            await capabilities.revokeForJob({
+              jobId: job.id,
+              reason: 'lease_recovery',
+              now: input.now,
+            });
+          }
           changed.push(toExecutionJob(row!));
         }
         return changed;

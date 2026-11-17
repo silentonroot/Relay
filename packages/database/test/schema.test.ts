@@ -35,7 +35,7 @@ afterAll(async () => {
 });
 
 describe('migrations', () => {
-  it('creates every Phase 1 and Phase 2 table on a fresh database', async () => {
+  it('creates every Phase 1, Phase 2 and Phase 3 table on a fresh database', async () => {
     const rows = rowsOf(
       await handle.db.execute(
         sql`select table_name from information_schema.tables where table_schema = 'public' order by table_name`,
@@ -54,6 +54,7 @@ describe('migrations', () => {
       'organizations',
       'user_sessions',
       'users',
+      'vault_access_capabilities',
       'vault_secret_versions',
       'vault_secrets',
     ]);
@@ -62,7 +63,7 @@ describe('migrations', () => {
   it('does not create tables that belong to later phases', async () => {
     const rows = rowsOf(
       await handle.db.execute(
-        sql`select table_name from information_schema.tables where table_schema = 'public' and (table_name like 'approval%' or table_name like 'workflow%' or table_name like 'vault_access%')`,
+        sql`select table_name from information_schema.tables where table_schema = 'public' and (table_name like 'approval%' or table_name like 'workflow%')`,
       ),
     );
     expect(rows).toEqual([]);
@@ -78,6 +79,7 @@ describe('migrations', () => {
       '0002_audit_events_append_only',
       '0003_phase2_execution',
       '0004_job_arguments_hash',
+      '0005_phase3_vault',
     ]);
     const applied = rowsOf(
       await handle.db.execute(sql`select count(*)::int as n from drizzle.__drizzle_migrations`),
