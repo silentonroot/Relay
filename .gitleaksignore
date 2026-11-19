@@ -1,0 +1,4 @@
+# Synthetic test values that match generic secret rules. One fingerprint per line,
+# each with a reason. Never add a real secret here: remove it from history instead.
+# services/vault/test/logging.test.ts: base64 of "plaintext-session", a log-redaction canary.
+06bfcdf363db95559be134818183c2a255819a88:services/vault/test/logging.test.ts:generic-api-key:158

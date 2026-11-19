@@ -155,7 +155,9 @@ describe('log redaction (P3-15, logging part)', () => {
         await call(harness.vault.sockets[role as 'api'], body);
       }
       const text = harness.log.text();
+      // gitleaks:allow (synthetic canary: base64 of "plaintext-session")
       for (const value of [secret, token, 'cGxhaW50ZXh0LXNlc3Npb24']) {
+        // gitleaks:allow
         expect(text).not.toContain(value);
       }
       expect(text).toContain('vault.request_refused');
