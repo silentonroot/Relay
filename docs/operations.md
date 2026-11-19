@@ -245,6 +245,67 @@ who can read files as the service's user, or against root.
 **Planned.** The design is to add `kek-v<N+1>.key`, re-wrap existing data keys, and delete the old
 file only after every record reports the new version. There is no re-wrap command yet.
 
+## The vault and its admin command (Phase 3, not yet wired to the API and worker)
+
+Status: step B2b. The vault service (`services/vault`) runs and answers every operation of
+ADR-014 section 4, but nothing calls it yet: the API and the worker still use the Phase 2 path
+(the worker holds the KEK). B3 wires them. Use this section to run and test the vault on its own.
+
+Start it (one user, a developer laptop; `separate-uid` needs users and groups and is described
+with B3):
+
+```sh
+export DATABASE_URL=postgres://...            # a migrated database (the API's migrate script)
+export AAB_KEK_DIR=$HOME/.config/aab/keys     # owned by the vault's user, mode 0700
+export AAB_VAULT_SOCKET_DIR=$XDG_RUNTIME_DIR/aab-vault
+export AAB_VAULT_ISOLATION=shared-uid         # explicit; refused unless set
+corepack pnpm --filter @aab/vault run init-kek     # first key, kek-v1.key
+corepack pnpm --filter @aab/vault run start
+```
+
+The vault refuses to start when it cannot read its tables through `DATABASE_URL` (it does not
+migrate), when the key or socket directory is unsafe, or off Linux. Sockets are
+`$AAB_VAULT_SOCKET_DIR/{api,supervisor,admin}/vault.sock`. The worker's `init-kek` script still
+works: it runs the vault's script.
+
+**Run `init-kek` (and `init-kek --next`) as the vault's user**, in `separate-uid` mode too, for example
+`sudo -u aab-vault env AAB_KEK_DIR=... corepack pnpm --filter @aab/vault run init-kek`. The vault
+refuses a key directory owned by another user, so a key created as root or as the worker's user
+would stop it from starting. Every directory above `AAB_VAULT_SOCKET_DIR` must be owned by root or
+the vault's user and not writable by group or other (a sticky directory owned by root, like `/tmp`,
+is accepted); otherwise the vault refuses to start.
+
+Requests are time-limited in the database first: every vault transaction sets `statement_timeout` to
+80% and `lock_timeout` to 50% of the role's request timeout (`AAB_VAULT_REQUEST_TIMEOUT_MS`, 10 s;
+`AAB_VAULT_ADMIN_REQUEST_TIMEOUT_MS`, 120 s for the admin socket), so a request answered as failed
+has rolled back. A request still running at the full timeout (for example one waiting for a
+database connection) closes its connection without an answer: its outcome is then unknown, and the
+caller must check state before it retries. At most 4 (api), 8 (supervisor) and 1 (admin) requests
+run in the database at once; the rest wait.
+
+Admin command (talks to the admin socket only; it reads no key and no database):
+
+```sh
+corepack pnpm --filter @aab/vault run vault status
+corepack pnpm --filter @aab/vault run vault rewrap [--batch-size N] [--max-batches N]
+corepack pnpm --filter @aab/vault run vault kek-retirement-check <kekVersion>
+```
+
+Rotating the key: run `init-kek --next` (`node --import tsx src/scripts/init-kek.ts --next <dir>`
+from `services/vault`) as the vault's user, restart the vault (keys are read at start), run
+`vault rewrap` until it exits 0 (the command calls the vault repeatedly, at most 500 rows per call; exit 3
+means rows remain or failed, for example because a KEK file is missing; run it again after fixing that), check with
+`vault kek-retirement-check <old version>` that `safeToRemove` is true, and only then remove the
+old file yourself. The vault never deletes a key file. A capability authorized or issued under the
+old version stops working when its file is gone (it is refused as `key_unavailable`); they last at
+most an hour, so retire after a quiet period. `status` lists KEK versions that stored versions
+still need but that are missing (`missingKekVersions`): those sessions cannot be opened until the
+file is back.
+
+Tests: `corepack pnpm --filter @aab/vault run test` (PGlite, temporary sockets under
+`$XDG_RUNTIME_DIR`, no root). The process-level start test in `test/main.test.ts` needs a reachable
+PostgreSQL and runs only when `AAB_TEST_DATABASE_URL` is set.
+
 ## Database backup and restore
 
 AAB uses PostgreSQL. Migrations are applied by the `migrate` script (`corepack pnpm --filter @aab/broker-api run migrate`; in Compose, the `migrate` service).

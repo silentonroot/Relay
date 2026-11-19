@@ -1,32 +1,31 @@
-import { readdir } from 'node:fs/promises';
-import { isAbsolute } from 'node:path';
-import { generateLocalKek, KekStoreError } from '@aab/crypto';
+import { spawn } from 'node:child_process';
+import { join } from 'node:path';
 
 /*
- * Creates the local key-encryption key (ADR-003):
- *   AAB_KEK_DIR=/abs/path node --import tsx src/scripts/init-kek.ts
- * The directory is created with mode 0700 and `kek-v1.key` with mode 0600. An existing key is
- * never overwritten. Prints only the path of the new file.
+ * The KEK is created by the vault now (ADR-014 section 3): the script moved to
+ * `services/vault/src/scripts/init-kek.ts`. This wrapper keeps the old entry point working by
+ * running that script with the same arguments and passing its output and exit code through. It
+ * imports no key handling code (the worker must not, ADR-014 section 3).
  */
 
-async function main(): Promise<void> {
-  const directory = process.argv[2] ?? process.env['AAB_KEK_DIR'];
-  if (directory === undefined || directory.trim() === '' || !isAbsolute(directory)) {
-    console.error('usage: init-kek <absolute key directory>   (or set AAB_KEK_DIR)');
-    process.exit(2);
-  }
-  const existing = await readdir(directory).catch(() => [] as string[]);
-  if (existing.some((name) => /^kek-v\d+\.key$/.test(name))) {
-    console.error(`a KEK already exists in ${directory}; refusing to overwrite or add one`);
-    process.exit(1);
-  }
-  try {
-    const path = await generateLocalKek(directory, 1);
-    console.log(path);
-  } catch (error) {
-    console.error(error instanceof KekStoreError ? error.message : 'the KEK could not be created');
-    process.exit(1);
-  }
-}
-
-void main();
+const script = join(
+  import.meta.dirname,
+  '..',
+  '..',
+  '..',
+  'vault',
+  'src',
+  'scripts',
+  'init-kek.ts',
+);
+const child = spawn(process.execPath, ['--import', 'tsx', script, ...process.argv.slice(2)], {
+  stdio: 'inherit',
+  cwd: join(import.meta.dirname, '..', '..', '..', 'vault'),
+});
+child.once('error', () => {
+  console.error(
+    'init-kek moved to services/vault (run it from there: pnpm --filter @aab/vault run init-kek)',
+  );
+  process.exit(1);
+});
+child.once('exit', (code, signal) => process.exit(code ?? (signal === null ? 1 : 1)));

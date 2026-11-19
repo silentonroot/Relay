@@ -560,6 +560,222 @@ the code differs from, or is more exact than, the text above:
 - **What B2 must guarantee** (the repositories cannot): see "B2 must guarantee" in
   [`docs/phase-3.md`](../phase-3.md).
 
+### As built in step B2a (2026-11-17)
+
+`services/vault` (`@aab/vault`) exists as a skeleton: configuration, socket safety, listeners, the
+wire protocol, `hello`, KEK loading and MAC key derivation. Every other operation validates the role
+and its parameters and answers `not_implemented`; B2b replaces the stubs. The service does not open a
+database connection yet (it validates `DATABASE_URL` only). Where the code differs from, or is more
+exact than, the text above:
+
+- **Contracts first.** `packages/contracts/src/vault.ts` holds every request and result schema
+  (all `.strict()`), the role names, `VAULT_OPERATION_ROLES` (the section 4 table as data), the limits
+  and `VAULT_ERROR_TO_ERROR_CODE`. Wire shape: request `{ id, operation, params }`, response
+  `{ id, ok: true, result }` or `{ id, ok: false, error: { code } }`. The error codes are the
+  section 4 ones plus two protocol-level codes: `malformed` (framing, envelope, unknown operation or
+  bad parameters; reads as `validation_failed` in the error contract) and `not_implemented` (reads as
+  `service_unavailable`). `id` is `null` in a response when the line gave no usable one. Order of
+  checks: line cap, `JSON.parse`, `checkPlainJson`, strict envelope, known operation, role allowed
+  (`forbidden` before parameters are looked at, so a refused call learns nothing about the schema),
+  strict parameters, handler, result schema.
+- **Line cap by role.** Section 1 says one 4 MiB cap. As built: 64 KiB on the `api` and `admin`
+  sockets, 4 MiB on the `supervisor` socket only, the one socket that carries a session
+  (`completeLogin`, `readForWorker`; plaintext is base64url of at most 2 MiB). A longer line is
+  answered `malformed` once and the connection is closed. Requests on one connection are answered in
+  order and one at a time; an empty line is `malformed`.
+- **Limits.** Per role: connections (default 16, 1 to 256; the next one is answered
+  `service_unavailable` and closed), idle timeout (default 60 s), request timeout (default 10 s; it also
+  bounds how long a partial line may take to complete, and a request that outlives it is answered
+  `service_unavailable` once, with its result discarded). Settings: `AAB_VAULT_MAX_CONNECTIONS`,
+  `AAB_VAULT_IDLE_TIMEOUT_MS`, `AAB_VAULT_REQUEST_TIMEOUT_MS`.
+- **Configuration.** `AAB_KEK_DIR`, `AAB_VAULT_SOCKET_DIR` (absolute, normalized, at most 100 bytes
+  once `/supervisor/vault.sock` is appended), `AAB_VAULT_ISOLATION` (`separate-uid` by default),
+  `AAB_VAULT_GROUP_API`, `AAB_VAULT_GROUP_SUPERVISOR` and `AAB_VAULT_GROUP_ADMIN` (a group name or a
+  numeric gid; required and distinct in `separate-uid`, refused in `shared-uid`),
+  `AAB_VAULT_AUTHORIZATION_TTL_SECONDS` (10 to 3,600, default 600), `AAB_VAULT_TOKEN_TTL_SECONDS`
+  (1 to 120, default 30), `DATABASE_URL`. Numbers are strict decimal integers (`1e2`, `0x10`, ` 5`,
+  `5.0` and a blank value are refused). A blank `AAB_VAULT_ISOLATION` is refused, not defaulted.
+- **Socket safety** (`src/socket-safety.ts`). Checked before any key is read: Linux only; not root;
+  the socket directory is absolute, has no symbolic link in any component (its `realpath` equals the
+  configured path), exists, is owned by the vault's user, is not under the repository root (best
+  effort; the root is this checkout) and does not contain or sit inside the key directory. The
+  **base** directory is checked more loosely than section 2's "no access for others": it must not be
+  writable by group or other and not readable by other, because in `separate-uid` the three role
+  groups share no common group and need search (`x`) on it; in `shared-uid` it must be 0700. Each
+  **role** directory must be a real directory owned by the vault's user, with no `other` bits;
+  `separate-uid`: mode exactly 0750 or 2750 and the role's group (the group may search, never write);
+  `shared-uid`: exactly 0700. A missing role directory is created (mode set explicitly, because the
+  umask would otherwise strip the search bit) and given to its group, so the vault user must belong to
+  that group; the installer may also create them. Roles must resolve to distinct groups, none of them
+  the vault's own primary group, and to distinct directories (`dev:ino`). A path at a socket location
+  is removed only if it is a socket owned by the vault's user that nothing is listening on (a probe
+  connect); a symbolic link, a regular file, a directory, another owner's socket or a live socket
+  refuses the start. After `listen` the vault sets the socket's group and mode (0660, 0600 in
+  `shared-uid`) explicitly and checks them again; `main.ts` also sets the umask to 0117. Shutdown
+  closes the listeners, destroys connections and removes only sockets that are still its own.
+  `separate-uid` with real groups is tested where the user has three supplementary groups; the same
+  rules are tested without groups on fake `stat` results. Not testable without root: two role
+  directories that are one inode (a bind mount).
+- **No TCP.** Each listener is `listen({ path })`; a test compares the TCP `LISTEN` entries of
+  `/proc/net/tcp` and `tcp6` before and after start and checks every `server.address()` is a path.
+- **`hello`.** Returns `protocolVersion`, `serviceVersion`, `isolation`, `role` (the socket's),
+  `keyDirectory` and `currentKekVersion`.
+- **Keys.** `LocalFileKekProvider.load` with the ADR-003 checks, plus the narrowing of section 3
+  (the directory must belong to the vault's own user, not root). The capability MAC key of each KEK
+  version is `deriveKey(kek, { info: 'aab.vault.capability-mac.v1' })` (`@aab/crypto`: `deriveKey`,
+  `macSha256`, `verifyMac`, tested against RFC 5869 and RFC 4231 vectors), computed through
+  `LocalFileKekProvider.deriveKeyFor(version, purpose)` so the KEK bytes never leave the crypto
+  package, and held as `KeyObject`s in `VaultKeys`; every MAC records the KEK version it used.
+  The vault keeps a key for every loaded version (section 8 says verification must work while the
+  file is loaded), not only the current one.
+- **Logging.** pino with a redactor that replaces the value under any key containing a secret word
+  (token, mac, hash, kek, dek, key, secret, plaintext, ciphertext, storage state, cookie, password,
+  authorization, database, arguments, params, result, request, response and the like) at any depth,
+  in any letter case, in log objects and in `child` bindings; bytes are never printed; errors log type and
+  code only. A few numeric or path fields are allow-listed (`kekVersion`, `keyDirectory`,
+  `requestId`). It is a key-name redactor: a secret written into a message string is not caught, so
+  the code never does that.
+- **Refusal audit.** A request refused for its role is logged as `vault.request_refused` (role,
+  operation, request id) and passed to an `onRequestRefused` hook; the audit append in its own
+  transaction (section 10) is B2b's, marked `TODO(B2b)` in `src/server.ts`.
+
+### As built in step B2b (2026-11-19)
+
+`services/vault` serves every operation of section 4 (`src/operations.ts`); `startVault` connects to
+`DATABASE_URL` (or an injected handle in tests) and reads its own tables before it listens, so a
+vault without a database, or without the migrated schema, refuses to start. `hello` and the role
+checks are unchanged. Where the code differs from, or is more exact than, the text above:
+
+- **Secret type.** The stored secret type, and the AAD secret type, is `session_snapshot`
+  (`SESSION_SNAPSHOT_SECRET_TYPE`), the Phase 2 value, so Phase 2 rows open unchanged; the sections
+  above call it `browser_session`. The `secretType` of the `readForWorker` result is that value
+  (`packages/contracts/src/vault.ts` changed from the literal `browser_session`).
+- **Refusal versus internal failure (P3-12).** A refused capability is `forbidden` with no detail.
+  Anything else that goes wrong (database, key, a bug) is answered `service_unavailable` (the vault
+  has no `vault_unavailable` wire code; callers map it to the job error), logged as
+  `vault request failed` (error type and code only), counted in `status` and writes no rejection
+  event. `internal_error` stays reserved for a result that fails its own schema.
+- **After the consume (resolves section 6 against the B1 note).** A refusal found after the consume
+  (a MAC mismatch, a missing KEK file, an open that fails) commits the consume together with
+  `vault.capability_rejected` (reason `integrity` or `key_unavailable`) in the one transaction and
+  returns `forbidden`: the capability is spent. An exception (database error, a failing audit
+  append) rolls the whole transaction back, the consume included, and answers `service_unavailable`;
+  the capability is then still usable until it expires. A consume that matches no row changed
+  nothing: `describeForRejection` and `recordRejection` run afterwards in their own transaction.
+- **MACs.** `src/mac.ts`: HMAC-SHA-256 over canonical JSON with a layout label of its own per MAC
+  (`aab.vault.capability-authorization.v1`, `aab.vault.capability-token.v1`); the token MAC embeds the
+  whole authorization payload. Both use the key of `mac_kek_version` (the table has one column), so a
+  capability authorized under a KEK version cannot be used once that file is gone (`key_unavailable`).
+  A forged authorization MAC is reason `integrity` (the closed list has no `forged`).
+- **authorizeJobAccess** ensures the secret row first in its own transaction (a `pending` row is
+  inert), because `insertAuthorization` takes the agent lock before the connection lock and
+  `ensureSecret` takes the connection lock; one transaction would invert the order. The
+  authorization row, its MAC, `capability_ref` and `vault.capability_authorized` are then one
+  transaction (inside `insertAuthorization`). `conflict` for a job that is not queued, already
+  authorized, cancelled or refused by the statement; `not_found` for an unknown job.
+- **issueAccessCapability** verifies the authorization MAC before it generates the token; the
+  conditional update, the token MAC and `vault.capability_issued` are one transaction (inside
+  `issueToken`). A refusal is labelled for the audit event only (`unknown_token` for an unknown
+  capability, `binding_mismatch`, `integrity`, `used`, `revoked`, `expired`, `job_not_running`,
+  `connection_not_active`, `secret_not_active`, `key_unavailable`).
+- **readForWorker** is one transaction: consume, version load, both MACs, open (AAD from the
+  connection row and the capability), `last_accessed_at` and `vault.secret_read`.
+- **completeLogin** is one transaction: consume (connection `FOR UPDATE`), MACs, identity rule,
+  seal, `putVersion` with the bound version as the expected active version, connection to `active`
+  with its status event, `recordSession`, `vault.secret_stored`, `connection.auth_completed`
+  (actor `system`; adapter id and version from the application row) and the job completed under the
+  bound worker with that event. A different account than the verified one answers `conflict` and
+  rolls everything back (the capability stays unused; the supervisor ends the job
+  `identity_mismatch` itself). A moved active pointer is refused at the consume (`secret_not_active`)
+  or, if it moves later, by `putVersion` (`conflict`).
+- **rewrap** lists versions below the current KEK version in batches (`listForRewrap`, cursor by
+  id), rewraps only the wrapped key (the ciphertext fields are never passed in), and applies each row
+  with the compare-and-set `rewrapVersion` (own transaction with `vault.secret_rewrapped`). A row
+  whose KEK version is not loaded or that no longer unwraps counts as `failed`, a lost
+  compare-and-set as `skipped`. One rewrap runs at a time (`conflict` otherwise). `remaining` counts
+  every stored version below the current KEK. `status` counters are in memory:
+  `rejectedUnattributed`, `refusedUnattributed`, `rejectedAudited`, `internalFailures`.
+  `kekRetirementCheck` is `safeToRemove` only when no version references the KEK version and it is not
+  the current one; it does not consider capabilities that still carry that version's MAC.
+- **`vault.request_refused`** is appended in its own transaction to the chain of the job whose
+  `jobId` the refused request's params carried (only a UUID naming an existing job; the role check
+  runs before parameter validation, so that is the only handle), at most 60 per minute; otherwise it
+  is logged and counted. `src/refusals.ts`.
+- **`init-kek`** moved to `services/vault/src/scripts/init-kek.ts` (new: `--next` adds the next
+  version; without it an existing key still refuses the run). The worker's script runs it as a
+  child process, so the worker imports no key code. The admin command is
+  `services/vault/src/scripts/vault-cli.ts` (`status`, `rewrap`, `kek-retirement-check`) over the
+  admin socket.
+- **Test seams.** `startVault` options `database` (an open handle) and `operations` (`clock`,
+  `afterRewrapRow` for the crash test); protocol tests pass `handlers: DEFAULT_HANDLERS` (stubs, no
+  database). `@aab/database/testing` re-exports drizzle's `sql` for tests that edit rows.
+
+### As built in the B2 review fixes (2026-11-19)
+
+Changes after the review of B2a and B2b; where they differ from the text above, this wins.
+
+- **Backpressure (section 1).** A connection stops being read while its unsent response bytes are
+  over 1 MiB or `write()` returned false, until `'drain'`; it is destroyed when it stays blocked for
+  30 s, or over 4 MiB for 2 s. An empty line is `malformed` and closes the connection (it used to be
+  answered each time). At most 4 complete lines may be buffered or in handling per connection; the
+  next one is answered `service_unavailable` once and the connection closes. Requests on one
+  connection are still answered one at a time, in order. The caps are `RoleServerLimits`
+  (`writeBufferSoftBytes`, `writeBufferHardBytes`, `writeGraceMs`, `writeStallMs`,
+  `maxInFlightPerConnection`), not environment settings.
+- **Over-cap connections** are destroyed 1 s after their one answer (`closeGraceMs`) whether or not
+  the client closes, and are tracked (`refusedConnections`) until closed. The same unconditional
+  destroy applies after any `abort` that writes an error line. The idle timeout no longer closes a
+  connection while a request is being handled (admin requests outlast it).
+- **Timeouts (resolves the "request timeout" wording of section 9).** Every vault transaction runs
+  `SET LOCAL statement_timeout` (80% of the role's request timeout) and `SET LOCAL lock_timeout` (50%),
+  applied by `withTransactionTimeouts` (`packages/database/src/client.ts`) around the repositories'
+  database handle, with the limits taken from the request being handled (`src/request-scope.ts`,
+  AsyncLocalStorage). A request ended by those limits rolled back and is answered
+  `service_unavailable` from the handler's failure. The server's own timer (the full request
+  timeout) is a last resort: it closes the connection and sends **no answer**, because the handler
+  may still commit; the caller learns "unknown" and checks state. Known gaps: the limits are per
+  statement, not per transaction (a transaction of several statements can outlast the timer), and a
+  statement outside a transaction (single reads) and a wait for a pool connection are not covered
+  by them. The admin socket has its own timeout, `AAB_VAULT_ADMIN_REQUEST_TIMEOUT_MS` (default 120 s).
+- **Handler caps.** At most 4 (api), 8 (supervisor) and 1 (admin) handlers run at once per role,
+  across connections; further requests wait in order (counted against their request timeout, and not
+  started if it has fired). The slot is held until the handler settles even after the timer closed
+  the connection. `hello` takes no slot.
+- **rewrap** does at most 500 rows per call (`REWRAP_MAX_ROWS_PER_CALL`) and the batch comparison now
+  uses the effective page size (`min(batchSize, 500)`; it used the requested size and stopped after
+  one page when that was above 500). Deviation from the review text: the result keeps its four
+  fields (`rewrapped`, `skipped`, `failed`, `remaining`); there is no `processed` field (it would equal
+  `rewrapped + skipped + failed`, and the existing assertions pin the shape). The `vault rewrap`
+  command calls again while `remaining > 0` and the last call rewrapped something, and sums the
+  results; rows that cannot be rewrapped (a missing KEK) end the loop with exit 3. There is no
+  cursor between calls, so more than 500 permanently failing rows would hide the rest.
+- **`vault.capability_rejected` is rate limited** per organization (60 per minute, in memory, like
+  `vault.request_refused`); the overflow is logged and counted (`status` counter
+  `rejectedRateLimited`). The refusal itself is unchanged. Note that `refusals.ts` still limits
+  `vault.request_refused` with one window for the whole vault, not per organization.
+- **Socket directory ancestors.** Every directory above `AAB_VAULT_SOCKET_DIR` must be owned by root
+  or the vault's user and must not be writable by group or other, except a sticky directory owned by
+  root (like `/tmp`). The review text said to reuse the KEK directory's ancestor check; no such
+  check exists in `packages/crypto` (ADR-003 and `LocalFileKekProvider` check the key directory and
+  files only), so `ancestorProblem` in `src/socket-safety.ts` is new and the KEK directory's
+  ancestors are still unchecked.
+- **Framing** keeps the chunks of a partial line and scans only each new chunk for the newline; the
+  line is joined once, when it completes.
+- **completeLogin** refuses (`validation_failed`, transaction rolled back, capability unspent) a
+  payload that is empty, over 2 MiB decoded, not JSON, or not `{ cookies: [...], origins: [...] }`
+  of objects, and one with no cookies and no origins; an `sessionExpiresAt` in the past is refused
+  and one beyond 400 days is stored as 400 days. `vault.secret_stored` also carries
+  `snapshotVersion` (alias of `entryVersion`, the Phase 2 name) and `originCount` (origins in the
+  stored state; Phase 2's was the number of allowed origins). A `cookieCount` was dropped because
+  the audit redactor replaces any value under a key containing `cookie`. Actor attribution stays
+  `system` per section 10; `durationMs` and `sandbox` of `connection.auth_completed` are not known
+  to the vault (docs/phase-3.md B3 lists what the supervisor must keep).
+- **Tests changed on purpose.** `protocol.test.ts` "answers service_unavailable to a request that
+  outlives the request timeout, once" pinned the old timer behaviour and is replaced by "closes,
+  without claiming an outcome, ...". `audit-atomic.test.ts` "a failing audit append rolls back the login
+  completion" sent an empty storage state as its payload, which the vault now refuses; it sends a
+  valid one (the assertions are unchanged). Nothing else was changed or loosened.
+
 ## What a compromised component can and cannot do after Phase 3
 
 These statements are the design. They become claims only when the tests named in

@@ -1,0 +1,24 @@
+{
+  "name": "@aab/vault",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start": "node --import tsx src/main.ts",
+    "init-kek": "node --import tsx src/scripts/init-kek.ts",
+    "vault": "node --import tsx src/scripts/vault-cli.ts"
+  },
+  "dependencies": {
+    "@aab/contracts": "workspace:*",
+    "@aab/crypto": "workspace:*",
+    "@aab/database": "workspace:*",
+    "pino": "^10.4.0",
+    "tsx": "^4.23.15",
+    "zod": "^4.6.7"
+  }
+}

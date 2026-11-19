@@ -23,4 +23,6 @@ export {
   verifyPassword,
 } from './password.js';
 export type { HashPasswordOptions, ScryptParams } from './password.js';
+export { deriveKey, KEY_PURPOSES, MAC_BYTES, macSha256, verifyMac } from './derive.js';
+export type { DerivedKey, DeriveKeyOptions, KeyPurpose } from './derive.js';
 export { constantTimeEqual, generateToken, hashToken } from './tokens.js';

@@ -1,4 +1,6 @@
 import { createSecretKey, randomBytes } from 'node:crypto';
+import { deriveKey, KEY_PURPOSES } from './derive.js';
+import type { DerivedKey, KeyPurpose } from './derive.js';
 import type { KeyObject } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
@@ -84,6 +86,22 @@ abstract class KeyringKekProvider implements KekProvider {
   /** Known KEK versions, ascending. */
   get versions(): number[] {
     return [...this.#keys.keys()].sort((a, b) => a - b);
+  }
+
+  /**
+   * Derives a purpose-specific key from one KEK version (HKDF-SHA-256, info = the purpose's
+   * label) and returns it with that version. The KEK itself never leaves the provider. Throws
+   * for a version this provider does not hold.
+   */
+  deriveKeyFor(version: number, purpose: KeyPurpose): DerivedKey {
+    assertKekVersion(version);
+    const key = this.#keys.get(version);
+    if (key === undefined) throw new KekOperationError('derive');
+    return { kekVersion: version, key: deriveKey(key, { info: KEY_PURPOSES[purpose] }) };
+  }
+
+  hasVersion(version: number): boolean {
+    return this.#keys.has(version);
   }
 
   wrap(dek: Uint8Array, context: KekContext): Promise<WrappedDek> {

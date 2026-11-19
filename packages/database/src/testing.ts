@@ -19,3 +19,9 @@ export async function createTestDatabase(): Promise<DatabaseHandle> {
     close: () => client.close(),
   };
 }
+
+/**
+ * `sql` re-exported for tests of other packages that edit or inspect rows directly (a forged
+ * MAC, a dump of every table) without depending on drizzle-orm themselves. Not for production code.
+ */
+export { sql } from 'drizzle-orm';

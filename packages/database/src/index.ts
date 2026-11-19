@@ -1,5 +1,5 @@
-export { createDatabase } from './client.js';
-export type { CreateDatabaseOptions, DatabaseHandle, Db } from './client.js';
+export { createDatabase, withTransactionTimeouts } from './client.js';
+export type { CreateDatabaseOptions, DatabaseHandle, Db, TransactionTimeouts } from './client.js';
 export { hashJobArguments, verifyJobArgumentsHash } from './job-arguments.js';
 export { migrate, MIGRATIONS_FOLDER } from './migrate.js';
 export type { MigrateResult } from './migrate.js';

@@ -26,8 +26,8 @@ export class SecretOpenError extends Error {
 export class KekOperationError extends Error {
   override readonly name = 'KekOperationError';
 
-  constructor(operation: 'wrap' | 'unwrap') {
-    super(`unable to ${operation} data key`);
+  constructor(operation: 'wrap' | 'unwrap' | 'derive') {
+    super(operation === 'derive' ? 'unable to derive key' : `unable to ${operation} data key`);
   }
 }
 
