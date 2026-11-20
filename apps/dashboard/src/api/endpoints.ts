@@ -9,10 +9,14 @@ import {
   Connection,
   ConnectionAuthResponse,
   ConnectionList,
+  ConnectionVaultMetadata,
+  DeleteStoredSessionResult,
   HealthResponse,
   OperationJob,
+  RevokeCapabilitiesResult,
   Routes,
   SessionResponse,
+  VaultKeyStatus,
 } from '@aab/contracts';
 import type {
   AuditEventType,
@@ -153,6 +157,32 @@ export function createEndpoints(client: ApiClient) {
         body,
         schema: Connection,
       }),
+
+    /** Metadata only: types, versions, counts. The API never returns key or session material. */
+    getConnectionVault: (id: string, signal?: AbortSignal) =>
+      client.request({
+        path: fill(Routes.connectionVault, { id }),
+        schema: ConnectionVaultMetadata,
+        signal,
+      }),
+
+    deleteStoredSession: (id: string) =>
+      client.request({
+        method: 'POST',
+        path: fill(Routes.connectionVaultDeleteSession, { id }),
+        schema: DeleteStoredSessionResult,
+      }),
+
+    revokeCapabilities: (id: string) =>
+      client.request({
+        method: 'POST',
+        path: fill(Routes.connectionVaultRevokeCapabilities, { id }),
+        schema: RevokeCapabilitiesResult,
+      }),
+
+    /** Owner only; 403 for other roles and 503 while the vault is down. */
+    getVaultStatus: (signal?: AbortSignal) =>
+      client.request({ path: Routes.vaultStatus, schema: VaultKeyStatus, signal }),
 
     listAgents: (signal?: AbortSignal) =>
       listAll((cursor) =>

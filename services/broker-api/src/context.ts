@@ -73,7 +73,13 @@ declare module 'fastify' {
   }
   interface FastifyInstance {
     /** Every route registered on this app, for tests that must cover all of them. */
-    routeTable: { method: string; url: string; public: boolean }[];
+    routeTable: {
+      method: string;
+      url: string;
+      public: boolean;
+      /** The route's response schemas by status code, as registered (for tests of what a route serves). */
+      responseSchemas: Record<string, unknown>;
+    }[];
     /** Runs the vault authorization sweep once; returns how many jobs it ended. For tests. */
     sweepVaultAuthorizations: () => Promise<number>;
   }

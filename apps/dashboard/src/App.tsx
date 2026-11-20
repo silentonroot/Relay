@@ -14,13 +14,8 @@ import { ApplicationsPage } from './pages/ApplicationsPage.js';
 import { ConnectionsPage } from './pages/ConnectionsPage.js';
 import { LoginPage } from './pages/LoginPage.js';
 import { OverviewPage } from './pages/OverviewPage.js';
-import {
-  ApprovalsPage,
-  PoliciesPage,
-  SettingsPage,
-  VaultPage,
-  WorkflowsPage,
-} from './pages/PlannedPages.js';
+import { ApprovalsPage, PoliciesPage, SettingsPage, WorkflowsPage } from './pages/PlannedPages.js';
+import { VaultPage } from './pages/VaultPage.js';
 
 const MAX_RETRIES = 2;
 

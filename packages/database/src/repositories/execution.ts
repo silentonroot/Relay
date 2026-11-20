@@ -649,6 +649,44 @@ export function createJobRepository(db: Db) {
     },
 
     /**
+     * For "revoke outstanding capabilities" (B5a): the QUEUED jobs of this connection whose
+     * capability is one of `capabilityIds` (the ones that call just revoked) become `cancelled`
+     * at once. Running jobs are left alone: their read was already consumed. Call it in the
+     * transaction that revoked the capabilities, after the revocation. Returns the jobs it
+     * cancelled.
+     */
+    async cancelQueuedForCapabilities(
+      connectionId: string,
+      capabilityIds: readonly string[],
+      now: Date,
+    ): Promise<ExecutionJob[]> {
+      if (!isUuid(connectionId) || capabilityIds.length === 0) return [];
+      if (!capabilityIds.every((id) => isUuid(id))) return [];
+      const rows = await db
+        .update(executionJobs)
+        .set({
+          status: 'cancelled',
+          errorCode: 'cancelled',
+          errorMessage: 'The job was cancelled before it started.',
+          cancelRequestedAt: now,
+          finishedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(executionJobs.connectionId, connectionId),
+            eq(executionJobs.status, 'queued'),
+            sql`${executionJobs.id} in (select job_id from vault_access_capabilities where id in (${sql.join(
+              capabilityIds.map((id) => sql`${id}::uuid`),
+              sql`, `,
+            )}))`,
+          ),
+        )
+        .returning();
+      return rows.map(toExecutionJob);
+    },
+
+    /**
      * Decides what happens to running jobs whose lease expired: a retry-safe operation with
      * attempts left is requeued, an operation that is not retry-safe becomes
      * `outcome_unknown` (it may have changed the target application), everything else fails

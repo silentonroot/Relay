@@ -15,7 +15,7 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { to: '/', label: 'Overview' },
   { to: '/applications', label: 'Applications' },
   { to: '/connections', label: 'Connections' },
-  { to: '/vault', label: 'Vault', planned: true },
+  { to: '/vault', label: 'Vault' },
   { to: '/agents', label: 'Agents' },
   { to: '/policies', label: 'Policies', planned: true },
   { to: '/workflows', label: 'Workflows', planned: true },

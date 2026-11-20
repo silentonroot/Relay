@@ -28,6 +28,8 @@ export const queryKeys = {
   auditList: (filters: AuditFilters) => ['audit', 'list', filters] as const,
   auditRecent: (limit: number) => ['audit', 'recent', limit] as const,
   operation: (jobId: string) => ['operations', jobId] as const,
+  connectionVault: (id: string) => ['vault', 'connection', id] as const,
+  vaultStatus: ['vault', 'status'] as const,
 };
 
 export function useHealth() {
@@ -288,4 +290,50 @@ export function useOperationJob(jobId: string | null, enabled: boolean) {
     if (finished) void queryClient.invalidateQueries({ queryKey: queryKeys.audit });
   }, [finished, queryClient]);
   return query;
+}
+
+export function useConnectionVault(id: string) {
+  const api = useApi();
+  return useQuery({
+    queryKey: queryKeys.connectionVault(id),
+    queryFn: ({ signal }) => api.getConnectionVault(id, signal),
+  });
+}
+
+/** Failures of the status read (403 for a non-owner, 503 without the vault) are answers, not retried. */
+export function useVaultStatus() {
+  const api = useApi();
+  return useQuery({
+    queryKey: queryKeys.vaultStatus,
+    queryFn: ({ signal }) => api.getVaultStatus(signal),
+    retry: false,
+  });
+}
+
+function useRefreshAfterVaultAction(connectionId: string) {
+  const queryClient = useQueryClient();
+  return () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.connectionVault(connectionId) }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.connections }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.audit }),
+    ]);
+}
+
+export function useDeleteStoredSession(connectionId: string) {
+  const api = useApi();
+  const refresh = useRefreshAfterVaultAction(connectionId);
+  return useMutation({
+    mutationFn: () => api.deleteStoredSession(connectionId),
+    onSuccess: refresh,
+  });
+}
+
+export function useRevokeCapabilities(connectionId: string) {
+  const api = useApi();
+  const refresh = useRefreshAfterVaultAction(connectionId);
+  return useMutation({
+    mutationFn: () => api.revokeCapabilities(connectionId),
+    onSuccess: refresh,
+  });
 }

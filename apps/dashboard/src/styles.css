@@ -1004,11 +1004,12 @@ tbody tr:last-child > * {
 
 .cell-actions {
   text-align: right;
-  white-space: nowrap;
 }
 
-.cell-actions > * + * {
-  margin-left: var(--space-1);
+/* Three actions no longer fit one line at common widths, so they wrap rather than scroll. */
+.cell-actions > * {
+  margin: 0 0 var(--space-1) var(--space-1);
+  white-space: nowrap;
 }
 
 .plain-list {
@@ -1360,4 +1361,41 @@ section > .confirm {
   font-size: var(--text-sm);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* ---------- Vault panel ---------- */
+
+.vault-panel h3,
+.vault-panel h4 {
+  margin: var(--space-4) 0 var(--space-2);
+}
+
+.vault-panel h3 {
+  margin-top: 0;
+}
+
+.vault-counts dd + dd {
+  margin-top: 0;
+}
+
+.vault-rejections {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-4);
+  padding-left: 1.25rem;
+}
+
+.vault-secret,
+.vault-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3) var(--space-5);
+  margin-bottom: var(--space-3);
+}
+
+.vault-secret > div,
+.vault-counts > div {
+  flex: 1 1 11rem;
+  min-width: 0;
+  max-width: 24rem;
 }

@@ -40,6 +40,12 @@ export const Routes = {
   connections: '/connections',
   connection: '/connections/:id',
   connectionRevoke: '/connections/:id/revoke',
+  /** Vault metadata of one connection (ADR-014 section 12). */
+  connectionVault: '/connections/:id/vault',
+  /** Delete the stored session: versions gone, capabilities revoked, reconnect required. */
+  connectionVaultDeleteSession: '/connections/:id/vault/delete-session',
+  /** Revoke the connection's outstanding capabilities; the session stays stored. */
+  connectionVaultRevokeCapabilities: '/connections/:id/vault/revoke-capabilities',
   connectionAuthStart: '/connections/:id/auth/start',
   connectionAuthComplete: '/connections/:id/auth/complete',
   operationsExecute: '/operations/execute',

@@ -80,9 +80,24 @@ application: it is rendered only as text inside a `<pre>`, never as HTML and nev
 `denied`, `approval_required`, `reauth_required`, `validation_failed` and `conflict` answers are
 shown as outcomes. Approvals do not exist yet, so an `approval_required` answer says that.
 
+## Vault screens
+
+Each row of the Connections page has a **Vault** button that opens the connection's vault panel
+(`GET /v1/connections/:id/vault`): secret type, status, active version, key version, last access,
+and the 24-hour counts of capabilities authorized, used and revoked, with rejections listed by
+reason. Two actions, each behind a confirmation and sent with the CSRF header: **Delete stored
+session** and **Revoke outstanding capabilities**. A 409 is shown as "not possible in the
+connection's current state".
+
+The **Vault** page shows the installation's key status (`GET /v1/vault/status`): key versions
+present and missing, stored versions per key version, the isolation mode and the fixed statement
+of what the key protects. It is owner-only (other roles see an explanation) and shows "Vault not
+available" on a 503. Rewrap and key retirement are admin-command only and have no button. Both
+screens render only the fields of the contract schemas; nothing else in a response reaches the DOM.
+
 ## What does not exist yet
 
-Vault, Policies, Workflows, Approvals and Settings have routes and a page that says so, because
+Policies, Workflows, Approvals and Settings have routes and a page that says so, because
 the broker has no backend for them. They show no data. Also not built: cancelling a sign-in from
 the dashboard, editing applications or connections, and enabling a disabled agent.
 

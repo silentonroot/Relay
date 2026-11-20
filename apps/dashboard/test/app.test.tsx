@@ -41,7 +41,7 @@ describe('Navigation', () => {
     const planned = within(nav)
       .getAllByText('Planned')
       .map((tag) => tag.previousElementSibling?.textContent);
-    expect(planned).toEqual(['Vault', 'Policies', 'Workflows', 'Approvals', 'Settings']);
+    expect(planned).toEqual(['Policies', 'Workflows', 'Approvals', 'Settings']);
   });
 
   it('shows a not-found page for an unknown address inside the shell', async () => {
@@ -54,7 +54,6 @@ describe('Navigation', () => {
 
 describe('Not-yet-available sections', () => {
   const cases: [string, string, RegExp][] = [
-    ['/vault', 'Vault', /Secret metadata and rotation.*never shown/],
     ['/policies', 'Policies', /Grant rules and a policy simulator/],
     ['/workflows', 'Workflows', /Multi-step runs/],
     ['/approvals', 'Approvals', /exact proposed actions awaiting a decision/],

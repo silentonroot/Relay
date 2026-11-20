@@ -212,6 +212,7 @@ export function ConfirmPanel(props: {
   confirmLabel: string;
   pending: boolean;
   error?: unknown;
+  errorTitle?: string;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -228,7 +229,7 @@ export function ConfirmPanel(props: {
       </p>
       <div className="confirm-body">{props.children}</div>
       {props.error !== undefined && props.error !== null && (
-        <ErrorState title="That did not work" error={props.error} />
+        <ErrorState title={props.errorTitle ?? 'That did not work'} error={props.error} />
       )}
       <div className="button-row">
         <button type="button" className="button" onClick={props.onCancel} disabled={props.pending}>

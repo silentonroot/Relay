@@ -47,6 +47,8 @@ const NO_SESSION: readonly ConnectionStatus[] = [
   'created',
   'authentication_required',
   'authenticating',
+  // "Delete stored session" ends here with the expiry still on the row.
+  'reconnect_required',
   'revoked',
 ];
 

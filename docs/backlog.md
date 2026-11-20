@@ -149,6 +149,7 @@ These record gaps that Phase 2 left. They add no Phase 3 scope: Phase 3 moves th
 - **Depends on:** AAB-005, AAB-015
 - **Done when:** the three screens were used end to end in a browser, differences are fixed or recorded, and the relevant tests are updated.
 - **Threat model:** UI-10. **Matrix:** AT-059.
+- **Progress (2026-11-20, step B5b):** one manual run of the sign-in panel (real handoff to `Connected`), the session status display and the new vault screens in a browser against the real API, vault, worker and demo. The run-a-read panel of the agent page was not used, so the ticket stays open. One difference was found and fixed: a connection in `reconnect_required` still showed an expiry estimate. Details: `docs/phase-3.md` B5b.
 
 ### AAB-022 Snapshot handling on failed re-login
 

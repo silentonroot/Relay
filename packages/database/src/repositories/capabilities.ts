@@ -1,6 +1,6 @@
 import { AuditEventType } from '@aab/contracts';
 import type { ActorType, CapabilityRejectionReason } from '@aab/contracts';
-import { and, eq, gte, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { PgTransaction } from 'drizzle-orm/pg-core';
 import type { Db } from '../client.js';
@@ -302,6 +302,77 @@ function inTransaction<T>(db: Db, work: (tx: Db) => Promise<T>): Promise<T> {
   return db instanceof PgTransaction ? work(db as unknown as Db) : db.transaction(work);
 }
 
+type OnRevoked = (capabilityIds: string[]) => Promise<Record<string, string | number | boolean>>;
+
+/**
+ * The dashboard counts of `summarizeForConnection`. `since` is a SQL timestamp expression. What
+ * each count means, all within the window starting at `since`: `authorized` = capabilities
+ * authorized (issued_at) in the window; `issued` = of those, the ones that got a token;
+ * `used` = capabilities consumed (used_at) in the window; `revoked` = capabilities revoked
+ * (revoked_at) in the window, whenever they were authorized; `rejected` = capability_rejected
+ * audit events in the window. So `used` and `revoked` count events of the window and can exceed
+ * `authorized`. The
+ * ownership check and the counts are scoped by the caller's organization and user; nothing but
+ * counts and reason codes is selected.
+ */
+async function summarize(
+  db: Db,
+  scope: Scope,
+  connectionId: string,
+  since: SQL,
+): Promise<CapabilitySummary> {
+  if (!isValidScope(scope) || !isUuid(connectionId)) throw new NotFoundError('connection');
+  const [owned] = await db
+    .select({ id: connections.id })
+    .from(connections)
+    .where(
+      and(
+        eq(connections.id, connectionId),
+        eq(connections.organizationId, scope.organizationId),
+        eq(connections.ownerUserId, scope.userId),
+      ),
+    )
+    .limit(1);
+  if (owned === undefined) throw new NotFoundError('connection');
+
+  const [counts] = rowsOf(
+    await db.execute(sql`
+      select count(*) filter (where issued_at >= ${since})::int as authorized,
+             count(*) filter (where token_hash is not null and issued_at >= ${since})::int as issued,
+             count(*) filter (where used_at >= ${since})::int as used,
+             count(*) filter (where revoked_at >= ${since})::int as revoked
+      from vault_access_capabilities
+      where connection_id = ${connectionId}::uuid
+        and organization_id = ${scope.organizationId}::uuid`),
+  );
+  const rejected = await db
+    .select({
+      reason: sql<string>`${auditEvents.metadata} ->> 'reason'`,
+      total: sql<number>`count(*)::int`,
+    })
+    .from(auditEvents)
+    .where(
+      and(
+        eq(auditEvents.organizationId, scope.organizationId),
+        eq(auditEvents.connectionId, connectionId),
+        eq(auditEvents.eventType, 'vault.capability_rejected'),
+        sql`${auditEvents.timestamp} >= ${since}`,
+      ),
+    )
+    .groupBy(sql`${auditEvents.metadata} ->> 'reason'`);
+  const rejectedByReason: Partial<Record<CapabilityRejectionReason, number>> = {};
+  for (const row of rejected) {
+    rejectedByReason[row.reason as CapabilityRejectionReason] = Number(row.total);
+  }
+  return {
+    authorized: Number(counts?.authorized ?? 0),
+    issued: Number(counts?.issued ?? 0),
+    used: Number(counts?.used ?? 0),
+    revoked: Number(counts?.revoked ?? 0),
+    rejectedByReason,
+  };
+}
+
 /**
  * Capability rows for the vault. The vault calls these inside `repositories.transaction`, so
  * every state change commits with its audit event (INV-10), or not at all.
@@ -336,7 +407,12 @@ export function createCapabilityRepository(db: Db) {
   async function revokeWhere(
     tx: Db,
     target: SQL,
-    input: { reason: CapabilityRevocationReason; now: Date; actor?: CapabilityActor | undefined },
+    input: {
+      reason: CapabilityRevocationReason;
+      now: Date;
+      actor?: CapabilityActor | undefined;
+      onRevoked?: OnRevoked | undefined;
+    },
     extraMetadata: Record<string, unknown>,
   ): Promise<RevocationResult> {
     // Lock the target rows first, in id order, in a statement of their own: two revocations that
@@ -363,6 +439,11 @@ export function createCapabilityRepository(db: Db) {
         returning id, organization_id, agent_id, connection_id, job_id`),
     );
     if (rows.length === 0) return { revoked: 0, capabilityIds: [] };
+    // Same transaction, after the capability rows and before the audit event: the caller's
+    // follow-up writes (cancelling the queued jobs of these capabilities) and the metadata it
+    // wants on the event.
+    const followUp =
+      input.onRevoked === undefined ? {} : await input.onRevoked(rows.map((row) => String(row.id)));
     const actor = input.actor ?? SYSTEM_ACTOR;
     const audit = createAuditRepository(tx);
     // One event per organization: an audit event belongs to exactly one chain.
@@ -386,6 +467,7 @@ export function createCapabilityRepository(db: Db) {
         timestamp: input.now,
         metadata: {
           ...extraMetadata,
+          ...(byOrganization.size === 1 ? followUp : {}),
           reason: input.reason,
           count: group.length,
           capabilityIds: group.slice(0, MAX_LISTED_IDS).map((row) => String(row.id)),
@@ -813,6 +895,11 @@ export function createCapabilityRepository(db: Db) {
       >;
       now: Date;
       actor?: CapabilityActor | undefined;
+      /**
+       * Called in the same transaction with the ids just revoked, before the audit event; the
+       * metadata it returns (small counts only) is added to the event.
+       */
+      onRevoked?: OnRevoked | undefined;
     }): Promise<RevocationResult> {
       requireNow(input.now);
       if (!isUuid(input.connectionId)) return { revoked: 0, capabilityIds: [] };
@@ -1060,55 +1147,15 @@ export function createCapabilityRepository(db: Db) {
       since: Date,
     ): Promise<CapabilitySummary> {
       requireNow(since);
-      if (!isValidScope(scope) || !isUuid(connectionId)) throw new NotFoundError('connection');
-      const [owned] = await db
-        .select({ id: connections.id })
-        .from(connections)
-        .where(
-          and(
-            eq(connections.id, connectionId),
-            eq(connections.organizationId, scope.organizationId),
-            eq(connections.ownerUserId, scope.userId),
-          ),
-        )
-        .limit(1);
-      if (owned === undefined) throw new NotFoundError('connection');
+      return summarize(db, scope, connectionId, sqlTime(since));
+    },
 
-      const [counts] = rowsOf(
-        await db.execute(sql`
-          select count(*)::int as authorized,
-                 count(token_hash)::int as issued,
-                 count(used_at)::int as used,
-                 count(revoked_at)::int as revoked
-          from vault_access_capabilities
-          where connection_id = ${connectionId}::uuid and issued_at >= ${sqlTime(since)}`),
-      );
-      const rejected = await db
-        .select({
-          reason: sql<string>`${auditEvents.metadata} ->> 'reason'`,
-          total: sql<number>`count(*)::int`,
-        })
-        .from(auditEvents)
-        .where(
-          and(
-            eq(auditEvents.organizationId, scope.organizationId),
-            eq(auditEvents.connectionId, connectionId),
-            eq(auditEvents.eventType, 'vault.capability_rejected'),
-            gte(auditEvents.timestamp, since),
-          ),
-        )
-        .groupBy(sql`${auditEvents.metadata} ->> 'reason'`);
-      const rejectedByReason: Partial<Record<CapabilityRejectionReason, number>> = {};
-      for (const row of rejected) {
-        rejectedByReason[row.reason as CapabilityRejectionReason] = Number(row.total);
-      }
-      return {
-        authorized: Number(counts?.authorized ?? 0),
-        issued: Number(counts?.issued ?? 0),
-        used: Number(counts?.used ?? 0),
-        revoked: Number(counts?.revoked ?? 0),
-        rejectedByReason,
-      };
+    /**
+     * Dashboard (B5): the same counts over the last 24 hours by the DATABASE clock
+     * (`statement_timestamp()`), so the window does not depend on a caller's clock.
+     */
+    async summarizeLast24Hours(scope: Scope, connectionId: string): Promise<CapabilitySummary> {
+      return summarize(db, scope, connectionId, sql`statement_timestamp() - interval '24 hours'`);
     },
   };
 }

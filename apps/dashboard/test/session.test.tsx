@@ -99,4 +99,15 @@ describe('Session status on the connections page', () => {
     expect(within(row).getByText('no session stored')).toBeInTheDocument();
     expect(within(row).queryByText(/expires in/)).not.toBeInTheDocument();
   });
+
+  it('shows no expiry once the stored session was deleted (reconnect required)', async () => {
+    show({
+      displayName: 'Deleted',
+      status: 'reconnect_required',
+      sessionExpiresAt: at(HOUR * 5),
+    });
+    const row = await screen.findByRole('row', { name: /Deleted/ });
+    expect(within(row).getByText('no session stored')).toBeInTheDocument();
+    expect(within(row).queryByText(/expires in/)).not.toBeInTheDocument();
+  });
 });

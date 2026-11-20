@@ -1,4 +1,4 @@
-import { Routes, StatusResult } from '@aab/contracts';
+import { Routes, VAULT_KEY_PROTECTION_STATEMENT, VaultKeyStatus } from '@aab/contracts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createVaultGateway } from '../src/vault/gateway.js';
 import { startFakeVault } from './fake-vault.js';
@@ -70,7 +70,10 @@ describe('GET /vault/status', () => {
       headers: { cookie: ownerSession.cookie },
     });
     expect(response.statusCode, response.body).toBe(200);
-    expect(StatusResult.parse(response.json())).toEqual(STATUS);
+    expect(VaultKeyStatus.parse(response.json())).toEqual({
+      ...STATUS,
+      protectionStatement: VAULT_KEY_PROTECTION_STATEMENT,
+    });
     // hello first (the start-up check), then status; the API asked as itself and nothing else.
     expect(vault.requests.map((request) => request.operation)).toEqual(['hello', 'status']);
   });

@@ -8,3 +8,4 @@ export * from './connection-lifecycle.js';
 export * from './canonical.js';
 export * from './plain-json.js';
 export * from './vault.js';
+export * from './vault-dashboard.js';

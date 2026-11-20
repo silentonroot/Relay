@@ -451,6 +451,16 @@ delete the stored session, revoke outstanding capabilities. Rewrap and key retir
 admin command; the `api` role cannot start them. Nothing on the dashboard or in an API response
 carries plaintext, ciphertext, a wrapped key, a token, a token hash or a MAC.
 
+Accepted limitation (step B5a): `GET /v1/vault/status` reports installation-wide values (versions
+per KEK version, the vault's counters, including rejection counters over all organizations) to the
+owner of any organization, because there is one vault and one key per installation. This is accepted
+for a single-owner or single-organization installation. Follow-up: restrict the route to an
+installation administrator before multi-tenant use. The per-connection reads are scoped to the
+connection's owner and organization. "Delete stored session" cancels the connection's jobs as
+revoking a connection does, so no worker is refused for a capability the owner revoked; "revoke
+outstanding capabilities" cancels the queued jobs of the capabilities it revoked and leaves running
+jobs alone (their read was already consumed).
+
 ### Implementation notes
 
 - The vault caches no plaintext, no policy decision and no capability. (B0.5 (c), 2026-11-16: the

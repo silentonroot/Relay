@@ -2,7 +2,7 @@
 
 - **Status:** Planning, with steps B0.5 and B1 implemented (2026-11-16; both reviewed by Opus and pushed as 44f353b and 2dfc330),
   steps B2a (vault skeleton, protocol, crypto helpers; 2026-11-17) and B2b (vault operations; 2026-11-19) implemented and reviewed by Opus (B2a, B2b and the B2 review fixes committed and pushed as 06bfcdf and eaf7167; CI passed), and the wiring B3a (API) and B3b (supervisor, infra; 2026-11-19) implemented and reviewed by Opus (no Critical or High; 3 Medium and 8 Low findings, all fixed with tests). Verified on 2026-11-19 on PostgreSQL 17: database 319, vault 196, vault-client 12, contracts 72, browser-worker 272 (+15 skipped e2e) and broker-api 158 tests passing (three broker-api files hit 10 s hook timeouts under load on the first run and passed alone; hook timeout now 60 s); typecheck, lint and format clean; the Phase 2 end-to-end test passed twice (15/15) with the vault in the path. Compose and the Docker images were checked with `docker compose config` only, not built locally (CI builds them). Written on 2026-11-16 from [ADR-014](adr/ADR-014-vault-service.md) and the code as
-  it stood at commit `b714c6d`. `services/vault` exists (B2a, B2b) and is wired to the API and the supervisor (B3a, B3b); step B4 (key versioning and rewrap; 2026-11-19, reviewed by Opus: one High (operations procedure), two Medium and three Low findings, all fixed; verified on PostgreSQL 17 with every suite and the end-to-end test passing twice) is implemented; B5 and everything after it do not exist yet.
+  it stood at commit `b714c6d`. `services/vault` exists (B2a, B2b) and is wired to the API and the supervisor (B3a, B3b); step B4 (key versioning and rewrap; 2026-11-19, reviewed by Opus: one High (operations procedure), two Medium and three Low findings, all fixed; verified on PostgreSQL 17 with every suite and the end-to-end test passing twice) is implemented; step B5a (the API half of B5: vault metadata reads and the two lifecycle actions, 2026-11-20; reviewed by Opus: no Critical or High, three Medium and six Low findings, all fixed with tests) and B5b (dashboard screens, 2026-11-20; checked in a browser against the real local stack, not separately reviewed) are implemented; verified on PostgreSQL 17 with every suite and the end-to-end test passing twice. B6 does not exist yet.
 - **Specification:** §6 (vault), §11 (`vault_access_capabilities`, `execution_jobs.capability_ref`),
   §15 Phase 3. Exit criteria: workers can use only secrets for authorized jobs; database-only theft
   yields ciphertext; vault tests pass.
@@ -454,6 +454,106 @@ secrets-scan,startup-database,cli}.test.ts` plus the B2a files. Covered on PGlit
 - Done when: cross-owner tests for the new reads pass, the response-schema test passes, and the
   screens are checked against the real API (not only a mock; compare AAB-021).
 - Model: Sonnet; the response-schema test reviewed by Opus.
+- **B5a status (implemented 2026-11-20; reviewed by Opus, all findings fixed):**
+  `GET /v1/connections/:id/vault` (secret type, status, active version, KEK version, last access,
+  and 24-hour counts of authorized, used, revoked and rejected-by-reason capabilities on the
+  database clock); `GET /v1/vault/status` now also carries the fixed ADR-003 statement
+  (`protectionStatement`; still owner-only, 503 without the vault);
+  `POST /v1/connections/:id/vault/delete-session` (one transaction: connection to
+  `reconnect_required`, versions deleted, secret `deleted`, unused capabilities revoked with reason
+  `session_deleted`, the connection's jobs cancelled as revoking does, events
+  `connection.status_changed`, `vault.secret_deleted` (with `jobsCancelled`),
+  `vault.capability_revoked`; 409 for a revoked connection, a repeat, a connection in `created`,
+  `authentication_required` or `authenticating`, or no stored session, each leaving everything
+  unchanged; works with the vault down) and `POST /v1/connections/:id/vault/revoke-capabilities`
+  (reason `owner_requested`; connection and secret unchanged; always appends one
+  `vault.capability_revoked` event, with count 0 when nothing was revoked). Both actions, like
+  revoking a connection, are open to every role for the connections the caller owns and 404 for
+  anyone else's; CSRF applies as everywhere. The response schemas are in
+  `VAULT_DASHBOARD_RESPONSE_SCHEMAS`; the walker in `packages/contracts/test/forbidden-fields.ts`
+  fails on any field name matching
+  `cipher|wrapped|dek|kek|key|token|mac|nonce|plaintext|secret_?value|salt|hash|password|credential|authtag|auth_?tag`
+  (case-insensitive) except five listed key-version fields, over the schemas and over the real
+  route responses. It also fails on an open-ended schema (`any`, `unknown`, a loose object, a
+  catchall other than `never`), checks enum or literal record keys as field names, lists free-key
+  records (`vaultStatus.versionsByKek`, `vaultStatus.counters`) so a test must name every one, flags
+  response string values that look like a 64-hex or a long (32+ characters) base64 or base64url
+  string (UUIDs are exempt), and a route test checks that every vault route serves exactly its entry
+  in the table (same schema object, none missing).
+  What the dashboard counts mean (window = the last 24 hours by the database clock): `authorized`
+  = capabilities authorized (`issued_at`) in the window; `used` = capabilities consumed (`used_at`)
+  in the window; `revoked` = capabilities revoked (`revoked_at`) in the window, whenever they were
+  authorized; `rejected` = `vault.capability_rejected` events in the window, by reason. `used` and
+  `revoked` therefore count events of the window and can exceed `authorized`. The window start uses
+  the database clock; the audit event `timestamp` of a rejection is written with the caller's clock,
+  which the capability statements already hold to within five seconds of the database's.
+  Jobs: delete-session cancels the connection's jobs exactly as revoking a connection does (queued
+  jobs end `cancelled`, running jobs get `cancel_requested_at`), in the same transaction and in the
+  lock order connection, secrets, capabilities, jobs, so a queued job is never claimed with a
+  capability the owner just revoked (that would record `vault.capability_rejected`, the theft
+  signal, for the owner's own action). Revoke-capabilities cancels only the QUEUED jobs whose
+  capability that call revoked, in the same transaction (the count is in the response and in the
+  event). Running jobs are left alone there: their read was already consumed, so the capability is
+  no longer in play; the job finishes or fails on its own.
+  Accepted limitation (L7): `GET /v1/vault/status` shows installation-wide values (versions per KEK
+  version, the vault's counters, including rejection counters across all organizations) to the owner
+  of ANY organization, because the vault and its key are one per installation. That is acceptable for
+  a single-owner or single-organization installation, which is what exists today. Follow-up: restrict
+  the route to an installation administrator before any multi-tenant use.
+  Not done: the "reviewed by Opus" step on the review fixes and the screens.
+- **B5b status (implemented 2026-11-20; not separately reviewed, checked against the real API as described below):** dashboard screens in `apps/dashboard`.
+  _Connections page:_ each row has a "Vault" button that opens a panel from
+  `GET /v1/connections/:id/vault`: secret type, status, active version, key (KEK) version, last
+  access, the 24-hour counts of authorized, used and revoked (each labelled as the API defines it)
+  and the rejections by reason, kept in their own list apart from the revoked count, with the
+  wording that only an expired token is also what a slow worker produces (ADR-014 section 10).
+  "Revoke outstanding capabilities" and "Delete stored session" each open a confirmation that says
+  what happens (delete: reconnect required, queued jobs cancelled, running jobs flagged, unused
+  capabilities revoked; revoke: unused capabilities revoked, queued jobs that held one cancelled,
+  connection and session untouched), post through the existing client (CSRF header), show a 409 as
+  "not possible in the connection's current state" with the server's message and request id,
+  refresh the panel, the connection list and the audit queries, and announce the counts through the
+  existing notice region. Delete is disabled, with a stated reason, when no version is stored.
+  _Vault page_ (formerly a placeholder; the "Planned" tag is gone from the navigation): installation
+  key status from `GET /v1/vault/status` (key versions present, missing versions highlighted as a
+  problem, stored versions per key version, isolation mode with a warning on `shared-uid`, the
+  protection statement verbatim), a "Vault not available" state on 503, an owner-only explanation
+  on 403, and a statement that rewrap and key retirement are admin-command only (no buttons). The
+  session response carries no role, so the page asks the API and lets it answer 403; the vault's
+  `counters` are in the contract but are not rendered. Every response is parsed with the contract
+  schema (strict), so a field outside the contract is refused rather than shown.
+  _Tests:_ `apps/dashboard/test/vault.test.tsx` (15 tests, mock API as elsewhere): metadata and count
+  labels, rejections apart from revocations, empty states, a response with canary strings planted
+  under extra fields (ciphertext, wrapped key, token, MAC; also on the status response) renders none
+  of them, confirmation required and cancel sends nothing, CSRF header and path of both actions,
+  announcement and refresh, 409, 403, 503. Mutation checks (made, run, reverted): replacing the
+  response schema with `z.any()` and rendering the raw response made the canary test fail;
+  not sending the CSRF header on POST made both action tests fail.
+  _Real-API check (2026-11-20; compare AAB-021):_ the stack ran locally with a throwaway PostgreSQL
+  17, the vault (`shared-uid`, a generated key in `/run/user`), the broker API, the worker
+  (bubblewrap, a private Xvfb display), the Northstar demo (seeded, synthetic accounts) and the
+  dashboard's Vite dev server, driven by Playwright's Chromium (`playwright-core` 1.65.0, a script
+  outside the repository). Seen in a browser against the real API: signing in to the dashboard; a
+  connection with no stored session (panel empty state); a real login handoff through the
+  dashboard's sign-in panel (window on the private display, credentials typed with xdotool, the
+  "I've signed in" button) ending `Connected`; the panel with the stored session (`session_snapshot`,
+  version 1, key version 1, counts 1 authorized and 1 used, from the sign-in's own seal capability);
+  the key-status page; "Revoke outstanding capabilities" with nothing outstanding (200, 0 and 0);
+  "Delete stored session" (200, connection `reconnect_required`, secret `deleted`); a second delete
+  on the same connection (409, shown as designed); a second login, then a real read
+  (`orders.list`, run through the API as an agent would, because the run-a-read panel was not used)
+  after which the panel showed version 2, a last-access time and counts 3 and 3; then, with the
+  vault process stopped, the Vault page in its 503 state and a delete of the stored session that
+  still worked. Both POSTs carried the CSRF header. Mismatches found and fixed in the dashboard:
+  the secret type the real API returns is `session_snapshot`; the connection row kept showing
+  "expires in 59 minutes" after a delete (the API leaves `sessionExpiresAt` on the row;
+  `reconnect_required` now counts as holding no session); three buttons in the row overflowed the
+  table (they now wrap); the delete button was offered with nothing to delete; the authorized
+  count includes the sign-in's seal capability, which the label now says. Not exercised: a
+  non-owner (403) against the real API (only the owner account exists; mock tests only), a non-zero
+  rejection list, a revoke that cancels queued jobs, delete with a running job, a vault with a
+  missing or second key version, and `separate-uid` isolation. The run-a-read panel of the agent
+  page was not used.
 
 ### B6 Service-boundary negative tests, end-to-end and review
 

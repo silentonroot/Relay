@@ -18,6 +18,7 @@ import {
   auditTypes,
   capabilityRow,
   consumeInput,
+  isPostgres,
   issue,
   jobRow,
   markRunning,
@@ -2099,6 +2100,157 @@ describe('scoped dashboard reads (ADR-010)', () => {
     await expect(
       repositories.capabilities.summarizeForConnection(tenant.scope, UNKNOWN_ID, at(0)),
     ).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it('capabilities.summarizeLast24Hours counts a window measured by the DATABASE clock (the app clock is made wrong) and is scoped like the other reads', async () => {
+    const f = await op();
+    const issued = await issue(handle.db, repositories, f);
+    await repositories.capabilities.consumeRead(consumeInput(issued));
+    // Two rejections now (one reason each) and one 25 hours ago, which the window excludes.
+    const rejectWith = async (hash: string | undefined, now: Date) =>
+      repositories.capabilities.recordRejection(
+        await repositories.capabilities.describeForRejection({
+          ...consumeInput(issued, hash === undefined ? {} : { tokenHash: hash }),
+          purpose: 'read',
+        }),
+        { role: 'supervisor', now },
+      );
+    await rejectWith(undefined, at(3000)); // used
+    await rejectWith(newToken().hash, at(3100)); // unknown_token
+    await rejectWith(undefined, new Date(Date.now() - 25 * 3_600_000)); // used, too old
+    const expected = {
+      authorized: 1,
+      issued: 1,
+      used: 1,
+      revoked: 0,
+      rejectedByReason: { used: 1, unknown_token: 1 },
+    };
+    expect(
+      await repositories.capabilities.summarizeLast24Hours(tenant.scope, f.connectionId),
+    ).toEqual(expected);
+    // The discriminating case needs a real PostgreSQL: PGlite takes its clock from the JS Date,
+    // so faking the app clock would fake the database clock too.
+    if (isPostgres()) {
+      // The discriminating case: the application's clock is three days ahead of the database's.
+      // A window built from the app clock (`new Date()`) would start two days after these rows
+      // and count none of them; the database-clock window still counts them all.
+      vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 3 * 86_400_000 });
+      try {
+        const appClockWindow = await repositories.capabilities.summarizeForConnection(
+          tenant.scope,
+          f.connectionId,
+          new Date(Date.now() - 24 * 3_600_000),
+        );
+        expect(appClockWindow).toMatchObject({ authorized: 0, used: 0 }); // the control
+        expect(
+          await repositories.capabilities.summarizeLast24Hours(tenant.scope, f.connectionId),
+        ).toEqual(expected);
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+    // Capabilities authorized 25 hours ago are outside the window as well.
+    await sql1(
+      sql`update vault_access_capabilities set issued_at = issued_at - interval '25 hours', expires_at = expires_at - interval '25 hours', token_issued_at = token_issued_at - interval '25 hours', token_expires_at = token_expires_at - interval '25 hours', used_at = used_at - interval '25 hours' where id = ${issued.capabilityId}::uuid`,
+    );
+    expect(
+      (await repositories.capabilities.summarizeLast24Hours(tenant.scope, f.connectionId))
+        .authorized,
+    ).toBe(0);
+    for (const scope of [
+      teammate.scope,
+      other.scope,
+      { organizationId: other.organization.id, userId: tenant.user.id },
+      { organizationId: tenant.organization.id, userId: other.user.id },
+      { organizationId: 'nope', userId: 'nope' },
+    ]) {
+      await expect(
+        repositories.capabilities.summarizeLast24Hours(scope, f.connectionId),
+      ).rejects.toBeInstanceOf(NotFoundError);
+    }
+    await expect(
+      repositories.capabilities.summarizeLast24Hours(tenant.scope, UNKNOWN_ID),
+    ).rejects.toBeInstanceOf(NotFoundError);
+  });
+});
+
+describe('dashboard window semantics and the job cancel of a revocation (B5a review)', () => {
+  it('summarize counts revoked and used by when they happened, authorized by when issued', async () => {
+    const f = await op();
+    await authorize(repositories, f);
+    // Authorized 25 hours ago, revoked now: outside the window as an authorization, inside it
+    // as a revocation.
+    await sql1(
+      sql`update vault_access_capabilities set issued_at = issued_at - interval '25 hours', expires_at = expires_at - interval '25 hours' where connection_id = ${f.connectionId}::uuid`,
+    );
+    await repositories.capabilities.revokeForConnection({
+      connectionId: f.connectionId,
+      reason: 'owner_requested',
+      now: at(100),
+    });
+    expect(
+      await repositories.capabilities.summarizeLast24Hours(tenant.scope, f.connectionId),
+    ).toMatchObject({ authorized: 0, issued: 0, used: 0, revoked: 1 });
+    // The other way round: revoked 25 hours ago, so not counted in the window.
+    await sql1(
+      sql`update vault_access_capabilities set revoked_at = revoked_at - interval '25 hours' where connection_id = ${f.connectionId}::uuid`,
+    );
+    expect(
+      (await repositories.capabilities.summarizeLast24Hours(tenant.scope, f.connectionId)).revoked,
+    ).toBe(0);
+  });
+
+  it('jobs.cancelQueuedForCapabilities cancels only queued jobs of the listed capabilities on that connection, via revokeForConnection onRevoked', async () => {
+    const queued = await op();
+    await authorize(repositories, queued);
+    const running = await addOperationJob(repositories, queued);
+    const runningCapability = await issue(handle.db, repositories, running);
+    // A queued job of the same connection that has no capability to revoke stays queued.
+    const uncovered = await addOperationJob(repositories, queued);
+    const elsewhere = await op();
+    const elsewhereCapability = await authorize(repositories, elsewhere);
+
+    // Listing a capability of ANOTHER connection cancels nothing here.
+    expect(
+      await repositories.jobs.cancelQueuedForCapabilities(
+        queued.connectionId,
+        [elsewhereCapability.capabilityId],
+        at(50),
+      ),
+    ).toEqual([]);
+    expect(
+      await repositories.jobs.cancelQueuedForCapabilities(queued.connectionId, [], at(50)),
+    ).toEqual([]);
+    expect((await jobRow(handle.db, elsewhere.jobId)).status).toBe('queued');
+
+    const result = await repositories.transaction((tx) =>
+      tx.capabilities.revokeForConnection({
+        connectionId: queued.connectionId,
+        reason: 'owner_requested',
+        now: at(100),
+        onRevoked: async (ids) => ({
+          jobsCancelled: (
+            await tx.jobs.cancelQueuedForCapabilities(queued.connectionId, ids, at(100))
+          ).length,
+        }),
+      }),
+    );
+    expect(result.revoked).toBe(2);
+    expect(await jobRow(handle.db, queued.jobId)).toMatchObject({
+      status: 'cancelled',
+      error_code: 'cancelled',
+    });
+    expect((await jobRow(handle.db, running.jobId)).status).toBe('running');
+    expect((await jobRow(handle.db, uncovered.jobId)).status).toBe('queued');
+    expect((await jobRow(handle.db, elsewhere.jobId)).status).toBe('queued');
+    expect(runningCapability.capabilityId).toBeDefined();
+    const events = rowsOf(
+      await handle.db.execute(
+        sql`select metadata from audit_events where connection_id = ${queued.connectionId}::uuid and event_type = 'vault.capability_revoked'`,
+      ),
+    );
+    expect(events).toHaveLength(1);
+    expect(events[0]!.metadata).toMatchObject({ count: 2, jobsCancelled: 1 });
   });
 });
 

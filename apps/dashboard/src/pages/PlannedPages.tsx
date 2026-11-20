@@ -42,22 +42,6 @@ function PlannedPage({ content }: { content: PlannedContent }) {
   );
 }
 
-export function VaultPage() {
-  return (
-    <PlannedPage
-      content={{
-        title: 'Vault',
-        summary: 'Secret metadata and rotation. Secret values are never shown, here or anywhere.',
-        items: [
-          'Which secrets exist, which connection each belongs to, and when it was created.',
-          'When each secret was last rotated and when it is due for rotation.',
-          'Rotation and revocation actions. Values stay inside the broker and are never displayed or exported.',
-        ],
-      }}
-    />
-  );
-}
-
 export function PoliciesPage() {
   return (
     <PlannedPage

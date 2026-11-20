@@ -177,6 +177,9 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
         method: String(method).toUpperCase(),
         url: route.url,
         public: route.config?.auth === 'public',
+        responseSchemas: {
+          ...((route.schema as { response?: Record<string, unknown> } | undefined)?.response ?? {}),
+        },
       });
     }
   });

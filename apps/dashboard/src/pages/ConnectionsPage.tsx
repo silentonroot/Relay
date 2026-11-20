@@ -12,6 +12,7 @@ import {
 import { useAnnounce } from '../components/Announcer.js';
 import { SessionInfo } from '../components/SessionInfo.js';
 import { SignInPanel } from '../components/SignInPanel.js';
+import { VaultPanel } from '../components/VaultPanel.js';
 import {
   ConfirmPanel,
   EmptyState,
@@ -204,6 +205,7 @@ export function ConnectionsPage() {
   const applications = useApplications();
   const [creating, setCreating] = useState(false);
   const [revokingId, setRevokingId] = useState<string | null>(null);
+  const [vaultOpenId, setVaultOpenId] = useState<string | null>(null);
   // Connections whose sign-in panel stays open (to show the outcome), and how many handoffs
   // each has had, so a new handoff starts with a fresh panel.
   const [panels, setPanels] = useState<Record<string, number>>({});
@@ -340,6 +342,17 @@ export function ConnectionsPage() {
                           {signInLabel}
                         </button>
                       )}
+                      <button
+                        type="button"
+                        className="button"
+                        aria-label={`Vault details for ${connection.displayName}`}
+                        aria-expanded={vaultOpenId === connection.id}
+                        onClick={() =>
+                          setVaultOpenId(vaultOpenId === connection.id ? null : connection.id)
+                        }
+                      >
+                        {vaultOpenId === connection.id ? 'Hide vault' : 'Vault'}
+                      </button>
                       {connection.status !== 'revoked' && revokingId !== connection.id && (
                         <button
                           type="button"
@@ -375,6 +388,13 @@ export function ConnectionsPage() {
                           }
                           onClose={() => setPanels(({ [connection.id]: _closed, ...rest }) => rest)}
                         />
+                      </td>
+                    </tr>
+                  ),
+                  vaultOpenId === connection.id && (
+                    <tr key={`${connection.id}-vault`} className="row-confirm">
+                      <td colSpan={6}>
+                        <VaultPanel connection={connection} />
                       </td>
                     </tr>
                   ),

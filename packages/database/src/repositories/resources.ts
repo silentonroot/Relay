@@ -130,6 +130,8 @@ export interface TransitionConnectionInput {
   reason?: string | undefined;
   /** Defaults to the user in the scope. */
   actor?: StatusActor | undefined;
+  /** Also sets `sessionExpiresAt` to null, in the same update: the session is gone. */
+  clearSessionExpiry?: boolean | undefined;
 }
 
 export interface RecordSessionInput {
@@ -189,6 +191,7 @@ export function createConnectionRepository(db: Db) {
           .set({
             status: input.to,
             statusReason: reason,
+            ...(input.clearSessionExpiry === true ? { sessionExpiresAt: null } : {}),
             lastVerifiedAt: input.to === 'active' ? now : current.lastVerifiedAt,
             updatedAt: now,
           })
@@ -362,6 +365,7 @@ export function createConnectionRepository(db: Db) {
         to: 'revoked',
         reason: input.reason,
         actor: input.actor,
+        clearSessionExpiry: true,
       });
     },
 
