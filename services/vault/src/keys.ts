@@ -1,8 +1,10 @@
 import { createSecretKey } from 'node:crypto';
 import type { KeyObject } from 'node:crypto';
-import { lstat } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import { inspect } from 'node:util';
 import { KekStoreError, LocalFileKekProvider } from '@aab/crypto';
+import { ancestorProblem } from './socket-safety.js';
 
 /*
  * The vault's key material, loaded once at start (ADR-014 section 3). The KEK stays inside
@@ -10,6 +12,47 @@ import { KekStoreError, LocalFileKekProvider } from '@aab/crypto';
  * HKDF (label `aab.vault.capability-mac.v1`) and kept here, in memory only, as KeyObjects that
  * do not print their bytes. Nothing here is ever logged or returned by an operation.
  */
+
+/**
+ * The key directory's path must be a real one (no symbolic link in it) and every directory above
+ * it must pass the socket directory's rule (`ancestorProblem`): owned by root or the vault's user
+ * and not writable by group or other, a sticky directory being exempt only when root owns it.
+ * Whoever can rename an ancestor, or replace a link, can swap the key directory after it was
+ * checked (ADR-014 section 3; the B2 residual closed in B4 and tightened in its review). A
+ * directory that does not exist yet (`init-kek`) is checked through its nearest existing
+ * ancestor. Runs before any key file is read.
+ */
+export async function requireSafeKeyPath(directory: string): Promise<void> {
+  const uid = process.geteuid?.() ?? -1;
+  const target = resolve(directory);
+  let existing = target;
+  for (;;) {
+    if (
+      await lstat(existing).then(
+        () => true,
+        () => false,
+      )
+    )
+      break;
+    const parent = dirname(existing);
+    if (parent === existing) break;
+    existing = parent;
+  }
+  if ((await realpath(existing)) !== existing) {
+    throw new KekStoreError(`the KEK directory path must not contain a symbolic link: ${target}`);
+  }
+  // The nearest existing path is itself an ancestor when the key directory is yet to be created.
+  let current = existing === target ? dirname(target) : existing;
+  for (;;) {
+    const problem = ancestorProblem(await lstat(current), uid);
+    if (problem !== null) {
+      throw new KekStoreError(`a parent of the KEK directory ${problem}: ${current}`);
+    }
+    const parent = dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
+}
 
 export class VaultKeys {
   readonly #macKeys = new Map<number, KeyObject>();
@@ -32,6 +75,8 @@ export class VaultKeys {
     if (stat !== null && uid !== undefined && stat.isDirectory() && stat.uid !== uid) {
       throw new KekStoreError(`KEK directory must be owned by the vault's user: ${directory}`);
     }
+    // Every path check happens before a key file is opened, and the keys load from that path.
+    await requireSafeKeyPath(directory);
     const provider = await LocalFileKekProvider.load(directory);
     const keys = new VaultKeys(provider);
     for (const version of provider.versions) {

@@ -430,3 +430,30 @@ export function isPlainForbidden(response: Record<string, unknown>): boolean {
 
 export const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Makes the stored versions sort in a known order and adds `count` rows that can never be
+ * rewrapped: copies of the first stored version under other version numbers, so the AAD does not
+ * match and the unwrap fails. The copies get the smallest ids, the real rows the largest, so a
+ * rewrap that starts from the beginning meets every failing row before any good one.
+ */
+export async function seedUnwrappableRowsFirst(service: Service, count: number): Promise<void> {
+  const real = rowsOf(
+    await service.db.execute(sql`select id from vault_secret_versions order by id`),
+  ).map((row) => String(row['id']));
+  for (const [index, id] of real.entries()) {
+    await execSql(
+      service,
+      sql`update vault_secret_versions set id = ${`ffffffff-ffff-4fff-8fff-${String(index).padStart(12, '0')}`}::uuid where id = ${id}::uuid`,
+    );
+  }
+  await execSql(
+    service,
+    sql`insert into vault_secret_versions
+          (id, secret_id, version, algorithm, ciphertext, nonce, auth_tag, wrapped_dek, kek_version, aad_version)
+        select ('00000000-0000-4000-8000-' || lpad(g::text, 12, '0'))::uuid, secret_id, 1000 + g,
+               algorithm, ciphertext, nonce, auth_tag, wrapped_dek, kek_version, aad_version
+        from (select * from vault_secret_versions order by id desc limit 1) as template,
+             generate_series(1, ${count}::int) as g`,
+  );
+}

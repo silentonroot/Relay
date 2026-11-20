@@ -827,7 +827,7 @@ The API side of the wiring, as far as it is done. Where it differs from the text
   queued jobs with no capability older than 60 s the same way, using `listQueuedWithoutCapability`. Both
   repository functions are additive, in `packages/database` (`test/job-vault-failure.test.ts`).
 
-### As built in step B3b (2026-11-19, local WIP commits, not reviewed)
+### As built in step B3b (2026-11-19, reviewed)
 
 The supervisor side of the wiring. Where it differs from the text above, this wins.
 
@@ -901,6 +901,64 @@ The supervisor side of the wiring. Where it differs from the text above, this wi
   copy workspace packages were updated (`vault-client` added to the API image, which B3a had missed;
   `crypto` replaced by `vault-client` in the runner image). Validated with `docker compose config` only;
   nothing was built or started. `docs/operations.md` has the `separate-uid` setup and `LimitCORE=0`.
+
+### As built in step B4 (2026-11-19, reviewed)
+
+Most of section 8 existed from B2 (the rewrap batches, `kekRetirementCheck`, `status`, `init-kek --next`).
+B4 closed what was left:
+
+- **A rewrap cursor (deviation from "the command calls the vault again while rows remain and the last call
+  made progress").** The B2 loop stopped when a call rewrapped nothing, and every call listed from the
+  first row again, so 500 or more rows that cannot be rewrapped (a missing KEK, a wrapped key that does
+  not open) starved every good row behind them. `RewrapParams` now takes an optional `afterId` (a
+  version id) and `RewrapResult` an optional `nextAfterId`, both strictly validated as UUIDs in
+  `packages/contracts`. A call that stopped at its bound (rows per call or `maxBatches`) with more
+  candidates behind it returns the id of the last row it examined; the next call starts after it. The
+  field is absent when the call reached the end of the list. `vault rewrap` passes it through and ends at
+  the first result without one, so it always ends (each call starts strictly after the previous one) and
+  it visits every row once per run. `remaining` still counts every stored version below the current KEK,
+  so exit 3 is unchanged: rows `remaining` or `failed`. No migration: `listForRewrap` already took
+  `afterVersionId`.
+- **The key directory's path (tightened in the B4 review).** `requireSafeKeyPath` in `keys.ts` runs
+  before any key file is read, and the keys load from the verified path. The path must be real
+  (`realpath` equals the path, so no symbolic link in it) and every directory above it must pass the
+  socket directory's `ancestorProblem` rule: owned by root or the vault's user and not writable by group
+  or other, a sticky directory exempt only when root owns it. `init-kek` (also with `--next`) runs the
+  same check first, through the nearest existing ancestor when the directory does not exist yet, so it
+  never creates a key the vault would refuse. Without it, whoever can rename an ancestor or replace a
+  link can swap the key directory after the check. Not tested: an ancestor owned by a third user (the
+  tests run unprivileged and cannot `chown`); that branch is the shared `ancestorProblem`, tested with
+  the socket directory.
+- **The vault takes no authorization lifetime (review L2).** `AAB_VAULT_AUTHORIZATION_TTL_SECONDS` was
+  parsed by the vault and never used; the API sends the lifetime with every `authorizeJobAccess`
+  (default 600 s, logins 900 s, at most 3,600 s). It is removed from the vault's configuration; a value
+  still set in the vault's environment is ignored, not an error, so existing unit files keep working.
+  The rotation guide therefore waits one hour.
+- **The admin command's exit codes (review M1).** `pnpm --filter ... run` turns the command's exit codes
+  2 and 3 into 1. The documented invocation is `corepack pnpm --silent --dir services/vault run vault ...`
+  from the repository root, which keeps them (`cli.test.ts` runs that exact line against a vault with a
+  missing KEK and expects 3). The guide also says to decide from the JSON fields.
+- **No change to the transaction or the audit.** `rewrapVersion` (B1) and the single-row transaction with
+  `vault.secret_rewrapped` stay as they were. The mutation checks showed that a revoked secret is
+  protected twice on the rewrap path (the status predicates and the deletion of its versions by the
+  revocation transaction); the race tests assert the outcome, not which of the two did the work.
+- **Tests.** `services/vault/test/rewrap-kill.test.ts` kills the real vault process (`src/main.ts`) with
+  SIGKILL inside a row's transaction: a trigger makes the transaction of the 31st row wait on an advisory
+  lock the test holds, after the row was updated and before its audit event was written. After the kill 30
+  rows are on the new KEK with 30 events, none is half-applied, the ciphertext digest is unchanged, and
+  every version opens with the key files; after a restart and `vault rewrap` every row has exactly one
+  event and reads work through the vault. `revocation-race.test.ts` interleaves the vault operations with
+  a revocation on a second connection, ordering them with the revocation transaction held open or with
+  the same kind of advisory-lock trigger in front of the vault's audit append and `pg_locks` to know the
+  vault is waiting. Both are PostgreSQL only. `key-files.test.ts` hashes the key directory (contents,
+  modes, inodes, change times) around every operation and the admin command.
+  `services/broker-api/test/import-boundary.test.ts` is the API half of the import boundary: the API may
+  use `@aab/crypto` for password hashing and tokens, so the test forbids the key-handling names anywhere
+  in its source and requires every name imported from the package to be on a short allow list.
+- **Not covered.** Power loss or a kernel crash (SIGKILL of the process is what was tested; PostgreSQL's
+  own durability is assumed). A kill of the vault while PostgreSQL itself is on a slow disk. The
+  separate-uid setup. The rotation procedure of `docs/operations.md` was checked command by command
+  against the real scripts but not run end to end on a host.
 
 ## What a compromised component can and cannot do after Phase 3
 

@@ -713,7 +713,8 @@ export function createHandlers(deps: OperationDeps): VaultHandlers {
       let rewrapped = 0;
       let skipped = 0;
       let failed = 0;
-      let cursor: string | undefined;
+      let cursor: string | undefined = params.afterId;
+      let reachedEnd = target < 2;
       // The batch actually requested from the database: the cap applies to the comparison too,
       // or a batch size above it would stop after the first (short) batch.
       const batchLimit = Math.min(params.batchSize, REWRAP_MAX_BATCH);
@@ -721,11 +722,13 @@ export function createHandlers(deps: OperationDeps): VaultHandlers {
       // caller sees `remaining` and calls again.
       let processed = 0;
       for (let batch = 0; batch < params.maxBatches && target >= 2; batch += 1) {
+        const limit = Math.min(batchLimit, rewrapMaxRows - processed);
         const candidates = await repos.vault.listForRewrap({
           belowKekVersion: target,
-          limit: Math.min(batchLimit, rewrapMaxRows - processed),
+          limit,
           afterVersionId: cursor,
         });
+        if (candidates.length < limit) reachedEnd = true;
         for (const candidate of candidates) {
           cursor = candidate.versionId;
           processed += 1;
@@ -782,7 +785,15 @@ export function createHandlers(deps: OperationDeps): VaultHandlers {
       for (const [version, count] of await versionCounts()) {
         if (version < target) remaining += count;
       }
-      return { rewrapped, skipped, failed, remaining };
+      // A call that stopped at its bound hands back where it stopped, so the next call moves past
+      // rows that cannot be rewrapped instead of examining them first again.
+      return {
+        rewrapped,
+        skipped,
+        failed,
+        remaining,
+        ...(reachedEnd || cursor === undefined ? {} : { nextAfterId: cursor }),
+      };
     } finally {
       rewrapRunning = false;
     }

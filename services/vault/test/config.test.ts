@@ -24,7 +24,7 @@ describe('vault configuration', () => {
   it('defaults to separate-uid and the ADR-014 lifetimes', () => {
     const config = loadVaultConfig(GOOD);
     expect(config.isolation).toBe('separate-uid');
-    expect(config.authorizationTtlSeconds).toBe(600);
+    expect('authorizationTtlSeconds' in config).toBe(false);
     expect(config.tokenTtlSeconds).toBe(30);
     expect(config.roleGroups).toEqual({
       api: 'aab-vault-api',
@@ -69,9 +69,15 @@ describe('vault configuration', () => {
     expect(issues({ ...GOOD, [name]: value })).toContain(expected);
   });
 
+  it('ignores AAB_VAULT_AUTHORIZATION_TTL_SECONDS: the API owns that lifetime, the vault never used it', () => {
+    for (const value of ['4321', '99999', 'nonsense']) {
+      const config = loadVaultConfig({ ...GOOD, AAB_VAULT_AUTHORIZATION_TTL_SECONDS: value });
+      expect(JSON.stringify(config)).not.toContain(value);
+    }
+  });
+
   describe('lifetimes (P3-7: no lifetime by accident)', () => {
     const cases: Array<[string, string, number, number]> = [
-      ['AAB_VAULT_AUTHORIZATION_TTL_SECONDS', 'authorization', 10, 3_600],
       ['AAB_VAULT_TOKEN_TTL_SECONDS', 'token', 1, 120],
     ];
     for (const [name, label, min, max] of cases) {
@@ -106,9 +112,7 @@ describe('vault configuration', () => {
       it(`accepts the ${label} bounds ${min} and ${max}`, () => {
         for (const value of [min, max]) {
           const config = loadVaultConfig({ ...GOOD, [name]: String(value) });
-          const actual =
-            label === 'token' ? config.tokenTtlSeconds : config.authorizationTtlSeconds;
-          expect(actual).toBe(value);
+          expect(config.tokenTtlSeconds).toBe(value);
         }
       });
     }
@@ -120,14 +124,14 @@ describe('vault configuration', () => {
       AAB_KEK_DIR: 'relative-secret-dir',
       AAB_VAULT_SOCKET_DIR: undefined,
       AAB_VAULT_ISOLATION: 'secret-mode',
-      AAB_VAULT_AUTHORIZATION_TTL_SECONDS: '99999',
+      AAB_VAULT_TOKEN_TTL_SECONDS: '99999',
     });
     for (const name of [
       'DATABASE_URL',
       'AAB_KEK_DIR',
       'AAB_VAULT_SOCKET_DIR',
       'AAB_VAULT_ISOLATION',
-      'AAB_VAULT_AUTHORIZATION_TTL_SECONDS',
+      'AAB_VAULT_TOKEN_TTL_SECONDS',
     ]) {
       expect(message).toContain(name);
     }

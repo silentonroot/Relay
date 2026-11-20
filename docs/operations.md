@@ -266,14 +266,15 @@ who can read files as the service's user, or against root.
 
 ### Rotate
 
-**Planned.** The design is to add `kek-v<N+1>.key`, re-wrap existing data keys, and delete the old
-file only after every record reports the new version. There is no re-wrap command yet.
+Add `kek-v<N+1>.key`, re-wrap the existing data keys, and delete the old file only after no stored
+version references it. The vault does the re-wrap (`vault rewrap`); the exact order of steps is in
+"Rotating the key" under "The vault and its admin command (Phase 3)" below.
 
 ## The vault and its admin command (Phase 3)
 
 Status: step B3b. The vault service (`services/vault`) answers every operation of ADR-014 section 4,
-the API (B3a) and the browser worker's supervisor (B3b) use it, and neither holds a key. Rotation
-(B4) and the dashboard (B5) are later steps. Local tests ran with a real vault on temporary sockets;
+the API (B3a) and the browser worker's supervisor (B3b) use it, and neither holds a key. Key rotation
+(B4, below) works; the dashboard (B5) is a later step. Local tests ran with a real vault on temporary sockets;
 the `separate-uid` setup below, the systemd unit and the Compose vault have not been run on a real
 host or in containers by the people who wrote them.
 
@@ -413,24 +414,116 @@ authors; check each step on yours. Names are examples.
    cannot search the supervisor directory) and the same for the worker against the `api` and `admin`
    directories.
 
-Admin command (talks to the admin socket only; it reads no key and no database):
+Admin command (talks to the admin socket only; it reads no key and no database). Type it exactly like
+this, from the repository root: with `--filter`, pnpm turns the command's exit codes 2 and 3 into 1, and the
+rotation steps below depend on exit 3. `--dir services/vault` keeps the exit code and `--silent` keeps
+pnpm's own lines out of the JSON. Whatever you type, decide from the JSON fields (`remaining`, `failed`,
+`safeToRemove`), not from the exit code alone.
 
 ```sh
-corepack pnpm --filter @aab/vault run vault status
-corepack pnpm --filter @aab/vault run vault rewrap [--batch-size N] [--max-batches N]
-corepack pnpm --filter @aab/vault run vault kek-retirement-check <kekVersion>
+corepack pnpm --silent --dir services/vault run vault status
+corepack pnpm --silent --dir services/vault run vault rewrap [--batch-size N] [--max-batches N]
+corepack pnpm --silent --dir services/vault run vault kek-retirement-check <kekVersion>
 ```
 
-Rotating the key: run `init-kek --next` (`node --import tsx src/scripts/init-kek.ts --next <dir>`
-from `services/vault`) as the vault's user, restart the vault (keys are read at start), run
-`vault rewrap` until it exits 0 (the command calls the vault repeatedly, at most 500 rows per call; exit 3
-means rows remain or failed, for example because a KEK file is missing; run it again after fixing that), check with
-`vault kek-retirement-check <old version>` that `safeToRemove` is true, and only then remove the
-old file yourself. The vault never deletes a key file. A capability authorized or issued under the
-old version stops working when its file is gone (it is refused as `key_unavailable`); they last at
-most an hour, so retire after a quiet period. `status` lists KEK versions that stored versions
-still need but that are missing (`missingKekVersions`): those sessions cannot be opened until the
-file is back.
+### Rotating the key
+
+Do the steps in this order. `<dir>` is the vault's key directory (`AAB_KEK_DIR`), `<old>` the KEK
+version you are retiring (for example 1), and the admin commands need `AAB_VAULT_SOCKET_DIR` set to the
+vault's socket directory (the user running them must be allowed to open the `admin` socket). Run
+the key commands as the vault's user.
+
+1. **Back up the key directory** (see "Back up" above) before you change anything. This copy holds the
+   current key. Keep it until the end.
+2. **Generate the next KEK** as the vault's user. It adds `kek-v<N+1>.key` (mode 0600) and never
+   overwrites or removes a file:
+
+   ```sh
+   sudo -u aab-vault env AAB_KEK_DIR=<dir> corepack pnpm --filter @aab/vault run init-kek --next
+   ```
+
+   (Without `sudo`, in `shared-uid` mode: `AAB_KEK_DIR=<dir> corepack pnpm --filter @aab/vault run
+init-kek --next`. It prints the path of the new file; `init-kek --next <dir>` takes the directory
+   as an argument instead of the variable. It refuses a directory the vault would refuse, and
+   creates nothing then.)
+
+   **Back up the key directory again now, before the restart.** The vault starts using the new key at
+   the restart, so from then on data keys are wrapped under a key that exists only in this directory. Once
+   rewrap has run, the new key is what you cannot lose: the first backup does not hold it, and a backup
+   taken only at the end would leave a window with a single copy. Keep both backups until step 9 is done.
+
+3. **Restart the vault.** Keys are read only at start. From now on new data keys and new capability
+   MACs use the highest version; the old file is still loaded, so everything stored keeps opening.
+4. **Check the state** with `vault status`:
+
+   ```sh
+   corepack pnpm --silent --dir services/vault run vault status
+   ```
+
+   `kekVersions` must list both versions, `currentKekVersion` the new one, `versionsByKek` how many stored
+   versions each KEK still wraps, and `missingKekVersions` must be empty. If it is not empty, stop and see
+   "If rewrap exits 3" below.
+
+5. **Re-wrap** until the command exits 0. It calls the vault repeatedly (at most 500 rows per call, each
+   call continuing after the last row the previous one looked at) and prints one JSON line with
+   `rewrapped`, `skipped`, `failed` and `remaining`:
+
+   ```sh
+   corepack pnpm --silent --dir services/vault run vault rewrap [--batch-size N] [--max-batches N]
+   ```
+
+   Each row is one transaction with its `vault.secret_rewrapped` audit event; only the wrapped key and
+   its KEK version change, never the ciphertext. It is safe to interrupt (even to kill the vault) and to
+   run again: rows already done are not touched, and a row replaced or revoked meanwhile is skipped.
+   Exit 0 means nothing remains; exit 3 means rows `remaining` or `failed`; exit 1 means the vault
+   refused (for example another rewrap is running) or is unreachable; exit 2 is bad usage.
+
+6. **Ask whether the old version can go:**
+
+   ```sh
+   corepack pnpm --silent --dir services/vault run vault kek-retirement-check <old>
+   ```
+
+   It prints `{"referencingVersions":0,"safeToRemove":true}` only when no stored version is wrapped
+   under `<old>` and `<old>` is not the current version. Anything else: do not continue.
+
+7. **Wait out the capabilities.** A capability authorized before the restart in step 3 is bound to a MAC
+   under the old key and is refused (`key_unavailable`) once that file is gone. Wait one hour after step 3
+   (the contract maximum for any capability: the API's `AAB_VAULT_AUTHORIZATION_TTL_SECONDS` defaults to 10
+   minutes and may be set up to 3,600 s, and a login's authorization lasts 900 s). Then run step 6 once more.
+8. **Remove the old file yourself**, as the vault's user: `rm <dir>/kek-v<old>.key`. The vault never
+   deletes a key file, and neither does `init-kek` or `vault`. The running vault keeps the old key in
+   memory and `status` reports no missing version, because nothing references it; restart the vault at
+   your next convenience so that its memory no longer holds the old key.
+9. **Back up the key directory once more** (it now holds the new key only). Keep the step 1 and step 2
+   backups by your own retention rules, and for as long as you keep any database backup taken before the
+   rewrap: such a backup holds data keys wrapped under the old key and needs it to be restored.
+
+**If rewrap exits 3.** Read the JSON line. `remaining` above 0 with `failed` above 0 means some stored
+versions could not be re-wrapped: the usual cause is a KEK file missing from `<dir>` (`vault status` lists
+the version under `missingKekVersions`, and the vault refuses reads of those sessions with
+`key_unavailable` until the file is back, while it keeps serving every other secret). Restore the missing
+`kek-v<N>.key` from your backup into `<dir>` with its original owner and mode (0600, vault's user),
+restart the vault, and run `vault rewrap` again. `failed` can also mean a row's wrapped key does not
+open (damaged data): `vault` never changes such a row; the connection must sign in again. `remaining` above 0
+with `failed` 0 means rows were skipped because they changed while the command ran: run it again.
+
+**Never.**
+
+- Never delete a KEK file while `kek-retirement-check` says `referencingVersions` is above 0, or before you
+  have a backup of it. Every session wrapped under it becomes unrecoverable (there is no escrow).
+- Never remove the current (highest) version.
+- Never edit, rename or copy over a key file in place, and never put one where the API, the worker or
+  the repository can reach it.
+- Never run `init-kek --next` as root or as another user than the vault's: the vault refuses a key
+  directory owned by someone else, and every directory above it must be owned by root or the vault's
+  user and not writable by group or other (a sticky root-owned directory such as `/tmp` is accepted),
+  or the vault will not start.
+- Never skip step 7 on a busy installation: jobs that hold an old-key capability fail and must be queued
+  again.
+
+`status` lists KEK versions that stored versions still need but that are missing
+(`missingKekVersions`): those sessions cannot be opened until the file is back.
 
 Tests: `corepack pnpm --filter @aab/vault run test` (PGlite, temporary sockets under
 `$XDG_RUNTIME_DIR`, no root). The process-level start test in `test/main.test.ts` needs a reachable

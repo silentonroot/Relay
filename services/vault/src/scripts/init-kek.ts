@@ -1,6 +1,7 @@
 import { readdir } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 import { generateLocalKek, KekStoreError } from '@aab/crypto';
+import { requireSafeKeyPath } from '../keys.js';
 
 /*
  * Creates a local key-encryption key (ADR-003, ADR-014 section 8). Run it as the vault's user:
@@ -42,6 +43,8 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   try {
+    // The vault refuses such a directory at start; do not create a key it would then refuse.
+    await requireSafeKeyPath(directory);
     const path = await generateLocalKek(
       directory,
       existing.length === 0 ? 1 : Math.max(...existing) + 1,

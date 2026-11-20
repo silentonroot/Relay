@@ -1,9 +1,6 @@
 import { isAbsolute, normalize } from 'node:path';
 import { z } from 'zod';
 import {
-  AUTHORIZATION_TTL_MAX_SECONDS,
-  AUTHORIZATION_TTL_MIN_SECONDS,
-  DEFAULT_AUTHORIZATION_TTL_SECONDS,
   DEFAULT_TOKEN_TTL_SECONDS,
   TOKEN_TTL_MAX_SECONDS,
   TOKEN_TTL_MIN_SECONDS,
@@ -89,11 +86,6 @@ const EnvSchema = z.object({
   AAB_VAULT_GROUP_API: GroupSpec,
   AAB_VAULT_GROUP_SUPERVISOR: GroupSpec,
   AAB_VAULT_GROUP_ADMIN: GroupSpec,
-  AAB_VAULT_AUTHORIZATION_TTL_SECONDS: strictInt(
-    AUTHORIZATION_TTL_MIN_SECONDS,
-    AUTHORIZATION_TTL_MAX_SECONDS,
-    DEFAULT_AUTHORIZATION_TTL_SECONDS,
-  ),
   AAB_VAULT_TOKEN_TTL_SECONDS: strictInt(
     TOKEN_TTL_MIN_SECONDS,
     TOKEN_TTL_MAX_SECONDS,
@@ -113,8 +105,12 @@ export interface VaultConfig {
   isolation: VaultIsolation;
   /** Group name or numeric gid per role; present for every role in `separate-uid` only. */
   roleGroups: Readonly<Partial<Record<VaultRole, string>>>;
-  /** Lifetimes the vault's own checks use (the API and supervisor send theirs per request). */
-  authorizationTtlSeconds: number;
+  /**
+   * The vault takes no authorization lifetime: the API sends one with every `authorizeJobAccess`
+   * (10 to 3,600 s, `AAB_VAULT_AUTHORIZATION_TTL_SECONDS` on the API). A value set for the vault is
+   * ignored; it was parsed and never used before B4's review.
+   */
+  /** The token lifetime the vault's own checks use (the supervisor sends its own per request). */
   tokenTtlSeconds: number;
   /** Open connections allowed per role socket. */
   maxConnectionsPerRole: number;
@@ -179,7 +175,6 @@ export function loadVaultConfig(env: Record<string, string | undefined>): VaultC
         socketDir: data.AAB_VAULT_SOCKET_DIR,
         isolation: data.AAB_VAULT_ISOLATION,
         roleGroups: groups,
-        authorizationTtlSeconds: data.AAB_VAULT_AUTHORIZATION_TTL_SECONDS,
         tokenTtlSeconds: data.AAB_VAULT_TOKEN_TTL_SECONDS,
         maxConnectionsPerRole: data.AAB_VAULT_MAX_CONNECTIONS,
         idleTimeoutMs: data.AAB_VAULT_IDLE_TIMEOUT_MS,

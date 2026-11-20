@@ -1,6 +1,9 @@
-import { readdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { chmod, mkdir, readdir, realpath, rename, rm, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { VaultKeys } from '../src/keys.js';
+import { makeKekDir, removeDir } from './helpers.js';
 import {
   addKek,
   auditEvents,
@@ -90,5 +93,65 @@ describe('P3-20: only the vault touches key files; a missing KEK version fails r
     });
     // Nothing the vault did removed or changed a key file.
     expect((await readdir(service.kekDir)).sort()).toEqual(['kek-v1.key', 'kek-v2.key']);
+  });
+});
+
+describe('the key directory must not sit under a directory others can rename (B2 residual)', () => {
+  async function loadUnder(parentMode: number): Promise<unknown> {
+    const dir = await makeKekDir([1]);
+    const parent = dirname(dir);
+    cleanups.push(() => removeDir(parent));
+    await chmod(parent, parentMode);
+    return VaultKeys.load(dir).then(
+      () => 'loaded',
+      (error: unknown) => error,
+    );
+  }
+
+  it('refuses a parent writable by group or by other, and loads under a private one', async () => {
+    expect(await loadUnder(0o700)).toBe('loaded');
+    expect(await loadUnder(0o755)).toBe('loaded');
+    for (const mode of [0o775, 0o777, 0o757, 0o770]) {
+      const error = await loadUnder(mode);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain('writable by group or other');
+    }
+  });
+
+  it('accepts a sticky directory only when root owns it (the socket directory rule)', async () => {
+    // A sticky parent owned by the vault's own user is refused: it is not root's /tmp. A
+    // root-owned sticky directory is accepted; every test key directory lives under /tmp.
+    const error = await loadUnder(0o1777);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('not a sticky directory owned by root');
+    expect(tmpdir()).toBe((await realpath(tmpdir())).toString());
+    expect(await loadUnder(0o700)).toBe('loaded');
+  });
+
+  it('refuses a key directory reached through a symbolic link, even a safe target in an unsafe directory', async () => {
+    const safe = await makeKekDir([1]);
+    cleanups.push(() => removeDir(dirname(safe)));
+    const outer = dirname(await makeKekDir([]));
+    cleanups.push(() => removeDir(outer));
+    await chmod(outer, 0o777);
+    const link = join(outer, 'link');
+    await symlink(safe, link);
+    const error = await VaultKeys.load(link).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('symbolic link');
+  });
+
+  it('checks every ancestor, not only the parent', async () => {
+    const dir = await makeKekDir([1]);
+    const parent = dirname(dir);
+    cleanups.push(() => removeDir(parent));
+    // The key directory sits two levels down; the unsafe directory is the outer one.
+    const nested = join(parent, 'inner');
+    await mkdir(nested, { mode: 0o700 });
+    await rename(dir, join(nested, 'keys'));
+    await chmod(parent, 0o777);
+    const error = await VaultKeys.load(join(nested, 'keys')).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(parent);
   });
 });

@@ -11,6 +11,7 @@ import {
   KekRetirementCheckParams,
   ReadForWorkerParams,
   RewrapParams,
+  RewrapResult,
   StatusParams,
   VAULT_ERROR_CODES,
   VAULT_ERROR_TO_ERROR_CODE,
@@ -99,6 +100,19 @@ describe('vault parameter schemas', () => {
       expect(schema.safeParse({ ...params, role: 'admin' }).success).toBe(false);
       expect(schema.safeParse({ ...params, extra: 1 }).success).toBe(false);
     }
+  });
+
+  it('the rewrap cursor is an optional uuid in the request and in the result, nothing else', () => {
+    const base = { batchSize: 10, maxBatches: 2 };
+    expect(RewrapParams.safeParse({ ...base, afterId: UUID }).success).toBe(true);
+    for (const afterId of ['', 'x', `${UUID}z`, 7, null, `${UUID}\n`]) {
+      expect(RewrapParams.safeParse({ ...base, afterId }).success).toBe(false);
+    }
+    const result = { rewrapped: 0, skipped: 0, failed: 0, remaining: 0 };
+    expect(RewrapResult.safeParse(result).success).toBe(true);
+    expect(RewrapResult.safeParse({ ...result, nextAfterId: UUID }).success).toBe(true);
+    expect(RewrapResult.safeParse({ ...result, nextAfterId: 'x' }).success).toBe(false);
+    expect(RewrapResult.safeParse({ ...result, cursor: UUID }).success).toBe(false);
   });
 
   it('bounds lifetimes: safe integers inside 10..3600 and 1..120 only', () => {

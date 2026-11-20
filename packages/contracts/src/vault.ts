@@ -138,6 +138,8 @@ export const StatusParams = z.strictObject({});
 export const RewrapParams = z.strictObject({
   batchSize: z.number().int().min(1).max(1_000),
   maxBatches: z.number().int().min(1).max(10_000),
+  /** Continue after this version id (the `nextAfterId` of the previous call); omitted: from the start. */
+  afterId: Uuid.optional(),
 });
 export const KekRetirementCheckParams = z.strictObject({ kekVersion: KekVersionNumber });
 
@@ -193,6 +195,12 @@ export const RewrapResult = z.strictObject({
   skipped: z.number().int().min(0),
   failed: z.number().int().min(0),
   remaining: z.number().int().min(0),
+  /**
+   * Present when this call stopped at its bound with more candidates behind the last one it
+   * examined: pass it as `afterId` to continue past rows that could not be rewrapped. Absent when
+   * the candidate list was exhausted.
+   */
+  nextAfterId: Uuid.optional(),
 });
 export const KekRetirementCheckResult = z.strictObject({
   referencingVersions: z.number().int().min(0),
