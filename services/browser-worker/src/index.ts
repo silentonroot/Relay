@@ -19,23 +19,23 @@ export { ConfigError, loadWorkerConfig } from './config.js';
 export type { LogLevel, WorkerConfig } from './config.js';
 export { createLogger, REDACT_PATHS } from './logging.js';
 export {
+  encodeSnapshot,
   filterStorageState,
   isEmptyStorageState,
-  loadLocalKek,
   MAX_SNAPSHOT_BYTES,
-  openSnapshot,
+  parseSnapshot,
   sessionExpiry,
   SnapshotOpenError,
   SnapshotTooLargeError,
-  storeSnapshot,
 } from './session-store/index.js';
-export type {
-  KekProvider,
-  OpenedSnapshot,
-  SnapshotConnection,
-  StoredSnapshot,
-  StoreSnapshotInput,
-} from './session-store/index.js';
+export type { OpenedSnapshot } from './session-store/index.js';
+export {
+  canOpenDirectory,
+  createSupervisorVault,
+  failureCodeFor,
+  VaultStartupRefusal,
+} from './vault/gateway.js';
+export type { SupervisorVault, SupervisorVaultOptions } from './vault/gateway.js';
 export {
   createJobRunner,
   displayFromEnvironment,

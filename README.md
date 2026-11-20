@@ -135,10 +135,9 @@ corepack pnpm install --frozen-lockfile
 cp .env.example .env
 ```
 
-The API uses no key and refuses to start if `AAB_KEK_DIR` is set in its environment, so leave it
-blank for the API. The browser worker needs a key, which
-you create with the worker's `init-kek` command (see "Run the browser worker" below and the
-[operations guide](docs/operations.md)).
+Neither the API nor the browser worker holds a key: both refuse to start if `AAB_KEK_DIR` is set in
+their environment, so leave it blank. Only the vault service reads the key, which you create with its
+`init-kek` command (see "Run the browser worker" below and the [operations guide](docs/operations.md)).
 
 Create a local PostgreSQL role and database, then put the connection string in `.env`
 (`postgres://aab:<password>@127.0.0.1:5432/aab`, password URL-encoded):
@@ -170,14 +169,26 @@ build `aab/browser-runner:local` first (see the Compose section), accept that Ch
 is off in it, and note that it cannot show the sign-in window, so connect accounts with a bubblewrap
 worker.
 
-Operations and sign-in need the worker. In a third shell, load `.env` as for the API, then set
-`AAB_KEK_DIR` in that shell only (keep it blank in `.env` and for the API). Create a key once and
-back it up separately from the database, then start the worker. The worker reads `DATABASE_URL`,
-`AAB_KEK_DIR` and the `AAB_WORKER_*` variables in `.env.example`.
+Operations and sign-in need the vault and the worker. Only the vault holds the key-encryption key:
+neither the API nor the worker may have `AAB_KEK_DIR` set, and both refuse to start if it is. On a
+single-user machine run the vault in `shared-uid` mode (a developer laptop; the operations guide
+describes `separate-uid` for a real host). In one shell, as the user that will own the key:
 
 ```sh
-export AAB_KEK_DIR=$HOME/.config/aab/keys
-corepack pnpm --filter @aab/browser-worker run init-kek
+export AAB_KEK_DIR=$HOME/.config/aab/keys            # the vault's shell only
+export AAB_VAULT_SOCKET_DIR=$XDG_RUNTIME_DIR/aab-vault
+export AAB_VAULT_ISOLATION=shared-uid
+corepack pnpm --filter @aab/vault run init-kek       # once; back the directory up away from the database
+corepack pnpm --filter @aab/vault run start
+```
+
+Start the API and the worker in other shells with `AAB_VAULT_ISOLATION=shared-uid` and their own role's
+socket: the API with `AAB_VAULT_SOCKET=$XDG_RUNTIME_DIR/aab-vault/api/vault.sock`, the worker with
+`AAB_VAULT_SOCKET=$XDG_RUNTIME_DIR/aab-vault/supervisor/vault.sock` (and no `AAB_KEK_DIR`). The worker
+reads `DATABASE_URL`, `AAB_VAULT_SOCKET`, `AAB_VAULT_ISOLATION` and the `AAB_WORKER_*` variables in
+`.env.example`.
+
+```sh
 corepack pnpm --filter @aab/browser-worker run start
 ```
 
@@ -213,6 +224,9 @@ openssl rand -hex 24 > ~/.config/aab/compose-secrets/postgres_password
 printf 'DATABASE_URL=postgres://aab:%s@postgres:5432/aab\n' \
   "$(cat ~/.config/aab/compose-secrets/postgres_password)" \
   > ~/.config/aab/compose-secrets/broker-api.env
+# The vault has its own file (the same database role for now); AAB_UID/AAB_GID below also set the
+# vault's user, which must equal the API's.
+cp ~/.config/aab/compose-secrets/broker-api.env ~/.config/aab/compose-secrets/vault.env
 
 # Compose-only settings.
 printf 'AAB_HOST_SECRETS_DIR=%s\nAAB_UID=%s\nAAB_GID=%s\n' \
@@ -246,8 +260,10 @@ line in `infra/docker/nginx/default.conf` (both are marked in that file) and reb
 
 `.env.example` lists every variable with safe defaults and no usable secrets. API: `DATABASE_URL`,
 `AAB_HOST`, `AAB_PORT`, `AAB_SESSION_TTL_MINUTES`, `AAB_COOKIE_SECURE`, `AAB_LOG_LEVEL`,
-`AAB_TRUST_PROXY`, `AAB_PASSWORD_CONCURRENCY`, `AAB_PASSWORD_QUEUE_LIMIT`, `AAB_JOB_WAIT_MS`. Worker:
-`DATABASE_URL`, `AAB_KEK_DIR` (worker only), `AAB_WORKER_SANDBOX`, `AAB_WORKER_CONCURRENCY`,
+`AAB_TRUST_PROXY`, `AAB_PASSWORD_CONCURRENCY`, `AAB_PASSWORD_QUEUE_LIMIT`, `AAB_JOB_WAIT_MS`,
+`AAB_VAULT_SOCKET`, `AAB_VAULT_ISOLATION`. Vault: `DATABASE_URL`, `AAB_KEK_DIR`, `AAB_VAULT_SOCKET_DIR`,
+`AAB_VAULT_ISOLATION`. Worker:
+`DATABASE_URL`, `AAB_VAULT_SOCKET`, `AAB_VAULT_ISOLATION`, `AAB_WORKER_SANDBOX`, `AAB_WORKER_CONCURRENCY`,
 `AAB_CHROMIUM_PATH`, `AAB_WORKER_RUNTIME_DIR`, `AAB_JOB_RESULT_TTL_MINUTES`, and
 `AAB_WORKER_POLL_MS` and `AAB_WORKER_LEASE_MS` (read by the worker, not listed in `.env.example`).
 `.env` is git-ignored and excluded from images.

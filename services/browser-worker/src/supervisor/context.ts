@@ -4,8 +4,8 @@ import type { AdapterRegistry, ApplicationAdapter } from '@aab/adapter-sdk';
 import type { ApplicationDefinition } from '@aab/contracts';
 import type { ExecutionJob, Repositories } from '@aab/database';
 import type { Logger } from 'pino';
-import type { KekProvider } from '../session-store/index.js';
 import type { JobRunner } from '../types.js';
+import type { SupervisorVault } from '../vault/gateway.js';
 
 export interface SupervisorSettings {
   /** Recorded on claimed jobs; must be unique per supervisor process. */
@@ -20,6 +20,13 @@ export interface SupervisorSettings {
   heartbeatMs: number;
   /** How often an open login window checks for the owner's completion or a cancel request. */
   loginPollMs: number;
+  /**
+   * A login's capability must outlive the sign-in window by this much: the token is issued after
+   * the owner completes, so the window is cut to the capability's remaining life minus this.
+   */
+  loginCapabilityMarginMs: number;
+  /** A login whose window would be shorter than this fails before a window opens. */
+  minLoginWindowMs: number;
   /** How often expired leases are recovered and old results purged. */
   maintenanceIntervalMs: number;
   /** Stored job results are purged this long after the job finished. */
@@ -33,6 +40,8 @@ export const DEFAULT_SUPERVISOR_SETTINGS: Omit<SupervisorSettings, 'workerId' | 
   pollIntervalMs: 1_000,
   leaseMs: 60_000,
   loginPollMs: 500,
+  loginCapabilityMarginMs: 45_000,
+  minLoginWindowMs: 5_000,
   maintenanceIntervalMs: 60_000,
   resultTtlMinutes: 60,
   maxAttempts: 3,
@@ -54,6 +63,8 @@ export function resolveSupervisorSettings(
     'leaseMs',
     'heartbeatMs',
     'loginPollMs',
+    'loginCapabilityMarginMs',
+    'minLoginWindowMs',
     'maintenanceIntervalMs',
     'resultTtlMinutes',
     'maxAttempts',
@@ -71,7 +82,8 @@ export function resolveSupervisorSettings(
 export interface SupervisorDeps {
   repos: Repositories;
   runner: JobRunner;
-  kek: KekProvider;
+  /** The supervisor-role vault gateway. The supervisor holds no key (P3-1). */
+  vault: SupervisorVault;
   adapters: AdapterRegistry;
   clock?: () => Date;
   logger: Logger;
@@ -84,7 +96,7 @@ export type StopReason = 'shutdown' | 'lease_lost' | 'cancelled';
 export interface JobContext {
   readonly repos: Repositories;
   readonly runner: JobRunner;
-  readonly kek: KekProvider;
+  readonly vault: SupervisorVault;
   readonly adapters: AdapterRegistry;
   readonly clock: () => Date;
   readonly logger: Logger;

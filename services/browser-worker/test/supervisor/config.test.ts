@@ -15,7 +15,7 @@ const TSX = path.resolve(WORKER_DIR, '..', '..', 'node_modules', '.bin', 'tsx');
 
 const minimal = {
   DATABASE_URL: 'postgres://aab:synthetic-db-password@127.0.0.1:5432/aab',
-  AAB_KEK_DIR: '/var/lib/aab/kek',
+  AAB_VAULT_SOCKET: '/run/aab/vault/supervisor/vault.sock',
 };
 
 function configError(env: Record<string, string | undefined>): ConfigError {
@@ -29,10 +29,36 @@ function configError(env: Record<string, string | undefined>): ConfigError {
 }
 
 describe('worker configuration', () => {
+  it('refuses unsafe-process unless the vault isolation is shared-uid (L2)', () => {
+    const error = configError({ ...minimal, AAB_WORKER_SANDBOX: 'unsafe-process' });
+    expect(error.message).toContain('unsafe-process');
+    expect(error.message).toContain('shared-uid');
+    expect(
+      configError({
+        ...minimal,
+        AAB_WORKER_SANDBOX: 'unsafe-process',
+        AAB_VAULT_ISOLATION: 'separate-uid',
+      }).message,
+    ).toContain('unsafe-process');
+    expect(
+      loadWorkerConfig({
+        ...minimal,
+        AAB_WORKER_SANDBOX: 'unsafe-process',
+        AAB_VAULT_ISOLATION: 'shared-uid',
+      }).sandbox,
+    ).toBe('unsafe-process');
+    // The real sandboxes work with either mode.
+    for (const sandbox of ['bubblewrap', 'docker']) {
+      expect(loadWorkerConfig({ ...minimal, AAB_WORKER_SANDBOX: sandbox }).sandbox).toBe(sandbox);
+    }
+  });
+
   it('applies defaults', () => {
     expect(loadWorkerConfig(minimal)).toEqual({
       databaseUrl: minimal.DATABASE_URL,
-      kekDir: '/var/lib/aab/kek',
+      vaultSocket: '/run/aab/vault/supervisor/vault.sock',
+      vaultIsolation: 'separate-uid',
+      vaultCallTimeoutMs: 5_000,
       sandbox: 'bubblewrap',
       concurrency: 2,
       pollIntervalMs: 1_000,
@@ -57,8 +83,12 @@ describe('worker configuration', () => {
       AAB_WORKER_DOCKER_IMAGE: 'aab/browser-runner:1.2',
       AAB_JOB_RESULT_TTL_MINUTES: '15',
       AAB_LOG_LEVEL: 'debug',
+      AAB_VAULT_ISOLATION: 'shared-uid',
+      AAB_VAULT_CALL_TIMEOUT_MS: '2500',
     });
     expect(config).toMatchObject({
+      vaultIsolation: 'shared-uid',
+      vaultCallTimeoutMs: 2_500,
       sandbox: 'docker',
       concurrency: 4,
       pollIntervalMs: 250,
@@ -74,15 +104,30 @@ describe('worker configuration', () => {
   it('names missing required variables', () => {
     const error = configError({});
     expect(error.message).toContain('DATABASE_URL');
-    expect(error.message).toContain('AAB_KEK_DIR');
+    expect(error.message).toContain('AAB_VAULT_SOCKET');
     // Blank counts as missing.
-    expect(configError({ ...minimal, AAB_KEK_DIR: '  ' }).message).toContain('AAB_KEK_DIR');
+    expect(configError({ ...minimal, AAB_VAULT_SOCKET: '  ' }).message).toContain(
+      'AAB_VAULT_SOCKET',
+    );
+  });
+
+  it('refuses to start when a key directory is configured (P3-1), whatever else is wrong', () => {
+    const error = configError({ ...minimal, AAB_KEK_DIR: '/var/lib/aab/kek' });
+    expect(error.message).toContain('AAB_KEK_DIR');
+    expect(error.message).toContain('must not be set');
+    expect(error.message).not.toContain('/var/lib/aab/kek');
+    // Not hidden behind another problem, and a relative or odd value is refused all the same.
+    expect(configError({ AAB_KEK_DIR: 'relative' }).message).toContain('AAB_KEK_DIR');
+    // A blank variable is the same as an unset one.
+    expect(() => loadWorkerConfig({ ...minimal, AAB_KEK_DIR: '' })).not.toThrow();
   });
 
   it('rejects bad values without echoing them', () => {
     const error = configError({
       DATABASE_URL: 'mysql://root:hunter2-synthetic@db/aab',
-      AAB_KEK_DIR: 'relative/kek',
+      AAB_VAULT_SOCKET: 'relative/vault.sock',
+      AAB_VAULT_ISOLATION: 'neither',
+      AAB_VAULT_CALL_TIMEOUT_MS: '5',
       AAB_WORKER_SANDBOX: 'none',
       AAB_WORKER_CONCURRENCY: '0',
       AAB_WORKER_LEASE_MS: 'soon',
@@ -91,7 +136,9 @@ describe('worker configuration', () => {
     });
     for (const name of [
       'DATABASE_URL',
-      'AAB_KEK_DIR',
+      'AAB_VAULT_SOCKET',
+      'AAB_VAULT_ISOLATION',
+      'AAB_VAULT_CALL_TIMEOUT_MS',
       'AAB_WORKER_SANDBOX',
       'AAB_WORKER_CONCURRENCY',
       'AAB_WORKER_LEASE_MS',
@@ -101,8 +148,8 @@ describe('worker configuration', () => {
       expect(error.message).toContain(name);
     }
     expect(error.message).not.toContain('hunter2-synthetic');
-    expect(error.message).not.toContain('relative/kek');
-    expect(configError({ ...minimal, AAB_KEK_DIR: 'relative/kek' }).message).toContain(
+    expect(error.message).not.toContain('relative/vault.sock');
+    expect(configError({ ...minimal, AAB_VAULT_SOCKET: 'relative/vault.sock' }).message).toContain(
       'absolute path',
     );
   });

@@ -1,180 +1,38 @@
-import { SESSION_SNAPSHOT_SECRET_TYPE } from '@aab/contracts';
-import type { Repositories } from '@aab/database';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
+  encodeSnapshot,
   filterStorageState,
   MAX_SNAPSHOT_BYTES,
-  openSnapshot,
+  parseSnapshot,
   sessionExpiry,
   SnapshotOpenError,
   SnapshotTooLargeError,
-  storeSnapshot,
 } from '../../src/session-store/index.js';
 import type { StorageState } from '../../src/types.js';
-import {
-  APP_ORIGIN,
-  CDN_ORIGIN,
-  cookie,
-  createWorld,
-  dumpTables,
-  loginConnection,
-  OTHER_ORIGIN,
-  stateWith,
-  testKek,
-} from '../supervisor/helpers.js';
-import type { World } from '../supervisor/helpers.js';
+import { APP_ORIGIN, CDN_ORIGIN, cookie, OTHER_ORIGIN, stateWith } from '../supervisor/helpers.js';
 
 const CANARY = 'canary-cookie-value-7f3a9c';
 
-describe('session store', () => {
-  let world: World;
-  beforeEach(async () => {
-    world = await createWorld();
-  });
-  afterEach(async () => {
-    await world.close();
-  });
-
-  it('stores ciphertext only and opens it again with the same key', async () => {
-    const kek = testKek();
-    const { connection } = await loginConnection(world);
+/*
+ * The store no longer seals or opens anything (ADR-014): it validates and serializes a state for
+ * the vault and parses what the vault returns. Sealing is tested in services/vault.
+ */
+describe('session store: encode and parse', () => {
+  it('round-trips a state through the base64url form the vault carries', () => {
     const state = stateWith(CANARY);
-    const stored = await storeSnapshot(world.repos, {
-      connection,
-      storageState: state,
-      kek,
-      now: new Date(),
-    });
-    expect(stored).toEqual({ vaultEntryId: expect.any(String), version: 1, kekVersion: 1 });
-    expect(Object.keys(stored).sort()).toEqual(['kekVersion', 'vaultEntryId', 'version']);
-
-    const dump = await dumpTables(world);
-    expect(dump).not.toContain(CANARY);
-    expect(dump).not.toContain(Buffer.from(CANARY).toString('base64'));
-
-    const opened = await openSnapshot(world.repos, connection, kek);
-    expect(opened).not.toBeNull();
-    expect(opened!.storageState).toEqual(state);
-    expect(opened!.version).toBe(1);
-    opened!.dispose();
-    expect(opened!.storageState.cookies).toHaveLength(0);
-    opened!.dispose();
+    const encoded = encodeSnapshot(state);
+    expect(encoded).toMatch(/^[A-Za-z0-9_-]+$/);
+    const opened = parseSnapshot(encoded, { version: 3, kekVersion: 2 });
+    expect(opened.storageState).toEqual(state);
+    expect(opened.version).toBe(3);
+    expect(opened.kekVersion).toBe(2);
+    opened.dispose();
+    expect(opened.storageState.cookies).toHaveLength(0);
+    expect(opened.storageState.origins).toHaveLength(0);
+    opened.dispose();
   });
 
-  it('works inside a caller transaction and rolls back with it', async () => {
-    const kek = testKek();
-    const { connection } = await loginConnection(world);
-    await expect(
-      world.repos.transaction(async (tx) => {
-        await storeSnapshot(tx, { connection, storageState: stateWith('x'), kek, now: new Date() });
-        throw new Error('roll back');
-      }),
-    ).rejects.toThrow('roll back');
-    expect(await openSnapshot(world.repos, connection, kek)).toBeNull();
-  });
-
-  it('returns null when there is no active snapshot', async () => {
-    const { connection } = await loginConnection(world);
-    expect(await openSnapshot(world.repos, connection, testKek())).toBeNull();
-  });
-
-  it('a new snapshot replaces the old one and increments the version', async () => {
-    const kek = testKek();
-    const { connection } = await loginConnection(world);
-    await storeSnapshot(world.repos, {
-      connection,
-      storageState: stateWith('a'),
-      kek,
-      now: new Date(),
-    });
-    const second = await storeSnapshot(world.repos, {
-      connection,
-      storageState: stateWith('b'),
-      kek,
-      now: new Date(),
-    });
-    expect(second.version).toBe(2);
-    const opened = await openSnapshot(world.repos, connection, kek);
-    expect(opened!.storageState).toEqual(stateWith('b'));
-  });
-
-  it('fails to open with a different KEK', async () => {
-    const { connection } = await loginConnection(world);
-    await storeSnapshot(world.repos, {
-      connection,
-      storageState: stateWith(CANARY),
-      kek: testKek(),
-      now: new Date(),
-    });
-    const error = await openSnapshot(world.repos, connection, testKek()).catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(SnapshotOpenError);
-    expect((error as SnapshotOpenError).reason).toBe('decrypt');
-    expect(String((error as Error).message)).not.toContain(CANARY);
-  });
-
-  it('a ciphertext row copied onto another connection does not open (associated data)', async () => {
-    const kek = testKek();
-    const a = await loginConnection(world);
-    const b = await loginConnection(world);
-    await storeSnapshot(world.repos, {
-      connection: a.connection,
-      storageState: stateWith(CANARY),
-      kek,
-      now: new Date(),
-    });
-    const source = await world.repos.vault.getActive(a.connection.id, SESSION_SNAPSHOT_SECRET_TYPE);
-    const target = await world.repos.vault.ensureSecret({
-      connectionId: b.connection.id,
-      secretType: SESSION_SNAPSHOT_SECRET_TYPE,
-      now: new Date(),
-    });
-    // Same version number, so only the bound connection and secret ids differ.
-    expect(target.nextVersion).toBe(source!.version);
-    await world.repos.vault.putVersion({
-      secretId: target.secretId,
-      version: target.nextVersion,
-      sealed: source!.sealed,
-      now: new Date(),
-    });
-    await expect(openSnapshot(world.repos, b.connection, kek)).rejects.toBeInstanceOf(
-      SnapshotOpenError,
-    );
-    // The original still opens.
-    expect(await openSnapshot(world.repos, a.connection, kek)).not.toBeNull();
-    // And it does not open when presented as belonging to another owner.
-    await expect(
-      openSnapshot(world.repos, { ...a.connection, ownerUserId: b.connection.id }, kek),
-    ).rejects.toBeInstanceOf(SnapshotOpenError);
-  });
-
-  it.each(['ciphertext', 'authTag', 'nonce', 'wrappedDek'] as const)(
-    'fails to open when %s is tampered with',
-    async (field) => {
-      const kek = testKek();
-      const { connection } = await loginConnection(world);
-      await storeSnapshot(world.repos, {
-        connection,
-        storageState: stateWith(CANARY),
-        kek,
-        now: new Date(),
-      });
-      const real = await world.repos.vault.getActive(connection.id, SESSION_SNAPSHOT_SECRET_TYPE);
-      const tampered = Buffer.from(real!.sealed[field]);
-      tampered[0] = (tampered[0] ?? 0) ^ 0x01;
-      const repos: Repositories = {
-        ...world.repos,
-        vault: {
-          ...world.repos.vault,
-          getActive: async () => ({ ...real!, sealed: { ...real!.sealed, [field]: tampered } }),
-        },
-      };
-      await expect(openSnapshot(repos, connection, kek)).rejects.toBeInstanceOf(SnapshotOpenError);
-    },
-  );
-
-  it('refuses a snapshot over the size cap and stores nothing', async () => {
-    const kek = testKek();
-    const { connection } = await loginConnection(world);
+  it('refuses a state over the size cap before anything is sent', () => {
     const big: StorageState = {
       cookies: [],
       origins: Array.from({ length: 10 }, (_, index) => ({
@@ -182,24 +40,32 @@ describe('session store', () => {
         localStorage: [{ name: 'blob', value: 'x'.repeat(250_000) }],
       })),
     };
-    await expect(
-      storeSnapshot(world.repos, { connection, storageState: big, kek, now: new Date() }),
-    ).rejects.toBeInstanceOf(SnapshotTooLargeError);
-    expect(MAX_SNAPSHOT_BYTES).toBeLessThan(2_500_000 + 1);
-    expect(await openSnapshot(world.repos, connection, kek)).toBeNull();
+    expect(() => encodeSnapshot(big)).toThrow(SnapshotTooLargeError);
+    expect(MAX_SNAPSHOT_BYTES).toBe(2 * 1024 * 1024);
   });
 
-  it('rejects an invalid storage state before sealing', async () => {
-    const { connection } = await loginConnection(world);
+  it('rejects an invalid storage state on both sides', () => {
     const invalid = { cookies: [{ name: 'x' }], origins: [] } as unknown as StorageState;
-    await expect(
-      storeSnapshot(world.repos, {
-        connection,
-        storageState: invalid,
-        kek: testKek(),
-        now: new Date(),
-      }),
-    ).rejects.toBeInstanceOf(SnapshotOpenError);
+    expect(() => encodeSnapshot(invalid)).toThrow(SnapshotOpenError);
+    const meta = { version: 1, kekVersion: 1 };
+    const b64 = (value: string) => Buffer.from(value, 'utf8').toString('base64url');
+    expect(() => parseSnapshot(b64('not json'), meta)).toThrow(SnapshotOpenError);
+    expect(() => parseSnapshot(b64('{"cookies":[{"name":"x"}],"origins":[]}'), meta)).toThrow(
+      SnapshotOpenError,
+    );
+    expect(() => parseSnapshot(b64('{"cookies":[],"origins":[],"extra":1}'), meta)).toThrow(
+      SnapshotOpenError,
+    );
+    const error = (() => {
+      try {
+        parseSnapshot(b64(`{"cookies":[{"name":"${CANARY}"}],"origins":[]}`), meta);
+      } catch (e) {
+        return e as Error;
+      }
+      return null;
+    })();
+    expect(error?.message ?? '').not.toContain(CANARY);
+    expect(error).not.toHaveProperty('cause');
   });
 });
 
@@ -248,6 +114,20 @@ describe('sessionExpiry', () => {
       origins: [],
     };
     expect(sessionExpiry(state)).toEqual(new Date(1_900_000_000_500));
+  });
+
+  it('ignores expiries within the margin of now (L6)', () => {
+    const now = new Date(1_800_000_000_000);
+    const at = (seconds: number) => cookie('c', '1', 'app.example.test', 1_800_000_000 + seconds);
+    // 60 s away: ignored; 10 minutes away: counts.
+    expect(sessionExpiry({ cookies: [at(60)], origins: [] }, now)).toBeNull();
+    expect(sessionExpiry({ cookies: [at(60), at(600), at(900)], origins: [] }, now)).toEqual(
+      new Date(1_800_000_600_000),
+    );
+    // Already past: ignored too.
+    expect(sessionExpiry({ cookies: [at(-100), at(900)], origins: [] }, now)).toEqual(
+      new Date(1_800_000_900_000),
+    );
   });
 
   it('returns null for session cookies only', () => {

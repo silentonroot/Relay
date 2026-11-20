@@ -4,8 +4,9 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 /*
- * Key handling stays in the session store (and the key initialization script); the
- * untrusted half of the worker never sees the database or the crypto package (ADR-013).
+ * Key handling is the vault's alone (ADR-014, P3-1): no module of the worker, the session store
+ * included, imports the crypto package or names a seal, open, rewrap or key-provider function.
+ * The untrusted half of the worker also never sees the database (ADR-013).
  */
 
 const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'src');
@@ -29,6 +30,11 @@ function importsPackage(text: string, pkg: string): boolean {
   ).test(text);
 }
 
+/** Removes block and line comments, so prose that mentions a name is not a use of it. */
+function stripComments(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+}
+
 const files = sourceFiles(SRC).map((file) => ({
   rel: path.relative(SRC, file).split(path.sep).join('/'),
   text: readFileSync(file, 'utf8'),
@@ -37,6 +43,7 @@ const files = sourceFiles(SRC).map((file) => ({
 describe('import boundaries', () => {
   it('finds the source tree', () => {
     expect(files.some((file) => file.rel === 'session-store/index.ts')).toBe(true);
+    expect(files.some((file) => file.rel === 'vault/gateway.ts')).toBe(true);
     expect(files.some((file) => file.rel.startsWith('runner/'))).toBe(true);
   });
 
@@ -46,14 +53,29 @@ describe('import boundaries', () => {
     expect(importsPackage("await import('@aab/crypto')", '@aab/crypto')).toBe(true);
     expect(importsPackage("import '@aab/crypto';", '@aab/crypto')).toBe(true);
     expect(importsPackage("import { x } from '@aab/cryptography';", '@aab/crypto')).toBe(false);
+    expect(stripComments('// sealSecret\n/* openSecret */ const a = 1;')).not.toContain('Secret');
   });
 
-  it('only the session store and scripts import @aab/crypto', () => {
+  it('no worker module imports sealSecret, openSecret, rewrapSecret or a KEK provider', () => {
     const offenders = files
-      .filter((file) => !file.rel.startsWith('session-store/') && !file.rel.startsWith('scripts/'))
       .filter((file) => importsPackage(file.text, '@aab/crypto'))
       .map((file) => file.rel);
     expect(offenders).toEqual([]);
+    // Nothing may name them either, so a local re-implementation or a re-export fails too.
+    const names =
+      /\b(?:sealSecret|openSecret|rewrapSecret|KekProvider|LocalFileKekProvider|InMemoryKekProvider|loadLocalKek|generateLocalKek)\b/;
+    const named = files
+      .filter((file) => names.test(stripComments(file.text)))
+      .map((file) => file.rel);
+    expect(named).toEqual([]);
+    // And the package does not depend on it.
+    const manifest = JSON.parse(readFileSync(path.join(SRC, '..', 'package.json'), 'utf8')) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    expect(Object.keys({ ...manifest.dependencies, ...manifest.devDependencies })).not.toContain(
+      '@aab/crypto',
+    );
   });
 
   it('the runner, sandbox and egress code import neither the database nor crypto', () => {

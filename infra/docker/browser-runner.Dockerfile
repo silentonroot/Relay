@@ -34,9 +34,9 @@ COPY packages/contracts/package.json packages/contracts/
 COPY packages/adapter-sdk/package.json packages/adapter-sdk/
 COPY packages/adapters/northstar/package.json packages/adapters/northstar/
 COPY packages/audit/package.json packages/audit/
-COPY packages/crypto/package.json packages/crypto/
 COPY packages/database/package.json packages/database/
 COPY packages/policy-engine/package.json packages/policy-engine/
+COPY packages/vault-client/package.json packages/vault-client/
 COPY services/browser-worker/package.json services/browser-worker/
 
 # Production dependencies only, and not the workspace root: `tsx`, which runs the TypeScript
@@ -52,9 +52,9 @@ COPY packages/contracts packages/contracts
 COPY packages/adapter-sdk packages/adapter-sdk
 COPY packages/adapters/northstar packages/adapters/northstar
 COPY packages/audit packages/audit
-COPY packages/crypto packages/crypto
 COPY packages/database packages/database
 COPY packages/policy-engine packages/policy-engine
+COPY packages/vault-client packages/vault-client
 COPY services/browser-worker/src services/browser-worker/src
 
 # ---------------------------------------------------------------------------------------

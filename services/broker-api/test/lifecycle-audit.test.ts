@@ -1,7 +1,10 @@
 import { AgentGrant, AuditEventList, Connection, Routes } from '@aab/contracts';
 import type { AuditEvent } from '@aab/contracts';
+import { schema } from '@aab/database';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Harness, SignedIn } from './helpers.js';
+import { executeFor, newWorld, registerApplication, startRealVault } from './vault-world.js';
+import type { RealVault } from './vault-world.js';
 import {
   createHarness,
   expectError,
@@ -291,5 +294,165 @@ describe('grant revocation with a fixed clock', () => {
     } finally {
       await h.close();
     }
+  });
+});
+
+describe('revocation takes the capabilities with it (P3-18)', () => {
+  let h: Harness;
+  let vault: RealVault;
+  let session: SignedIn;
+  let applicationId: string;
+
+  const del = (url: string) => h.inject({ method: 'DELETE', url, headers: session.headers });
+  const post = (url: string) => h.inject({ method: 'POST', url, headers: session.headers });
+
+  beforeAll(async () => {
+    // The vault's audit checks compare event times with job times, so this API runs on the
+    // real clock, like the vault.
+    const { createTestDatabase } = await import('@aab/database/testing');
+    const database = await createTestDatabase();
+    vault = await startRealVault(database);
+    h = await createHarness({ database, vault: vault.gateway, clock: () => new Date() });
+    await seedOwner(h, owner);
+    session = await login(h, owner);
+    applicationId = await registerApplication(h, session);
+  }, 60_000);
+
+  afterAll(async () => {
+    await h.close();
+    await vault.stop();
+    await vault.service.dbHandle.close();
+  });
+
+  /** An operation job through the execute route, and the capability row the vault holds for it. */
+  async function authorizedJob(world: { agentId: string; connectionId: string }) {
+    const response = await executeFor(h, session, world);
+    expect(response.statusCode, response.body).toBe(202);
+    const { jobId } = response.json<{ jobId: string }>();
+    let [job] = (await h.database.db.select().from(schema.executionJobs)).filter(
+      (row) => row.id === jobId,
+    );
+    if (job?.capabilityRef === null) {
+      // Not authorized by the execute route itself (see execution-vault.test.ts): ask the vault.
+      const answer = await vault.service.rpc('api', 'authorizeJobAccess', {
+        jobId,
+        ttlSeconds: 600,
+      });
+      expect(answer['ok'], JSON.stringify(answer)).toBe(true);
+      [job] = (await h.database.db.select().from(schema.executionJobs)).filter(
+        (row) => row.id === jobId,
+      );
+    }
+    expect(job?.capabilityRef).not.toBeNull();
+    return { jobId, capabilityId: job!.capabilityRef! };
+  }
+
+  const capability = async (id: string) =>
+    (await h.database.db.select().from(schema.vaultAccessCapabilities)).find(
+      (row) => row.id === id,
+    )!;
+  const revokedEvents = async () =>
+    (
+      await h.repos.audit.list(
+        { organizationId: session.organizationId, userId: session.userId },
+        { limit: 200 },
+      )
+    ).items.filter((event) => event.eventType === 'vault.capability_revoked');
+
+  it('revoking a grant, disabling an agent and revoking a connection revoke their unused capabilities', async () => {
+    const forGrant = await newWorld(h, session, applicationId);
+    const forAgent = await newWorld(h, session, applicationId);
+    const forConnection = await newWorld(h, session, applicationId);
+    const bystander = await newWorld(h, session, applicationId);
+
+    const grantJob = await authorizedJob(forGrant);
+    const agentJob = await authorizedJob(forAgent);
+    const connectionJob = await authorizedJob(forConnection);
+    const bystanderJob = await authorizedJob(bystander);
+    for (const job of [grantJob, agentJob, connectionJob, bystanderJob]) {
+      expect((await capability(job.capabilityId)).revokedAt).toBeNull();
+    }
+    const before = (await revokedEvents()).length;
+
+    // 1. A grant revoked.
+    const grants = (
+      await h.inject({
+        method: 'GET',
+        url: path(Routes.agentGrants, { id: forGrant.agentId }),
+        headers: { cookie: session.cookie },
+      })
+    ).json<{ items: { id: string }[] }>().items;
+    const revokeGrant = await del(
+      path(Routes.agentGrant, { id: forGrant.agentId, grantId: grants[0]!.id }),
+    );
+    expect(revokeGrant.statusCode, revokeGrant.body).toBe(200);
+    expect(await capability(grantJob.capabilityId)).toMatchObject({
+      revokedReason: 'grant_revoked',
+    });
+    expect((await capability(grantJob.capabilityId)).revokedAt).not.toBeNull();
+    expect((await revokedEvents()).length).toBe(before + 1);
+
+    // 2. An agent disabled.
+    const disable = await post(path(Routes.agentDisable, { id: forAgent.agentId }));
+    expect(disable.statusCode, disable.body).toBe(200);
+    expect(await capability(agentJob.capabilityId)).toMatchObject({
+      revokedReason: 'agent_disabled',
+    });
+    expect((await revokedEvents()).length).toBe(before + 2);
+
+    // 3. A connection revoked.
+    const revoke = await post(path(Routes.connectionRevoke, { id: forConnection.connectionId }));
+    expect(revoke.statusCode, revoke.body).toBe(200);
+    expect(await capability(connectionJob.capabilityId)).toMatchObject({
+      revokedReason: 'connection_revoked',
+    });
+    expect((await revokedEvents()).length).toBe(before + 3);
+
+    // The connection's secret row (ensured by the authorization) became revoked in the same commit.
+    const secretEvents = (
+      await h.repos.audit.list(
+        { organizationId: session.organizationId, userId: session.userId },
+        { limit: 200, connectionId: forConnection.connectionId },
+      )
+    ).items.filter((event) => event.eventType === 'vault.secret_revoked');
+    expect(secretEvents).toHaveLength(1);
+    expect(
+      (await h.database.db.select().from(schema.vaultSecrets)).find(
+        (row) => row.connectionId === forConnection.connectionId,
+      )?.status,
+    ).toBe('revoked');
+
+    // Another agent's capability, on another connection, is untouched.
+    expect((await capability(bystanderJob.capabilityId)).revokedAt).toBeNull();
+
+    // Every event is the user's, names ids and a reason, and carries no capability secret.
+    const events = (await revokedEvents()).slice(0, 3);
+    for (const event of events) {
+      expect(event).toMatchObject({ actorType: 'user', actorId: session.userId });
+      expect(Object.keys(event.metadata).sort()).toEqual(
+        expect.arrayContaining(['capabilityIds', 'count', 'reason']),
+      );
+    }
+    expect(new Set(events.map((event) => event.metadata['reason']))).toEqual(
+      new Set(['grant_revoked', 'agent_disabled', 'connection_revoked']),
+    );
+
+    // A refused repeat (409) revokes nothing more and writes no further event.
+    expect(
+      (await post(path(Routes.connectionRevoke, { id: forConnection.connectionId }))).statusCode,
+    ).toBe(409);
+    expect((await revokedEvents()).length).toBe(before + 3);
+  });
+
+  it('revocation commits while the vault is down', async () => {
+    const world = await newWorld(h, session, applicationId);
+    const job = await authorizedJob(world);
+    await vault.stop();
+    // The vault is gone: revocation is a database transaction and still commits (ADR-014 section 7).
+    const revoke = await post(path(Routes.connectionRevoke, { id: world.connectionId }));
+    expect(revoke.statusCode, revoke.body).toBe(200);
+    expect(await capability(job.capabilityId)).toMatchObject({
+      revokedReason: 'connection_revoked',
+    });
   });
 });

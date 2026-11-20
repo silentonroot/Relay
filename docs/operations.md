@@ -1,13 +1,14 @@
-# Operations guide: local operation (Phase 1 and Phase 2)
+# Operations guide: local operation (Phase 1 to Phase 3)
 
 This guide covers running AAB on one machine with synthetic data. Items marked **planned** are
 described in the specification or an ADR but are not implemented; do not rely on them.
 
 Since Phase 2 the browser worker stores encrypted browser session snapshots, so the key and backup
-practices below protect real session material, still of synthetic accounts only. There is no vault
-service yet: the worker's supervisor reads the key directly, and the cryptography has not been
-externally reviewed. The Compose setup does not run the worker and does not mount or configure a
-key directory. On 2026-11-13 the container images were built and the Compose stack was started once
+practices below protect real session material, still of synthetic accounts only. Since Phase 3 step
+B3b the key is read by the **vault service** only (ADR-014): the API and the browser worker's
+supervisor hold no key, refuse to start when `AAB_KEK_DIR` is set, and reach the vault over Unix
+sockets. The cryptography has not been externally reviewed. The Compose setup runs the vault and
+gives it the key volume (and nothing else); it does not run the worker. On 2026-11-13 the container images were built and the Compose stack was started once
 by hand and checked (see "Run with Docker Compose" below); that was a manual check, not an automated
 test; the `containers` job in CI now builds the images and starts the stack, and passed on its
 first run on GitHub (2026-11-13). The Docker launcher for sandboxed jobs was
@@ -19,8 +20,9 @@ bubblewrap by default.
 
 The pieces, all on one host: PostgreSQL, the API (port 4000), the browser worker (no port), the
 dashboard (Vite on 5173, or the Compose nginx on 8080) and the Northstar demo (port 4100, from its
-own repository). The worker is a supervisor that holds the database connection and the key, plus one
-sandboxed runner per job (ADR-013); see [architecture](architecture.md).
+own repository), plus the vault (Unix sockets, no port). The worker is a supervisor that holds the
+database connection and a vault client but no key, plus one sandboxed runner per job (ADR-013,
+ADR-014); see [architecture](architecture.md).
 
 ### Prerequisites (Linux)
 
@@ -45,47 +47,56 @@ sandboxed runner per job (ADR-013); see [architecture](architecture.md).
 
 ### Create and back up the key
 
-The worker needs a key directory (mode 0700) holding `kek-v1.key` (mode 0600, 32 bytes). The
-`init-kek` script creates both, never overwrites an existing key, and prints only the file's path:
+The vault needs a key directory (mode 0700, owned by the vault's user) holding `kek-v1.key` (mode 0600,
+32 bytes). The vault's `init-kek` script creates both, never overwrites an existing key, and prints
+only the file's path (run it as the vault's user, see "The vault and its admin command" below):
 
 ```sh
-AAB_KEK_DIR=$HOME/.config/aab/keys corepack pnpm --filter @aab/browser-worker run init-kek
+AAB_KEK_DIR=$HOME/.config/aab/keys corepack pnpm --filter @aab/vault run init-kek
 ```
 
-The script takes the directory as its first argument or from `AAB_KEK_DIR`. The end-to-end test
-runs it as `node --import tsx src/scripts/init-kek.ts <directory>` from `services/browser-worker`;
-the `pnpm run` form above is taken from the package scripts and was not itself run for this guide.
-Back the directory up as described in the next section before you store a session you care about.
-Set `AAB_KEK_DIR` for the worker only. The API uses no key and refuses to start if the variable is set in its environment (`services/broker-api/test/config-and-startup.test.ts`, "refuses to start when a key directory is configured, without opening it").
+The old entry point `corepack pnpm --filter @aab/browser-worker run init-kek` still works: it runs the
+vault's script with the same arguments (it imports no key code itself). The end-to-end test runs it
+that way. Back the directory up as described in the next section before you store a session you care
+about. **Do not set `AAB_KEK_DIR` for the API or the worker:** both refuse to start if it is set
+(`services/browser-worker/test/supervisor/config.test.ts`, "refuses to start when a key directory is
+configured"; `services/broker-api/test/config-and-startup.test.ts`, "refuses to start when a key
+directory is configured, without opening it").
 
 ### Start the services
 
 1. `migrate` and `create-owner` as in the README. The `create-owner` script reads the password from
    the terminal, or from the first line of standard input when it is not a terminal.
-2. The API: `corepack pnpm --filter @aab/broker-api run start`.
-3. The worker, with `DATABASE_URL`, `AAB_KEK_DIR` and the variables below in its environment:
-   `corepack pnpm --filter @aab/browser-worker run start`. Before it claims any job it checks the
-   database, the key and the sandbox, and exits with a one-line reason if one fails (see
-   troubleshooting). The sandbox check starts a real sandbox and Chromium, so start-up takes a few
-   seconds. On success it logs "supervisor started" with the sandbox kind and the concurrency.
-4. The dashboard (`corepack pnpm --filter @aab/dashboard run dev`).
+2. The vault ("The vault and its admin command" below): `corepack pnpm --filter @aab/vault run start`.
+3. The API: `corepack pnpm --filter @aab/broker-api run start`, with `AAB_VAULT_SOCKET` set to the vault's
+   api-role socket.
+4. The worker, with `DATABASE_URL`, `AAB_VAULT_SOCKET` (the vault's **supervisor**-role socket) and the
+   variables below in its environment: `corepack pnpm --filter @aab/browser-worker run start`. Before
+   it claims any job it checks the database, asks the vault `hello` and checks the sandbox, and exits
+   with a one-line reason if one fails (see troubleshooting). A vault that does not answer does not
+   stop it: it starts, claims nothing and checks again before every claim, so a job waits in the queue
+   until the vault is back. The sandbox check starts a real sandbox and Chromium, so start-up takes a
+   few seconds. On success it logs "supervisor started" with the sandbox kind and the concurrency.
+5. The dashboard (`corepack pnpm --filter @aab/dashboard run dev`).
 
 Worker variables (from `services/browser-worker/src/config.ts`; rows say where a variable is not
-in `.env.example`):
+in `.env.example`). `AAB_KEK_DIR` is not a worker variable: the worker refuses to start if it is set.
 
-| Variable                     | Default                       | Meaning                                                                                                                                                                                            |
-| ---------------------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`               | required                      | PostgreSQL connection string. Shown nowhere in errors.                                                                                                                                             |
-| `AAB_KEK_DIR`                | required                      | Absolute path of the key directory.                                                                                                                                                                |
-| `AAB_WORKER_SANDBOX`         | `bubblewrap`                  | `bubblewrap`, `docker` or `unsafe-process` (no isolation at all: development only, warns on every job, no security claim applies). `docker` is usable in its default mode, with limits: see below. |
-| `AAB_WORKER_CONCURRENCY`     | `2`                           | Jobs at once, 1 to 16. Each starts its own browser, roughly 300 to 500 MiB.                                                                                                                        |
-| `AAB_WORKER_POLL_MS`         | `1000`                        | How often the worker looks for queued jobs, 50 to 60000. Not in `.env.example`.                                                                                                                    |
-| `AAB_WORKER_LEASE_MS`        | `60000`                       | Lease on a claimed job, 5000 to 3600000. A heartbeat extends it every third of this time. Not in `.env.example`.                                                                                   |
-| `AAB_WORKER_RUNTIME_DIR`     | `$XDG_RUNTIME_DIR/aab-worker` | Short, private directory for per-job sockets. Falls back to `/tmp/aab-worker-<uid>` when `XDG_RUNTIME_DIR` is unset.                                                                               |
-| `AAB_CHROMIUM_PATH`          | `/usr/lib/chromium/chromium`  | Chromium binary used inside the sandbox.                                                                                                                                                           |
-| `AAB_WORKER_DOCKER_IMAGE`    | `aab/browser-runner:local`    | Only for the Docker launcher. Not in `.env.example`.                                                                                                                                               |
-| `AAB_JOB_RESULT_TTL_MINUTES` | `60`                          | Minutes a job's stored result is kept, 1 to 10080 (see below).                                                                                                                                     |
-| `AAB_LOG_LEVEL`              | `info`                        | `fatal`, `error`, `warn`, `info`, `debug`, `trace` or `silent`.                                                                                                                                    |
+| Variable                     | Default                       | Meaning                                                                                                                                                                                                                                                                                                   |
+| ---------------------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`               | required                      | PostgreSQL connection string. Shown nowhere in errors.                                                                                                                                                                                                                                                    |
+| `AAB_VAULT_SOCKET`           | required                      | Absolute path of the vault's supervisor-role socket, `$AAB_VAULT_SOCKET_DIR/supervisor/vault.sock`.                                                                                                                                                                                                       |
+| `AAB_VAULT_ISOLATION`        | `separate-uid`                | `separate-uid` or `shared-uid`; must match the vault's. In `separate-uid` the worker refuses to start if it can open the vault's key directory.                                                                                                                                                           |
+| `AAB_VAULT_CALL_TIMEOUT_MS`  | `5000`                        | Per vault call, connect included, 100 to 60000.                                                                                                                                                                                                                                                           |
+| `AAB_WORKER_SANDBOX`         | `bubblewrap`                  | `bubblewrap`, `docker` or `unsafe-process` (no isolation at all: development only, warns on every job, no security claim applies; refused unless `AAB_VAULT_ISOLATION=shared-uid`, because the runner would share the supervisor's user). `docker` is usable in its default mode, with limits: see below. |
+| `AAB_WORKER_CONCURRENCY`     | `2`                           | Jobs at once, 1 to 16. Each starts its own browser, roughly 300 to 500 MiB.                                                                                                                                                                                                                               |
+| `AAB_WORKER_POLL_MS`         | `1000`                        | How often the worker looks for queued jobs, 50 to 60000. Not in `.env.example`.                                                                                                                                                                                                                           |
+| `AAB_WORKER_LEASE_MS`        | `60000`                       | Lease on a claimed job, 5000 to 3600000. A heartbeat extends it every third of this time. Not in `.env.example`.                                                                                                                                                                                          |
+| `AAB_WORKER_RUNTIME_DIR`     | `$XDG_RUNTIME_DIR/aab-worker` | Short, private directory for per-job sockets. Falls back to `/tmp/aab-worker-<uid>` when `XDG_RUNTIME_DIR` is unset.                                                                                                                                                                                      |
+| `AAB_CHROMIUM_PATH`          | `/usr/lib/chromium/chromium`  | Chromium binary used inside the sandbox.                                                                                                                                                                                                                                                                  |
+| `AAB_WORKER_DOCKER_IMAGE`    | `aab/browser-runner:local`    | Only for the Docker launcher. Not in `.env.example`.                                                                                                                                                                                                                                                      |
+| `AAB_JOB_RESULT_TTL_MINUTES` | `60`                          | Minutes a job's stored result is kept, 1 to 10080 (see below).                                                                                                                                                                                                                                            |
+| `AAB_LOG_LEVEL`              | `info`                        | `fatal`, `error`, `warn`, `info`, `debug`, `trace` or `silent`.                                                                                                                                                                                                                                           |
 
 **`AAB_WORKER_SANDBOX=docker`.** Build the image first, from the repository root:
 `docker build -f infra/docker/browser-runner.Dockerfile -t aab/browser-runner:local .`. The worker
@@ -126,10 +137,23 @@ an ungranted `POST /v1/operations/execute` got 403 `denied` with no job row, and
 the CSRF header got 403 `csrf_failed`; and 30 concurrent wrong-password logins gave 4 responses of 401
 and 26 of 429 with a peak of 365 MiB against the 768 MiB limit. The stack was then removed.
 
+Step B3b added a `vault` service (image `aab/vault:local`, `infra/docker/vault.Dockerfile`), a one-shot
+`vault-init-kek` that creates the first key in the `vault-keys` volume when there is none, and one
+socket volume per role (`vault-api`, `vault-supervisor`, `vault-admin`). The key volume is mounted
+into those two containers only; the API mounts `vault-api` only and is started with
+`AAB_VAULT_SOCKET=/run/aab-vault/api/vault.sock` and `AAB_VAULT_ISOLATION=shared-uid` (the vault's
+term for one user inside a container: the container and volume boundaries keep the roles apart
+there). `infra/ci/compose-smoke.sh` has new checks for it (the vault runs as a non-root user, the API
+container cannot see the key volume or the other roles' socket directories, and
+`GET /v1/vault/status` answers). The vault reads its own `vault.env` in the secrets directory (create it beside `broker-api.env`; it holds the same `DATABASE_URL`, so the vault shares the API's database role for now). The vault and the API run as the same `AAB_UID:AAB_GID` on purpose: the `shared-uid` sockets are mode 0600, so an API under another uid would start degraded. **The B3b Compose changes were validated with `docker compose config`
+only: the vault image was not built and the stack was not started in that step.** The Compose vault
+has no worker beside it; a worker on the host reaches the supervisor-role socket only if you publish
+that volume's directory to the host yourself, which this file does not do. To run a host worker,
+run the vault on the host as well (below).
+
 These were manual checks. The `containers` job in CI now builds the images, starts the stack and
 asserts the main ones, so a change that breaks them fails CI (AAB-031; first GitHub run passed on
-2026-11-13). Compose still has no worker service and no container holds
-a key; run the worker on the host. Base images are pinned by tag and digest. Two Dockerfiles needed
+2026-11-13). Compose still has no worker service; run the worker on the host. Base images are pinned by tag and digest. Two Dockerfiles needed
 a fix on that first build: the API and runner images did not copy the workspace packages added in
 Phase 2 (`packages/adapter-sdk`, `packages/adapters/northstar`, `packages/policy-engine`). If a build
 fails on a missing workspace package, check that its directory is copied in the Dockerfile.
@@ -215,14 +239,14 @@ openssl rand 32 > ~/.config/aab/keys/kek-v1.key
 chmod 600 ~/.config/aab/keys/kek-v1.key
 ```
 
-The preferred way is the worker's `init-kek` script (above). The commands above do the same by hand.
-**The browser worker reads the key at start-up and refuses to start** if the directory is not mode
-0700, a key file is accessible to group or others, a key file is not exactly 32 bytes, or no key is
-present. The key never goes in an environment variable, an image, the repository, a log line or the
-database. Compose does not mount the directory into any container; when the vault service exists
-(Phase 3), the directory will be mounted read-only into that service only. In Phase 2 the worker's
-supervisor is the only process that reads it; the sandbox does not mount it. Keep it outside the
-repository: nothing enforces that.
+The preferred way is the vault's `init-kek` script (above). The commands above do the same by hand,
+but make the directory and file owned by the vault's user. **The vault reads the keys at start-up and
+refuses to start** if the directory is not mode 0700, a key file is accessible to group or others, a
+key file is not exactly 32 bytes, or no key is present. The key never goes in an environment
+variable, an image, the repository, a log line or the database. Compose mounts the key volume into
+the vault (and the one-shot that creates the first key) only. No other process reads it: not the
+API, not the worker's supervisor, not the sandbox (which does not mount it, P3-14). Keep it outside
+the repository: nothing enforces that.
 
 ### Back up
 
@@ -245,14 +269,15 @@ who can read files as the service's user, or against root.
 **Planned.** The design is to add `kek-v<N+1>.key`, re-wrap existing data keys, and delete the old
 file only after every record reports the new version. There is no re-wrap command yet.
 
-## The vault and its admin command (Phase 3, not yet wired to the API and worker)
+## The vault and its admin command (Phase 3)
 
-Status: step B2b. The vault service (`services/vault`) runs and answers every operation of
-ADR-014 section 4, but nothing calls it yet: the API and the worker still use the Phase 2 path
-(the worker holds the KEK). B3 wires them. Use this section to run and test the vault on its own.
+Status: step B3b. The vault service (`services/vault`) answers every operation of ADR-014 section 4,
+the API (B3a) and the browser worker's supervisor (B3b) use it, and neither holds a key. Rotation
+(B4) and the dashboard (B5) are later steps. Local tests ran with a real vault on temporary sockets;
+the `separate-uid` setup below, the systemd unit and the Compose vault have not been run on a real
+host or in containers by the people who wrote them.
 
-Start it (one user, a developer laptop; `separate-uid` needs users and groups and is described
-with B3):
+Start it (one user, a developer laptop; for `separate-uid` see "Separate-uid setup" below):
 
 ```sh
 export DATABASE_URL=postgres://...            # a migrated database (the API's migrate script)
@@ -266,7 +291,8 @@ corepack pnpm --filter @aab/vault run start
 The vault refuses to start when it cannot read its tables through `DATABASE_URL` (it does not
 migrate), when the key or socket directory is unsafe, or off Linux. Sockets are
 `$AAB_VAULT_SOCKET_DIR/{api,supervisor,admin}/vault.sock`. The worker's `init-kek` script still
-works: it runs the vault's script.
+works: it runs the vault's script. In `shared-uid` mode point the API at the `api` socket and the worker
+at the `supervisor` socket, both with `AAB_VAULT_ISOLATION=shared-uid`.
 
 **Run `init-kek` (and `init-kek --next`) as the vault's user**, in `separate-uid` mode too, for example
 `sudo -u aab-vault env AAB_KEK_DIR=... corepack pnpm --filter @aab/vault run init-kek`. The vault
@@ -282,6 +308,110 @@ has rolled back. A request still running at the full timeout (for example one wa
 database connection) closes its connection without an answer: its outcome is then unknown, and the
 caller must check state before it retries. At most 4 (api), 8 (supervisor) and 1 (admin) requests
 run in the database at once; the rest wait.
+
+**The API and the vault.** The API takes `AAB_VAULT_SOCKET` (required: the api-role socket,
+`$AAB_VAULT_SOCKET_DIR/api/vault.sock`), `AAB_VAULT_ISOLATION` (default `separate-uid`; it must match the
+vault's), `AAB_VAULT_AUTHORIZATION_TTL_SECONDS` (default 600, 10 to 3,600) and `AAB_VAULT_CALL_TIMEOUT_MS`
+(default 5000, 100 to 60,000). It never takes `AAB_KEK_DIR`. At start it asks the vault `hello` and
+refuses to start if the vault answers as another role or isolation mode, or, in `separate-uid` mode, if the
+API's user can open the vault's key directory (the message names the path: fix the directory's owner and
+mode, or run the API as another user). A vault that does not answer does not stop the API: it starts
+degraded and logs a warning, revocation works, and jobs fail with `vault_unavailable` until the vault is
+back (`services/broker-api/test/config-and-startup.test.ts`). `dev:memory` wires no vault.
+
+**The worker and the vault.** The supervisor takes `AAB_VAULT_SOCKET` (required: the supervisor-role
+socket), `AAB_VAULT_ISOLATION` (default `separate-uid`; it must match the vault's) and
+`AAB_VAULT_CALL_TIMEOUT_MS` (default 5000). It never takes `AAB_KEK_DIR` (it refuses to start if set).
+At start it asks the vault `hello` and refuses to start if the vault answers as another role or
+isolation mode, or, in `separate-uid` mode, if the worker's user can open the vault's key directory
+(`services/browser-worker/test/supervisor/startup-vault.test.ts`). Before **every** claim it checks the
+vault again, so while the vault is down or wrong no job is claimed and queued jobs wait (log lines "the
+vault is unreachable; no job is claimed" and, once it is back, "the vault answers; claiming jobs").
+A job that was already claimed when the vault went away ends `vault_unavailable`, and one the vault
+refuses ends `vault_denied`; neither is retried automatically, and nothing falls back to opening a secret
+in the worker. A login's duration and sandbox kind, which Phase 2 wrote on `connection.auth_completed`,
+are logged by the supervisor instead (the vault writes that event and cannot know them).
+
+### Separate-uid setup (Linux host)
+
+`separate-uid` is the isolation the design relies on: the kernel decides which user may call which
+operation, because the socket of each role belongs to its own group. Not run on a real host by the
+authors; check each step on yours. Names are examples.
+
+1. **Users and groups.** One user for the vault, one for the API, one for the worker, and one group per
+   role. The vault's user must be a member of all three role groups (it hands each socket to its group
+   without being root); each caller is a member of its own role's group only; the operator who runs the
+   admin command is in the admin group.
+
+   ```sh
+   sudo useradd --system --no-create-home --shell /usr/sbin/nologin aab-vault
+   sudo useradd --system --no-create-home --shell /usr/sbin/nologin aab-api
+   sudo useradd --system --no-create-home --shell /usr/sbin/nologin aab-worker
+   sudo groupadd --system aab-vault-api
+   sudo groupadd --system aab-vault-supervisor
+   sudo groupadd --system aab-vault-admin
+   sudo usermod --append --groups aab-vault-api,aab-vault-supervisor,aab-vault-admin aab-vault
+   sudo usermod --append --groups aab-vault-api aab-api
+   sudo usermod --append --groups aab-vault-supervisor aab-worker
+   sudo usermod --append --groups aab-vault-admin "$USER"
+   ```
+
+   The vault's primary group must not be one of the role groups, and two roles must not share a group;
+   it refuses to start otherwise.
+
+2. **Directories.** The key directory belongs to the vault and nobody else (mode 0700). The socket
+   directory belongs to the vault, is not writable by group or other and not readable by other (0711 lets
+   the three role groups search it); the vault creates `api/`, `supervisor/` and `admin/` below it (mode
+   0750, group = the role's group) and sockets with mode 0660. Every directory above the socket directory
+   must be owned by root or the vault's user and not writable by group or other, and the socket directory
+   must not be inside the repository (the sandbox mounts the repository).
+
+   ```sh
+   sudo install -d -o aab-vault -g aab-vault -m 0700 /var/lib/aab/keys
+   sudo install -d -o aab-vault -g aab-vault -m 0711 /run/aab-vault      # systemd can do this, see below
+   sudo -u aab-vault env AAB_KEK_DIR=/var/lib/aab/keys corepack pnpm --filter @aab/vault run init-kek
+   ```
+
+   The repository (the vault's code) must not be writable by the API or worker users; code they can
+   change is code that runs as the vault. The worker must not be able to read `/var/lib/aab/keys`: check
+   with `sudo -u aab-worker ls /var/lib/aab/keys` (must fail).
+
+3. **The vault**, as `aab-vault`, with `AAB_VAULT_ISOLATION=separate-uid` and one group variable per
+   role (`AAB_VAULT_GROUP_API=aab-vault-api`, `AAB_VAULT_GROUP_SUPERVISOR=aab-vault-supervisor`,
+   `AAB_VAULT_GROUP_ADMIN=aab-vault-admin`; all three are required in this mode and refused in
+   `shared-uid`). **Core dumps are off for the vault**: a core file of the vault holds keys and
+   plaintext sessions. With systemd, an example unit (a sketch, not tested):
+
+   ```ini
+   [Service]
+   User=aab-vault
+   Group=aab-vault
+   SupplementaryGroups=aab-vault-api aab-vault-supervisor aab-vault-admin
+   WorkingDirectory=/opt/aab/services/vault
+   EnvironmentFile=/etc/aab/vault.env        # DATABASE_URL and the AAB_VAULT_* settings; mode 0600, owner aab-vault
+   ExecStart=/usr/bin/node --import tsx src/main.ts
+   RuntimeDirectory=aab-vault
+   RuntimeDirectoryMode=0711
+   LimitCORE=0
+   NoNewPrivileges=yes
+   PrivateTmp=yes
+   ProtectHome=yes
+   ```
+
+   Without systemd, run `ulimit -c 0` in the shell that starts the vault (and check
+   `/proc/sys/kernel/core_pattern` does not pipe cores to a collector that stores them).
+   `LimitCORE=0` is the same limit; it is worth setting for the API and the worker too, because their
+   memory holds plaintext sessions while a job runs.
+
+4. **The API and the worker** run as `aab-api` and `aab-worker`, with `AAB_VAULT_SOCKET` set to their own
+   role's socket (`/run/aab-vault/api/vault.sock`, `/run/aab-vault/supervisor/vault.sock`) and the default
+   `AAB_VAULT_ISOLATION=separate-uid`. Each asks the vault `hello` at start and, in this mode, tries to
+   open the key directory the vault names; if it can, it refuses to start and tells you which path. That
+   check is what catches a wrong owner or mode on the key directory.
+
+5. **Verify** with `sudo -u aab-api test -S /run/aab-vault/supervisor/vault.sock` (must fail: the API
+   cannot search the supervisor directory) and the same for the worker against the `api` and `admin`
+   directories.
 
 Admin command (talks to the admin socket only; it reads no key and no database):
 
@@ -409,8 +539,8 @@ logs into public issues without reading them first.
 ## Running the end-to-end test
 
 The Phase 2 end-to-end test starts the Northstar demo, a fresh database on a PostgreSQL server that
-you run, the API (with no key directory) and the worker with the bubblewrap sandbox and a private
-Xvfb display, and checks the behaviour listed in the threat model (section 6.1). It takes about 85
+you run, the vault (shared-uid, temporary sockets), the API and the worker (neither with a key
+directory) with the bubblewrap sandbox and a private Xvfb display, and checks the behaviour listed in the threat model (section 6.1). It takes about 85
 seconds. It is not part of `pnpm run test` and CI does not run it.
 
 ```sh
@@ -436,7 +566,7 @@ are separate and do not use the Docker launcher.
 
 | Symptom                                                                                                                                         | Cause and fix                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ----------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `invalid configuration:` and a list of variable names                                                                                           | A variable is missing or out of range. The message names the variable and never its value. `DATABASE_URL` and `AAB_KEK_DIR` are required, and `AAB_KEK_DIR` must be absolute.                                                                                                                                                                                                                                                                                                                                         |
+| `invalid configuration:` and a list of variable names                                                                                           | A variable is missing or out of range. The message names the variable and never its value. For the worker `DATABASE_URL` and `AAB_VAULT_SOCKET` (absolute) are required, and `AAB_KEK_DIR` must not be set. For the vault `AAB_KEK_DIR` and `AAB_VAULT_SOCKET_DIR` are required.                                                                                                                                                                                                                                      |
 | `refusing to start: the sandbox self-check failed: bubblewrap not found ...`                                                                    | `/usr/bin/bwrap` is missing or not executable. Likewise for `node not found ... at /usr/bin/node` and `Chromium not found ... at <path>` (set `AAB_CHROMIUM_PATH`).                                                                                                                                                                                                                                                                                                                                                   |
 | `... the sandbox has a network interface besides lo` or `... can reach the host's loopback`                                                     | The sandbox is not isolating. Do not run jobs. Check the bubblewrap version and how it was installed.                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `... Chromium could not start inside the sandbox`                                                                                               | Chromium needs unprivileged user namespaces for its own sandbox. Check the `bwrap` command in the prerequisites, the distribution's restriction on user namespaces, and that the Chromium path is right.                                                                                                                                                                                                                                                                                                              |
@@ -445,7 +575,8 @@ are separate and do not use the Docker launcher.
 | `egress socket path would be N bytes, over the 100-byte Unix socket limit`                                                                      | `AAB_WORKER_RUNTIME_DIR` (or the default) is too long. Unix socket paths are limited to about 100 bytes. Use a short directory such as `/run/user/<uid>/aab`.                                                                                                                                                                                                                                                                                                                                                         |
 | `runtime base directory ... must not be accessible to other users` or `... is not owned by this user`                                           | The runtime base directory must be a real directory, owned by the worker's user, with no access for group or others (mode 0700). Remove it or fix its mode.                                                                                                                                                                                                                                                                                                                                                           |
 | `a KEK already exists ...; refusing to overwrite` from `init-kek`                                                                               | The directory already has a key. That is intended. Never delete it unless you accept reconnecting every connection.                                                                                                                                                                                                                                                                                                                                                                                                   |
-| The worker exits on start with a key-store error                                                                                                | The key directory is not mode 0700, a key file is accessible to group or others, or no `kek-v<N>.key` of 32 bytes is present.                                                                                                                                                                                                                                                                                                                                                                                         |
+| The worker exits on start with `AAB_KEK_DIR: must not be set` or `refusing to start: ... vault`                                                 | The worker holds no key: unset `AAB_KEK_DIR`. For a vault message: `AAB_VAULT_SOCKET` points at another role's socket, `AAB_VAULT_ISOLATION` differs from the vault's, or (separate-uid) the worker's user can open the key directory the vault reports: fix its owner and mode, or run the worker as another user. A vault that does not answer is not a start-up error: see the next row.                                                                                                                           |
+| Jobs stay `queued` and the worker log says `the vault is unreachable; no job is claimed`                                                        | The supervisor checks the vault before every claim. Start the vault, check that `AAB_VAULT_SOCKET` is the supervisor-role socket and that the worker's user may search its directory. Jobs resume by themselves. A job that fails `vault_unavailable` was claimed just before the vault went away; start it again from the dashboard or the API.                                                                                                                                                                      |
 | Port 4100 is busy, or jobs fail with `origin_not_allowed`                                                                                       | The Northstar adapter allows only `http://localhost:4100`. Run the demo on that port and register the application with that origin, not `127.0.0.1`.                                                                                                                                                                                                                                                                                                                                                                  |
 | Sign-in fails at once with the "could not complete the login" message                                                                           | No display reached the worker (`DISPLAY` with its authority file, or `WAYLAND_DISPLAY` with `XDG_RUNTIME_DIR`), the display is not a local `:N` display, or the sandbox could not start. Check the worker log for `login window could not be opened` and its `errorCode`.                                                                                                                                                                                                                                             |
 | A request stays `queued` or answers `202`                                                                                                       | The worker is not running, is at its concurrency, or the connection has another job. Look at the worker log. `GET /v1/operations/:jobId` shows the state.                                                                                                                                                                                                                                                                                                                                                             |

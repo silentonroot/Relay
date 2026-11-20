@@ -26,6 +26,7 @@ import type { AppContext, RateLimitSettings } from '../context.js';
 import { DEFAULT_RATE_LIMITS } from '../context.js';
 import { AppError, conflict, notFound } from '../errors.js';
 import type { ZodApp } from '../types.js';
+import { authorizeNewJob } from '../vault/authorize.js';
 
 /** How often a waiting request looks at its job. */
 export const JOB_POLL_INTERVAL_MS = 100;
@@ -170,7 +171,21 @@ export function registerExecutionRoutes(
         }
         jobId = existing.jobId;
       } else {
-        jobId = await createJob();
+        const made = await createJob();
+        jobId = made.jobId;
+        // Stage 1 of the capability, after the commit (ADR-014 section 5). A failure ends the
+        // job as vault_unavailable or vault_denied; the wait below then returns that outcome.
+        if (made.created) {
+          await authorizeNewJob(ctx, request.log, {
+            id: jobId,
+            kind: 'operation',
+            organizationId: auth.scope.organizationId,
+            connectionId: body.connectionId,
+            agentId: body.agentId,
+            operation: body.operation,
+            runId: body.runId ?? null,
+          });
+        }
       }
 
       // 8. Wait for the worker, within the budget.
@@ -178,7 +193,7 @@ export function registerExecutionRoutes(
       return reply.code(isTerminalJobStatus(job.status) ? 200 : 202).send(toOperationJob(job));
 
       /** Steps 4 to 7. Returns the id of the new job, or of the one a concurrent twin made. */
-      async function createJob(): Promise<string> {
+      async function createJob(): Promise<{ jobId: string; created: boolean }> {
         // 4. The adapter is resolved from the connection's application. An unknown adapter or
         // operation is not rejected here: the policy engine denies it as `operation_unknown`.
         const target = await ctx.repos.connections.getForExecution(connection!.id);
@@ -309,7 +324,7 @@ export function registerExecutionRoutes(
 
         // 7. The decision, the job and the idempotency record commit together.
         try {
-          return await ctx.repos.transaction(async (tx) => {
+          const jobId = await ctx.repos.transaction(async (tx) => {
             const event = await recordDecision(
               tx,
               'allow',
@@ -354,6 +369,7 @@ export function registerExecutionRoutes(
             });
             return created.id;
           });
+          return { jobId, created: true };
         } catch (error) {
           if (!(error instanceof ConflictError)) throw error;
           // A concurrent identical request won; this transaction rolled back whole.
@@ -362,7 +378,7 @@ export function registerExecutionRoutes(
           if (winner.requestHash !== requestHash) {
             throw conflict('This idempotency key was already used for a different request.');
           }
-          return winner.jobId;
+          return { jobId: winner.jobId, created: false };
         }
       }
     },
@@ -411,7 +427,7 @@ export function registerExecutionRoutes(
       }
 
       const now = ctx.clock();
-      return ctx.repos.transaction(async (tx) => {
+      const started = await ctx.repos.transaction(async (tx) => {
         if (current.status === 'created') {
           await tx.connections.transitionStatus(auth.scope, current.id, {
             to: 'authentication_required',
@@ -440,6 +456,23 @@ export function registerExecutionRoutes(
         });
         return { connection, jobId: job.id, jobStatus: job.status, error: null };
       });
+      // Stage 1 of the capability, after the commit (ADR-014 section 5).
+      const outcome = await authorizeNewJob(ctx, request.log, {
+        id: started.jobId,
+        kind: 'login',
+        organizationId: auth.scope.organizationId,
+        connectionId: current.id,
+        agentId: null,
+        operation: null,
+        runId: null,
+      });
+      if (outcome !== 'failed') return started;
+      const [job, latest] = await Promise.all([
+        ctx.repos.jobs.getInternal(started.jobId),
+        ctx.repos.connections.get(auth.scope, current.id),
+      ]);
+      if (job === null || latest === null) throw notFound();
+      return { connection: latest, jobId: job.id, jobStatus: job.status, error: job.error };
     },
   );
 

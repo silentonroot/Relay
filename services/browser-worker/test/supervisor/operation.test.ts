@@ -11,7 +11,7 @@ import {
   createSupervisor,
   OPERATION_REASONS,
 } from '../../src/supervisor/index.js';
-import type { OperationJobOutcome } from '../../src/types.js';
+import type { OperationJobOutcome, StorageState } from '../../src/types.js';
 import {
   activeConnection,
   APP_ORIGIN,
@@ -25,7 +25,6 @@ import {
   queueOperation,
   registerApplication,
   stateWith,
-  testKek,
   testRegistry,
   waitFor,
 } from './helpers.js';
@@ -36,13 +35,11 @@ const RESULT_CANARY = 'result-canary-9c4f7a';
 
 describe('operation jobs', () => {
   let world: World;
-  let kek: ReturnType<typeof testKek>;
   let runner: FakeRunner;
   let log: ReturnType<typeof captureLogger>;
 
   beforeEach(async () => {
     world = await createWorld();
-    kek = testKek();
     runner = new FakeRunner();
     log = captureLogger();
   });
@@ -50,19 +47,19 @@ describe('operation jobs', () => {
     await world.close();
   });
 
-  function supervisor(repos: Repositories = world.repos, extra: { kek?: typeof kek } = {}) {
+  function supervisor(repos: Repositories = world.repos) {
     return createSupervisor({
       repos,
       runner,
-      kek: extra.kek ?? kek,
+      vault: world.vault,
       adapters: testRegistry(),
       logger: log.logger,
       settings: { workerId: 'worker-test', leaseMs: 5_000, heartbeatMs: 40, loginPollMs: 20 },
     });
   }
 
-  async function runOnce(repos: Repositories = world.repos, extra: { kek?: typeof kek } = {}) {
-    const sup = supervisor(repos, extra);
+  async function runOnce(repos: Repositories = world.repos) {
+    const sup = supervisor(repos);
     const started = await sup.tick();
     await sup.idle();
     return started;
@@ -73,7 +70,7 @@ describe('operation jobs', () => {
   const connectionOf = async (id: string) => (await world.repos.connections.get(world.scope, id))!;
 
   it('runs an allowed read operation with the stored snapshot and records the outcome', async () => {
-    const connection = await activeConnection(world, kek, { state: stateWith(COOKIE_CANARY) });
+    const connection = await activeConnection(world, { state: stateWith(COOKIE_CANARY) });
     const jobId = await queueOperation(world, connection.id);
     let readAuditedBeforeRun = false;
     runner.operation = async () => {
@@ -117,8 +114,11 @@ describe('operation jobs', () => {
       resultKeys: ['items', 'note'],
       resultBytes: expect.any(Number),
     });
-    const read = events.find((event) => event.eventType === 'vault.secret_read')!;
-    expect(read.metadata).toMatchObject({ jobId, snapshotVersion: 1, keyVersion: 1 });
+    // The vault wrote the read (ADR-014 section 10: actor system); the supervisor wrote none.
+    const reads = events.filter((event) => event.eventType === 'vault.secret_read');
+    expect(reads).toHaveLength(1);
+    expect(reads[0]!.actorType).toBe('system');
+    expect(reads[0]!.metadata).toMatchObject({ jobId, entryVersion: 1, keyVersion: 1 });
 
     // Result values reach the job row only; never the audit trail or the log.
     expect(JSON.stringify(events)).not.toContain(RESULT_CANARY);
@@ -209,7 +209,7 @@ describe('operation jobs', () => {
   ];
 
   it.each(outcomes)('maps $name to the job status, audit event and connection', async (c) => {
-    const connection = await activeConnection(world, kek);
+    const connection = await activeConnection(world);
     const jobId = await queueOperation(world, connection.id);
     runner.operation = async () => c.outcome;
     await runOnce();
@@ -235,7 +235,7 @@ describe('operation jobs', () => {
   });
 
   it('tolerates the connection being revoked while the job ran', async () => {
-    const connection = await activeConnection(world, kek);
+    const connection = await activeConnection(world);
     const jobId = await queueOperation(world, connection.id);
     runner.operation = async () => {
       await world.repos.connections.revoke(world.scope, connection.id);
@@ -257,7 +257,7 @@ describe('operation jobs', () => {
     }
 
     it('grant revoked: denied', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id);
       const [grant] = await world.repos.grants.listForEvaluation({
         agentId: world.agentId,
@@ -273,7 +273,7 @@ describe('operation jobs', () => {
     });
 
     it('agent disabled: denied', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id);
       await world.repos.agents.disable(world.scope, world.agentId);
       await expectNotRun(jobId, 'denied');
@@ -282,7 +282,7 @@ describe('operation jobs', () => {
     });
 
     it('connection revoked: cancelled', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id);
       // Revocation without the API's job cancellation, so the job is still queued.
       await world.repos.connections.revoke(world.scope, connection.id);
@@ -290,7 +290,7 @@ describe('operation jobs', () => {
     });
 
     it('connection no longer active: denied', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id);
       await world.repos.connections.transitionStatus(world.scope, connection.id, {
         to: 'expired',
@@ -299,7 +299,7 @@ describe('operation jobs', () => {
     });
 
     it('a write operation is refused in phase 2 even with an allow grant', async () => {
-      const connection = await activeConnection(world, kek, { operation: 'orders.cancel' });
+      const connection = await activeConnection(world, { operation: 'orders.cancel' });
       const jobId = await queueOperation(world, connection.id, { operation: 'orders.cancel' });
       await expectNotRun(jobId, 'denied');
       const denied = (await auditEvents(world)).find((e) => e.eventType === 'operation.denied')!;
@@ -308,7 +308,7 @@ describe('operation jobs', () => {
   });
 
   it('re-validates stored arguments', async () => {
-    const connection = await activeConnection(world, kek);
+    const connection = await activeConnection(world);
     const jobId = await queueOperation(world, connection.id, { arguments: { limit: 1000 } });
     await runOnce();
     expect(runner.operationCalls).toHaveLength(0);
@@ -364,7 +364,7 @@ describe('operation jobs', () => {
     }
 
     it('a job whose arguments differ from the judged hash does not run', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id, { arguments: { limit: 5 } });
       // Still valid for the adapter and still allowed by the grant: without the hash the
       // worker would run it.
@@ -384,15 +384,15 @@ describe('operation jobs', () => {
     });
 
     it('an added argument is refused too', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id, { arguments: {} });
       await editRow(jobId, `arguments = '{"limit": 1}'::jsonb`);
       await expectRefused(jobId);
     });
 
     it('a job moved to another connection does not run there', async () => {
-      const judged = await activeConnection(world, kek);
-      const other = await activeConnection(world, kek, { state: stateWith(COOKIE_CANARY) });
+      const judged = await activeConnection(world);
+      const other = await activeConnection(world, { state: stateWith(COOKIE_CANARY) });
       const jobId = await queueOperation(world, judged.id);
       await editRow(jobId, `connection_id = '${other.id}'`);
       await expectRefused(jobId);
@@ -400,7 +400,7 @@ describe('operation jobs', () => {
     });
 
     it('a job switched to another operation does not run', async () => {
-      const connection = await activeConnection(world, kek, { operation: 'orders.cancel' });
+      const connection = await activeConnection(world, { operation: 'orders.cancel' });
       const jobId = await queueOperation(world, connection.id, { operation: 'orders.cancel' });
       // Rewritten to a read the grant set would also allow.
       await world.repos.grants.create(world.scope, world.agentId, {
@@ -412,7 +412,7 @@ describe('operation jobs', () => {
     });
 
     it('a hash replaced by the hash of other arguments is refused', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id, { arguments: { limit: 5 } });
       const otherHash = await hashWith(jobId, { limit: 6 });
       await editRow(jobId, `arguments_hash = '${otherHash}'`);
@@ -420,7 +420,7 @@ describe('operation jobs', () => {
     });
 
     it('an unchanged row still runs, whatever the key order the database stores', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id, { arguments: { limit: 5 } });
       // Rewriting the same value is not a change.
       await editRow(jobId, `arguments = '{"limit": 5.0}'::jsonb`);
@@ -430,7 +430,7 @@ describe('operation jobs', () => {
     });
 
     it('a job reassigned to another agent does not run', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id);
       // The other agent holds a grant too, so only the hash stands in the way.
       const other = await world.repos.agents.create(world.scope, {
@@ -446,28 +446,28 @@ describe('operation jobs', () => {
     });
 
     it('a job pointed at another policy decision does not run', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id);
       await editRow(jobId, `policy_decision_id = '${randomUUID()}'`);
       await expectRefused(jobId);
     });
 
     it('a job whose decision id was removed does not run', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id);
       await editRow(jobId, `policy_decision_id = null`);
       await expectRefused(jobId);
     });
 
     it('a job with a longer timeout does not run', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id);
       await editRow(jobId, `timeout_ms = 3600000`);
       await expectRefused(jobId);
     });
 
     it('a job whose retry flag was flipped does not run', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id, { retrySafe: false });
       await editRow(jobId, `retry_safe = true`);
       await expectRefused(jobId);
@@ -478,24 +478,44 @@ describe('operation jobs', () => {
       expect((await job(readOnly)).status).toBe('denied');
     });
 
-    it('residual risk until step B3: an edit that also recomputes the hash is not detected', async () => {
-      // The hash is unkeyed and stored beside the arguments, so a writer who knows the layout
-      // can replace both. The vault capability (ADR-014) is what will bind it with a MAC.
-      const connection = await activeConnection(world, kek);
+    it('an edit that also recomputes the hash does not run: the vault returns the hash it bound (P3-17)', async () => {
+      // The hash is unkeyed and stored beside the arguments, so a writer who knows the layout can
+      // replace both and the row stays consistent with itself (step 0 passes). The capability
+      // was bound to the hash the API judged, under a MAC, when the job was authorized: the
+      // supervisor compares what `readForWorker` returns with the row and runs nothing.
+      const connection = await activeConnection(world, { state: stateWith(COOKIE_CANARY) });
       const jobId = await queueOperation(world, connection.id, { arguments: { limit: 5 } });
       const forged = await hashWith(jobId, { limit: 50 });
       await editRow(jobId, `arguments = '{"limit": 50}'::jsonb, arguments_hash = '${forged}'`);
       await runOnce();
-      expect(runner.operationCalls).toHaveLength(1);
-      expect(runner.operationCalls[0]!.arguments).toEqual({ limit: 50 });
+      expect(runner.operationCalls).toHaveLength(0);
+      const finished = await job(jobId);
+      expect(finished.status).toBe('denied');
+      expect(finished.error?.code).toBe('denied');
+      expect(finished.result).toBeNull();
+      const events = await auditEvents(world);
+      const denied = events.filter((event) => event.eventType === 'operation.denied');
+      expect(denied).toHaveLength(1);
+      expect(denied[0]!.decision).toBe('deny');
+      expect(denied[0]!.metadata).toMatchObject({ jobId, reasonCode: ARGUMENTS_HASH_MISMATCH });
+      expect(JSON.stringify(denied[0]!.metadata)).not.toContain('limit');
+      expect(log.lines.join('')).toContain('do not match the hash the vault bound');
+      expect(log.lines.join('')).not.toContain(COOKIE_CANARY);
     });
   });
 
   describe('the runner receives exactly the hashed arguments', () => {
     it('a maxResults grant added after enqueue refuses the job', async () => {
-      // No grant yet: the job was judged and stored without the limit.
-      const connection = await activeConnection(world, kek, { grant: false });
+      // The job was judged and stored without the limit.
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id, { arguments: {} });
+      // The unconstrained grant is replaced by one with a limit.
+      const [old] = await world.repos.grants.listForEvaluation({
+        agentId: world.agentId,
+        connectionId: connection.id,
+        operation: 'orders.list',
+      });
+      await world.repos.grants.revoke(world.scope, world.agentId, old!.id);
       await world.repos.grants.create(world.scope, world.agentId, {
         connectionId: connection.id,
         operation: 'orders.list',
@@ -516,7 +536,7 @@ describe('operation jobs', () => {
     });
 
     it('a maxResults grant that adds nothing to the stored arguments does not refuse the job', async () => {
-      const connection = await activeConnection(world, kek, {
+      const connection = await activeConnection(world, {
         grant: false,
       });
       await world.repos.grants.create(world.scope, world.agentId, {
@@ -532,7 +552,7 @@ describe('operation jobs', () => {
     });
 
     it('passes the stored arguments to the runner unchanged', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       await queueOperation(world, connection.id, { arguments: { limit: 3 } });
       await runOnce();
       expect(runner.operationCalls[0]!.arguments).toEqual({ limit: 3 });
@@ -548,8 +568,8 @@ describe('operation jobs', () => {
       adapterId: 'manifest-only',
       allowedOrigins: [APP_ORIGIN],
     });
-    const a = await activeConnection(world, kek, { applicationId: unknownApp });
-    const b = await activeConnection(world, kek, { applicationId: manifestApp });
+    const a = await activeConnection(world, { applicationId: unknownApp });
+    const b = await activeConnection(world, { applicationId: manifestApp });
     const jobA = await queueOperation(world, a.id);
     const jobB = await queueOperation(world, b.id);
     await runOnce();
@@ -562,7 +582,7 @@ describe('operation jobs', () => {
     it('keeps the adapter order', async () => {
       await world.close();
       world = await createWorld({ allowedOrigins: [OTHER_ORIGIN, CDN_ORIGIN, APP_ORIGIN] });
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       await queueOperation(world, connection.id);
       await runOnce();
       expect(runner.operationCalls[0]!.allowedOrigins).toEqual([APP_ORIGIN, CDN_ORIGIN]);
@@ -571,7 +591,7 @@ describe('operation jobs', () => {
     it('is the subset the application allows', async () => {
       await world.close();
       world = await createWorld({ allowedOrigins: [CDN_ORIGIN] });
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       await queueOperation(world, connection.id);
       await runOnce();
       expect(runner.operationCalls[0]!.allowedOrigins).toEqual([CDN_ORIGIN]);
@@ -580,7 +600,7 @@ describe('operation jobs', () => {
     it('fails origin_not_allowed when empty', async () => {
       await world.close();
       world = await createWorld({ allowedOrigins: [OTHER_ORIGIN] });
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id);
       await runOnce();
       expect(runner.operationCalls).toHaveLength(0);
@@ -589,33 +609,71 @@ describe('operation jobs', () => {
     });
   });
 
-  it('without a snapshot: reauth_required and the runner is not called', async () => {
-    const connection = await activeConnection(world, kek, { state: null });
+  it('without a stored session: reauth_required, connection expired, no vault call (M3)', async () => {
+    const connection = await activeConnection(world, { state: null });
     const jobId = await queueOperation(world, connection.id);
     await runOnce();
     expect(runner.operationCalls).toHaveLength(0);
-    expect((await job(jobId)).status).toBe('reauth_required');
+    const finished = await job(jobId);
+    expect(finished.status).toBe('reauth_required');
+    expect(finished.error?.code).toBe('session_expired');
     const after = await connectionOf(connection.id);
     expect(after.status).toBe('expired');
     expect(after.statusReason).toBe(OPERATION_REASONS.noSnapshot);
+    const capability = await world.handle.db.execute(
+      `select token_hash from vault_access_capabilities where job_id = '${jobId}'`,
+    );
+    // No token was issued for it (the capability is also revoked with the session).
+    expect(JSON.stringify(capability)).not.toMatch(/[0-9a-f]{64}/);
+    expect(await eventTypes()).not.toContain('vault.capability_issued');
   });
 
-  it('a snapshot that cannot be opened fails worker_failure before anything runs', async () => {
-    const connection = await activeConnection(world, kek, { state: stateWith(COOKIE_CANARY) });
+  it("a session invalidation also revokes the connection's unused capabilities (L5)", async () => {
+    const connection = await activeConnection(world);
+    const first = await queueOperation(world, connection.id);
+    const second = await queueOperation(world, connection.id);
+    runner.operation = async () => ({ status: 'reauth_required' });
+    const sup = createSupervisor({
+      repos: world.repos,
+      runner,
+      vault: world.vault,
+      adapters: testRegistry(),
+      logger: log.logger,
+      settings: {
+        workerId: 'worker-test',
+        leaseMs: 5_000,
+        heartbeatMs: 40,
+        concurrency: 1,
+      },
+    });
+    expect(await sup.tick()).toEqual([first]);
+    await sup.idle();
+    expect((await job(first)).status).toBe('reauth_required');
+    const rows = (await world.handle.db.execute(
+      `select revoked_at, revoked_reason from vault_access_capabilities where job_id = '${second}'`,
+    )) as unknown as { rows?: Record<string, unknown>[] };
+    const row = (rows.rows ?? (rows as unknown as Record<string, unknown>[]))[0]!;
+    expect(row['revoked_at']).not.toBeNull();
+    expect(row['revoked_reason']).toBe('session_deleted');
+  });
+
+  it('a stored session that is not a valid storage state fails worker_failure before anything runs', async () => {
+    // Sealed bytes that are JSON but not a storage state.
+    const connection = await activeConnection(world, {
+      state: { cookies: [{ name: COOKIE_CANARY }], origins: [] } as unknown as StorageState,
+    });
     const jobId = await queueOperation(world, connection.id);
-    await runOnce(world.repos, { kek: testKek() });
+    await runOnce();
     expect(runner.operationCalls).toHaveLength(0);
     expect((await job(jobId)).error?.code).toBe('worker_failure');
-    expect(await eventTypes()).not.toContain('vault.secret_read');
     const logged = log.lines.join('');
-    expect(logged).toContain('session snapshot could not be opened');
+    expect(logged).toContain('not a valid storage state');
     expect(logged).not.toContain(COOKIE_CANARY);
-    // The snapshot is kept: the key may be fixed by an operator.
     expect((await connectionOf(connection.id)).status).toBe('active');
   });
 
   it('cancellation while running aborts the runner and ends the job cancelled', async () => {
-    const connection = await activeConnection(world, kek);
+    const connection = await activeConnection(world);
     const jobId = await queueOperation(world, connection.id);
     let seenAbort = false;
     runner.operation = (_spec, signal) =>
@@ -635,8 +693,8 @@ describe('operation jobs', () => {
   });
 
   it('after a restart, snapshots are opened unchanged and never cross connections', async () => {
-    const a = await activeConnection(world, kek, { state: stateWith('alpha-value') });
-    const b = await activeConnection(world, kek, { state: stateWith('beta-value') });
+    const a = await activeConnection(world, { state: stateWith('alpha-value') });
+    const b = await activeConnection(world, { state: stateWith('beta-value') });
     const expected = new Map([
       [a.id, stateWith('alpha-value')],
       [b.id, stateWith('beta-value')],
@@ -672,7 +730,7 @@ describe('operation jobs', () => {
   });
 
   it('if recording fails the result is not kept and the job is left to lease recovery (INV-10)', async () => {
-    const connection = await activeConnection(world, kek);
+    const connection = await activeConnection(world);
     const jobId = await queueOperation(world, connection.id, { retrySafe: false });
     runner.operation = async () => ({ status: 'succeeded', data: { items: [RESULT_CANARY] } });
     const failing = (repos: Repositories): Repositories => ({
@@ -698,7 +756,7 @@ describe('operation jobs', () => {
     const later = createSupervisor({
       repos: world.repos,
       runner,
-      kek,
+      vault: world.vault,
       adapters: testRegistry(),
       logger: log.logger,
       clock: () => new Date(Date.now() + 10 * 60_000),

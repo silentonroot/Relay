@@ -50,6 +50,8 @@ export const Routes = {
   agentGrants: '/agents/:id/grants',
   agentGrant: '/agents/:id/grants/:grantId',
   auditEvents: '/audit-events',
+  /** The vault's key and capability status, for the owner (ADR-014 section 12). */
+  vaultStatus: '/vault/status',
 } as const;
 
 /** Every non-2xx response has this body. */

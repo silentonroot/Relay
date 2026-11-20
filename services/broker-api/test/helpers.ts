@@ -23,6 +23,10 @@ export function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     host: '127.0.0.1',
     port: 0,
     kekDir: undefined,
+    vaultSocket: undefined,
+    vaultIsolation: 'separate-uid',
+    vaultAuthorizationTtlSeconds: 600,
+    vaultCallTimeoutMs: 5_000,
     sessionTtlMinutes: 60,
     cookieSecure: true,
     logLevel: 'info',
@@ -87,9 +91,13 @@ export async function createHarness(
     passwordVerifier?: BuildAppDeps['passwordVerifier'];
     /** Replaces the default adapter registry (which holds Northstar). */
     adapters?: BuildAppDeps['adapters'];
+    /** The vault as the api role. Omit for the Phase 2 path (no vault wired). */
+    vault?: BuildAppDeps['vault'];
+    /** Reuse a database (a vault started on it shares it with the API). */
+    database?: DatabaseHandle;
   } = {},
 ): Promise<Harness> {
-  const database = await createTestDatabase();
+  const database = options.database ?? (await createTestDatabase());
   const clock = new TestClock();
   const logs: string[] = [];
   const app = await buildApp({
@@ -100,6 +108,7 @@ export async function createHarness(
       ? {}
       : { passwordVerifier: options.passwordVerifier }),
     ...(options.adapters === undefined ? {} : { adapters: options.adapters }),
+    ...(options.vault === undefined ? {} : { vault: options.vault }),
     logDestination: { write: (line) => void logs.push(line) },
     passwordParams: TEST_SCRYPT,
     rateLimits: { globalMax: 10_000, ...options.rateLimits },
@@ -122,7 +131,7 @@ export async function createHarness(
     },
     async close() {
       await app.close();
-      await database.close();
+      if (options.database === undefined) await database.close();
     },
   };
   return harness;

@@ -39,6 +39,7 @@ interface ProbeResult {
   app: string[];
   interfaces: string[];
   loopback: string;
+  unix: Record<string, string>;
   envKeys: string[];
 }
 
@@ -167,6 +168,87 @@ describe.skipIf(integrationSkipReason !== null)(integrationTitle('bubblewrap iso
     } finally {
       await proxy.close();
       await dir.remove();
+    }
+  });
+
+  it('the vault socket directory is absent inside the sandbox', async () => {
+    // P3-14: the runner is hostile and must not be able to reach the vault. A real vault-shaped
+    // socket directory (one directory per role, a listening socket in each) sits on the host,
+    // where the supervisor would reach it; the sandbox is given no mount for it.
+    const parent = process.env['XDG_RUNTIME_DIR'] ?? os.tmpdir();
+    const vaultDir = mkdtempSync(path.join(parent, 'aab-vault-iso-'));
+    const servers: net.Server[] = [];
+    const socketPaths: string[] = [];
+    for (const role of ['api', 'supervisor', 'admin']) {
+      mkdirSync(path.join(vaultDir, role));
+      const socketPath = path.join(vaultDir, role, 'vault.sock');
+      const server = net.createServer((socket) => socket.end('{"vault":"answered"}\n'));
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      servers.push(server);
+      socketPaths.push(socketPath);
+    }
+    const config = resolveJobRunnerConfig({
+      repoRoot: fakeRepo,
+      runtimeBaseDir: runtimeBaseDir(),
+      bwrapPath: BWRAP,
+      chromiumPath: CHROMIUM,
+      adapterRegistryModule: path.join(
+        fakeRepo,
+        'services/browser-worker/test/fixtures/registry/index.ts',
+      ),
+    });
+    const launcher = createLauncher(config);
+    const dir = await createJobRuntimeDir(config.runtimeBaseDir);
+    const proxy = await createEgressProxy({
+      socketPath: dir.socketPath,
+      allowedOrigins: ['https://unused.invalid'],
+    });
+    try {
+      const sandbox = await launcher.launch({
+        jobId: 'isolation-probe-vault',
+        jobDir: dir.dir,
+        socketPath: dir.socketPath,
+        headed: false,
+        entryOverride: path.join(
+          fakeRepo,
+          'services/browser-worker/test/fixtures/registry/probe.ts',
+        ),
+      });
+      const paths = [vaultDir, path.dirname(vaultDir), ...socketPaths];
+      let output = '';
+      sandbox.stdout.on('data', (chunk: Buffer) => (output += chunk.toString()));
+      let errors = '';
+      sandbox.stderr.on('data', (chunk: Buffer) => (errors += chunk.toString()));
+      sandbox.stdin.write(`${JSON.stringify({ paths, port, sockets: socketPaths })}\n`);
+      const exit = await sandbox.exited;
+      expect(errors).toBe('');
+      expect(exit.code).toBe(0);
+      const result = JSON.parse(output) as ProbeResult;
+
+      // Host side first: the sockets are really there and really answer, so an absent path in
+      // the sandbox is the sandbox's doing and not a broken fixture.
+      for (const socketPath of socketPaths) {
+        const answer = await new Promise<string>((resolve) => {
+          const client = net.connect({ path: socketPath });
+          let data = '';
+          client.on('data', (chunk) => (data += chunk.toString()));
+          client.once('close', () => resolve(data));
+          client.once('error', () => resolve('error'));
+        });
+        expect(answer).toContain('answered');
+      }
+      for (const entry of paths) expect(result.exists[entry]).toBe(false);
+      for (const socketPath of socketPaths) {
+        // ENOENT: the path does not exist there. Anything else (a refusal, a connection) would mean it does.
+        expect(result.unix[socketPath]).toBe('ENOENT');
+      }
+      expect(result.envKeys.filter((key) => /VAULT|KEK|SOCKET_DIR/.test(key))).toEqual([]);
+      await sandbox.kill();
+    } finally {
+      await proxy.close();
+      await dir.remove();
+      for (const server of servers) server.close();
+      rmSync(vaultDir, { recursive: true, force: true });
     }
   });
 

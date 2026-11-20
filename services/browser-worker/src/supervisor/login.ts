@@ -1,14 +1,16 @@
+import { DEFAULT_TOKEN_TTL_SECONDS } from '@aab/contracts';
 import type { JobErrorCode } from '@aab/contracts';
 import { ConflictError } from '@aab/database';
 import { jobError } from '../protocol.js';
 import { LoginStartError } from '../sandbox/index.js';
 import {
+  encodeSnapshot,
   filterStorageState,
   isEmptyStorageState,
   sessionExpiry,
-  storeSnapshot,
 } from '../session-store/index.js';
 import type { LoginHandle, LoginOutcome } from '../types.js';
+import { failureCodeFor } from '../vault/gateway.js';
 import { errorFacts, intersectOrigins } from './context.js';
 import type { JobContext } from './context.js';
 import { auditAsWorker, LOGIN_FAILURE_REASONS, transitionIfAllowed } from './records.js';
@@ -26,7 +28,11 @@ function normalizeHint(hint: string | null): string | null {
  * revocation, the window closing, the job timeout, or a stop (shutdown, lease loss, cancel
  * seen by the heartbeat). The lease is extended by the supervisor's heartbeat meanwhile.
  */
-function waitForLoginEvent(ctx: JobContext, handle: LoginHandle): Promise<LoginEvent> {
+function waitForLoginEvent(
+  ctx: JobContext,
+  handle: LoginHandle,
+  windowMs: number,
+): Promise<LoginEvent> {
   return new Promise<LoginEvent>((resolve) => {
     let settled = false;
     let pollTimer: NodeJS.Timeout | undefined;
@@ -39,7 +45,7 @@ function waitForLoginEvent(ctx: JobContext, handle: LoginHandle): Promise<LoginE
       resolve(event);
     };
     const onAbort = () => finish('stopped');
-    const timeoutTimer = setTimeout(() => finish('timeout'), ctx.job.timeoutMs);
+    const timeoutTimer = setTimeout(() => finish('timeout'), windowMs);
     ctx.signal.addEventListener('abort', onAbort, { once: true });
     if (ctx.signal.aborted) finish('stopped');
     handle.closed.then(
@@ -98,6 +104,7 @@ async function failLogin(ctx: JobContext, code: JobErrorCode): Promise<void> {
         },
       });
       await tx.jobs.complete(job.id, ctx.settings.workerId, {
+        attempt: job.attemptCount,
         status,
         error: jobError(code),
         auditEventId: event.id,
@@ -146,6 +153,30 @@ export async function runLoginJob(ctx: JobContext): Promise<void> {
   if (allowedOrigins.length === 0) return failLogin(ctx, 'origin_not_allowed');
   if (ctx.signal.aborted) return failLogin(ctx, stopCode(ctx));
 
+  // M1: the capability was authorized when the job was enqueued and its token is issued only
+  // after the owner completes, so the window must end while the capability is still alive. Read
+  // its expiry (metadata only) and cut the window to what remains less a margin; with too little
+  // left, fail before a window opens (code `timeout`: the time to sign in ran out).
+  if (job.capabilityRef === null) {
+    logger.error({ jobId: job.id }, 'claimed login job has no capability; login refused');
+    return failLogin(ctx, 'vault_denied');
+  }
+  let windowMs = job.timeoutMs;
+  try {
+    const capability = await repos.capabilities.getAuthorization(job.capabilityRef);
+    if (capability === null) return failLogin(ctx, 'vault_denied');
+    const remainingMs = new Date(capability.expiresAt).getTime() - ctx.clock().getTime();
+    windowMs = Math.min(windowMs, remainingMs - ctx.settings.loginCapabilityMarginMs);
+  } catch (error) {
+    logger.error({ jobId: job.id, ...errorFacts(error) }, 'capability expiry could not be read');
+    return failLogin(ctx, 'worker_failure');
+  }
+  if (windowMs < ctx.settings.minLoginWindowMs) {
+    logger.warn({ jobId: job.id }, 'the login capability expires too soon for a sign-in window');
+    return failLogin(ctx, 'timeout');
+  }
+  windowMs = Math.floor(windowMs);
+
   let handle: LoginHandle;
   try {
     handle = await ctx.runner.startLogin(
@@ -155,7 +186,7 @@ export async function runLoginJob(ctx: JobContext): Promise<void> {
         adapterId: adapter.id,
         adapterVersion: adapter.version,
         allowedOrigins,
-        timeoutMs: job.timeoutMs,
+        timeoutMs: windowMs,
       },
       ctx.signal,
     );
@@ -174,7 +205,7 @@ export async function runLoginJob(ctx: JobContext): Promise<void> {
 
   try {
     // 2. Wait for the owner.
-    const event = await waitForLoginEvent(ctx, handle);
+    const event = await waitForLoginEvent(ctx, handle, windowMs);
     if (event !== 'complete') {
       await closeWindow();
       const code: JobErrorCode =
@@ -217,67 +248,64 @@ export async function runLoginJob(ctx: JobContext): Promise<void> {
     }
     if (ctx.signal.aborted) return failLogin(ctx, stopCode(ctx));
 
-    // 4. Store, activate and record in one transaction.
-    const now = ctx.clock();
-    const expiresAt = sessionExpiry(filtered);
+    // 4. Hand the filtered state to the vault (ADR-014 section 4). The vault checks shape, size and
+    // emptiness again, seals the state, activates the connection, records the session, writes
+    // `vault.secret_stored` and `connection.auth_completed` (actor system) and completes this job,
+    // all in one transaction. The supervisor writes none of that and holds no key (P3-1); it does
+    // not add a second, worker-attributed copy of those events. Nothing falls back to sealing
+    // locally: a vault that cannot answer or refuses ends the login.
+    const expiresAt = sessionExpiry(filtered, ctx.clock());
+    let plaintext: string;
     try {
-      await repos.transaction(async (tx) => {
-        const stored = await storeSnapshot(tx, {
-          connection: fresh.connection,
-          storageState: filtered,
-          kek: ctx.kek,
-          now,
-        });
-        await tx.connections.transitionStatusInternal(job.connectionId, { to: 'active' });
-        await tx.connections.recordSession(job.connectionId, {
-          externalAccountHint: hint,
-          sessionExpiresAt: expiresAt,
-          lastVerifiedAt: now,
-        });
-        await auditAsWorker(tx, job, now, {
-          eventType: 'vault.secret_stored',
-          metadata: {
-            jobId: job.id,
-            connectionId: job.connectionId,
-            vaultEntryId: stored.vaultEntryId,
-            snapshotVersion: stored.version,
-            keyVersion: stored.kekVersion,
-            originCount: allowedOrigins.length,
-          },
-        });
-        const event = await auditAsWorker(tx, job, now, {
-          eventType: 'connection.auth_completed',
-          metadata: {
-            jobId: job.id,
-            connectionId: job.connectionId,
-            adapterId: adapter.id,
-            adapterVersion: adapter.version,
-            accountHintRecorded: hint !== null,
-            sessionExpiresAt: expiresAt === null ? null : expiresAt.toISOString(),
-            durationMs: Math.max(0, Date.now() - ctx.startedAtMs),
-            sandbox: ctx.runner.sandbox,
-          },
-        });
-        await tx.jobs.complete(job.id, ctx.settings.workerId, {
-          status: 'succeeded',
-          auditEventId: event.id,
-          now,
-        });
-      });
-      logger.info({ jobId: job.id, status: 'succeeded' }, 'login job finished');
+      plaintext = encodeSnapshot(filtered);
     } catch (error) {
-      // Everything above rolled back: nothing is stored.
-      if (error instanceof ConflictError && ctx.stopReason() === 'lease_lost') {
-        logger.warn({ jobId: job.id }, 'lease lost; login result discarded');
-        return;
-      }
-      logger.error({ jobId: job.id, ...errorFacts(error) }, 'login result could not be stored');
-      const latest = await repos.connections.getForExecution(job.connectionId).catch(() => null);
-      return failLogin(
-        ctx,
-        latest?.connection.status === 'revoked' ? 'cancelled' : 'worker_failure',
-      );
+      logger.error({ jobId: job.id, ...errorFacts(error) }, 'the login state could not be encoded');
+      return failLogin(ctx, 'worker_failure');
     }
+    // The captured and filtered states are no longer needed once encoded.
+    filtered.cookies.length = 0;
+    filtered.origins.length = 0;
+    outcome.storageState.cookies.length = 0;
+    outcome.storageState.origins.length = 0;
+    const capabilityId = job.capabilityRef;
+    try {
+      const issued = await ctx.vault.call('issueAccessCapability', {
+        capabilityId,
+        jobId: job.id,
+        workerId: ctx.settings.workerId,
+        attempt: job.attemptCount,
+        ttlSeconds: DEFAULT_TOKEN_TTL_SECONDS,
+      });
+      await ctx.vault.call('completeLogin', {
+        token: issued.token,
+        jobId: job.id,
+        connectionId: job.connectionId,
+        plaintext,
+        externalAccountHint: hint,
+        sessionExpiresAt: expiresAt === null ? null : expiresAt.toISOString(),
+      });
+    } catch (error) {
+      // Nothing is stored. A completion that committed but whose answer was lost leaves the job
+      // `succeeded`; ending it as failed below then finds it no longer held and changes nothing.
+      const code = failureCodeFor(error);
+      logger.warn(
+        { jobId: job.id, errorCode: code, ...errorFacts(error) },
+        'the vault did not store the login',
+      );
+      const latest = await repos.connections.getForExecution(job.connectionId).catch(() => null);
+      return failLogin(ctx, latest?.connection.status === 'revoked' ? 'cancelled' : code);
+    }
+    // The duration and sandbox kind Phase 2 put on `connection.auth_completed` are not in the
+    // vault's event (it cannot know them); they are logged here instead (decision in B3b).
+    logger.info(
+      {
+        jobId: job.id,
+        status: 'succeeded',
+        durationMs: Math.max(0, Date.now() - ctx.startedAtMs),
+        sandbox: ctx.runner.sandbox,
+      },
+      'login job finished',
+    );
   } finally {
     await closeWindow();
   }

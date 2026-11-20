@@ -143,6 +143,20 @@ export function registerResourceRoutes(app: ZodApp, ctx: AppContext) {
             jobsCancelled: cancelled.length,
           },
         });
+        // ADR-014 sections 7 and 10: the connection's secrets become `revoked` (terminal) in
+        // this transaction, and its unused capabilities were revoked inside `connections.revoke`
+        // (`vault.capability_revoked`), all committed together or not at all.
+        if (secretsBefore.length > 0) {
+          await auditAsUser(tx, auth.scope, now, {
+            eventType: 'vault.secret_revoked',
+            connectionId: revoked.id,
+            metadata: {
+              connectionId: revoked.id,
+              vaultEntryIds: secretsBefore.map((secret) => secret.id),
+              versionsDeleted,
+            },
+          });
+        }
         if (versionsDeleted > 0) {
           await auditAsUser(tx, auth.scope, now, {
             eventType: 'vault.secret_deleted',

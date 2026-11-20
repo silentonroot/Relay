@@ -17,6 +17,11 @@
 #   AAB_DASHBOARD_PORT    loopback port for the dashboard (default 8080); keep it in step with
 #                         the allowed host names in infra/docker/nginx/default.conf
 #
+# Phase 3: the `vault` service holds the key and the API reaches it over its own socket volume.
+# The browser worker is not part of this file (it needs a display, bubblewrap or Docker and the
+# demo); a worker on the host needs the vault's supervisor-role socket, see docs/operations.md.
+# The vault service and its image were added in step B3b and have not been built or started.
+#
 # This file does not build or reference the Northstar demo. The demo is a separate
 # repository with its own Compose file.
 
@@ -34,6 +39,19 @@ x-hardening: &hardening
 x-broker-api-build: &broker-api-build
   context: ..
   dockerfile: infra/docker/broker-api.Dockerfile
+
+x-vault-build: &vault-build
+  context: ..
+  dockerfile: infra/docker/vault.Dockerfile
+
+x-vault-env-file: &vault-env-file
+  # The vault's own file, created locally by the operator beside broker-api.env; contains
+  # DATABASE_URL. It shares the API's database role for now: the vault reads and writes the same
+  # tables (capabilities, secrets, audit) and a role with narrower rights needs per-table grants
+  # that no migration creates yet. The file is separate so the vault can be given a different
+  # role later without touching the API's environment, and so the API's file is not mounted
+  # into the key-holding container. Never committed.
+  - '${AAB_HOST_SECRETS_DIR:?set AAB_HOST_SECRETS_DIR to a directory outside the repository}/vault.env'
 
 x-broker-api-env-file: &broker-api-env-file
   # Created locally by the operator; contains DATABASE_URL (which embeds the database
@@ -102,6 +120,86 @@ services:
     cpus: 1.0
     pids_limit: 200
 
+  # One-shot: creates the first key-encryption key in the key volume when there is none. It
+  # never overwrites a key. The key volume is mounted into this container and the vault, and
+  # nowhere else. Back the volume up before you store a session you care about
+  # (docs/operations.md, "The key-encryption key").
+  vault-init-kek:
+    <<: *hardening
+    restart: 'no'
+    build: *vault-build
+    image: aab/vault:local
+    user: '${AAB_UID:-1000}:${AAB_GID:-1000}'
+    command:
+      - sh
+      - -c
+      - 'ls /var/lib/aab/keys/kek-v*.key >/dev/null 2>&1 || node --import tsx src/scripts/init-kek.ts /var/lib/aab/keys'
+    volumes:
+      - vault-keys:/var/lib/aab/keys
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    network_mode: none
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 50
+
+  # The vault (ADR-014): the only process that reads the key directory. It talks to the database
+  # and listens on one Unix socket per role. Each role's socket directory is its own volume, mounted
+  # into the vault and into that role's container only: the API gets `vault-api`, the supervisor
+  # role's `vault-supervisor` exists for a containerised worker (there is none in this file; it
+  # is not reachable from a worker on the host, see
+  # docs/operations.md) and `vault-admin` is for the admin command (`docker compose exec vault`).
+  # The vault and the API run under the SAME uid:gid (`AAB_UID`/`AAB_GID`, default 1000:1000),
+  # on purpose. In `shared-uid` mode the vault's sockets are mode 0600 owned by its user, so an API
+  # running as another uid could not connect and would start degraded (every job would fail
+  # `vault_unavailable`). One variable pair sets both, so they cannot drift apart. The
+  # `vault-api` volume is the only thing the API shares with the vault.
+  # Isolation is `shared-uid` in the vault's terms (one user in the container); what keeps the
+  # roles apart here is that a container sees only its own volume, so the API cannot reach the
+  # key volume or another role's socket. On a host the vault should run as its own user
+  # (`separate-uid`, docs/operations.md).
+  vault:
+    <<: *hardening
+    build: *vault-build
+    image: aab/vault:local
+    user: '${AAB_UID:-1000}:${AAB_GID:-1000}'
+    env_file: *vault-env-file
+    environment:
+      AAB_KEK_DIR: /var/lib/aab/keys
+      AAB_VAULT_SOCKET_DIR: /run/aab-vault
+      AAB_VAULT_ISOLATION: shared-uid
+      AAB_LOG_LEVEL: '${AAB_LOG_LEVEL:-info}'
+    volumes:
+      - vault-keys:/var/lib/aab/keys
+      - vault-api:/run/aab-vault/api
+      - vault-supervisor:/run/aab-vault/supervisor
+      - vault-admin:/run/aab-vault/admin
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      vault-init-kek:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "process.exit(require('node:fs').statSync('/run/aab-vault/api/vault.sock').isSocket() ? 0 : 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    # No host port is published and the vault has no network of its own beyond the database.
+    networks:
+      - backend
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 100
+
   broker-api:
     <<: *hardening
     build: *broker-api-build
@@ -120,9 +218,14 @@ services:
       # The API is reachable only through the dashboard's nginx on the internal network,
       # which overwrites X-Forwarded-For. Trusting it gives rate limiting the real client.
       AAB_TRUST_PROXY: 'true'
-    # No key directory is mounted here, and the API refuses to start if AAB_KEK_DIR is set.
-    # Only the browser worker's supervisor holds the key-encryption key in Phase 2 (ADR-013),
-    # and this file does not run the worker. Phase 3 moves the key behind the vault service.
+      # The vault's api-role socket, from the `vault-api` volume (the only vault volume this
+      # container has). The isolation mode must match the vault's.
+      AAB_VAULT_SOCKET: /run/aab-vault/api/vault.sock
+      AAB_VAULT_ISOLATION: shared-uid
+    # No key directory is mounted here, and the API refuses to start if AAB_KEK_DIR is set: only
+    # the vault holds the key-encryption key (ADR-014, P3-1).
+    volumes:
+      - vault-api:/run/aab-vault/api
     tmpfs:
       - /tmp:size=64m,mode=1777
     depends_on:
@@ -130,6 +233,8 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      vault:
+        condition: service_healthy
     # No host port is published; the browser reaches the API through the dashboard.
     networks:
       - backend
@@ -172,6 +277,12 @@ networks:
 
 volumes:
   postgres-data: {}
+  # Key files. Mounted into `vault` and `vault-init-kek` only.
+  vault-keys: {}
+  # One socket volume per vault role.
+  vault-api: {}
+  vault-supervisor: {}
+  vault-admin: {}
 
 secrets:
   postgres_password:

@@ -3,7 +3,9 @@ import { createDatabase } from '@aab/database';
 import type { DatabaseHandle } from '@aab/database';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from './app.js';
-import { ConfigError, loadConfig } from './config.js';
+import { createVaultGateway, VaultStartupRefusal } from './vault/gateway.js';
+import { verifyVaultAtStart } from './vault/startup.js';
+import { ConfigError, loadConfig, requireVaultSocket } from './config.js';
 
 /*
  * Service entry point. Configuration problems stop the process before it binds a port, with a
@@ -28,13 +30,44 @@ async function main(): Promise<void> {
   }
 
   if (config.kekDir !== undefined) {
-    // The API never holds key material: only the browser worker's supervisor reads the key
-    // directory (ADR-013). Refusing to start makes a shared or copied environment visible
-    // instead of leaving the key path lying around in a process that must not use it.
+    // The API never holds key material: only the vault reads the key directory (ADR-014 section
+    // 3). Refusing to start makes a shared or copied environment visible instead of leaving the
+    // key path lying around in a process that must not use it.
     fail(
-      'AAB_KEK_DIR must not be set for the API. Only the browser worker reads key material; ' +
+      'AAB_KEK_DIR must not be set for the API. Only the vault reads key material; ' +
         'remove the variable from the API environment.',
     );
+  }
+
+  let vaultSocket: string;
+  try {
+    vaultSocket = requireVaultSocket(config);
+  } catch (error) {
+    if (error instanceof ConfigError) fail(error.message);
+    throw error;
+  }
+
+  // ADR-014 section 3: ask the vault who it is before this process serves anything. A vault that
+  // answers and is wrong for this API (another role, another isolation mode, a key directory this
+  // user can open in separate-uid mode) stops the start; a vault that does not answer does not
+  // (revocation works without it, and every job fails closed), and the check repeats before any
+  // capability is authorized.
+  const vault = createVaultGateway({
+    socketPath: vaultSocket,
+    isolation: config.vaultIsolation,
+    timeoutMs: config.vaultCallTimeoutMs,
+    // One error line when the vault turns out to be wrong for this API (also after start).
+    onRefused: (reason) =>
+      process.stderr.write(
+        `${JSON.stringify({ level: 'error', msg: 'the vault is not usable by this API', reason })}\n`,
+      ),
+  });
+  let vaultStart;
+  try {
+    vaultStart = await verifyVaultAtStart(vault);
+  } catch (error) {
+    if (error instanceof VaultStartupRefusal) fail(error.message);
+    throw error;
   }
 
   // The pool exists before the app (and its logger) does, so the handler looks the app up late.
@@ -44,8 +77,15 @@ async function main(): Promise<void> {
     onPoolError: (error) =>
       holder.app?.log.error({ err: error }, 'idle database connection failed'),
   });
-  const app = await buildApp({ database, config });
+  const app = await buildApp({ database, config, vault });
   holder.app = app;
+  if (vaultStart.state === 'unreachable') {
+    app.log.warn(
+      { code: vaultStart.code },
+      'the vault did not answer at start; starting degraded: jobs fail with vault_unavailable ' +
+        'until it does, and revocation still works',
+    );
+  }
 
   let shuttingDown = false;
   const shutdown = (signal: string) => {

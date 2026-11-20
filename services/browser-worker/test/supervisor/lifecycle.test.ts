@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { VaultCallError } from '@aab/vault-client';
 import { jobError } from '../../src/protocol.js';
-import type { KekProvider } from '../../src/session-store/index.js';
+import type { SupervisorVault } from '../../src/vault/gateway.js';
 import {
   createSupervisor,
   LOGIN_LEASE_EXPIRED_REASON,
@@ -18,7 +19,6 @@ import {
   FakeRunner,
   loginConnection,
   queueOperation,
-  testKek,
   testRegistry,
   waitFor,
 } from './helpers.js';
@@ -26,13 +26,11 @@ import type { World } from './helpers.js';
 
 describe('supervisor lifecycle', () => {
   let world: World;
-  let kek: ReturnType<typeof testKek>;
   let runner: FakeRunner;
   let log: ReturnType<typeof captureLogger>;
 
   beforeEach(async () => {
     world = await createWorld();
-    kek = testKek();
     runner = new FakeRunner();
     log = captureLogger();
   });
@@ -42,12 +40,13 @@ describe('supervisor lifecycle', () => {
 
   function supervisor(
     settings: Partial<SupervisorSettings> = {},
-    options: { clock?: () => Date; kek?: KekProvider } = {},
+    options: { clock?: () => Date } = {},
+    vault: SupervisorVault = world.vault,
   ) {
     return createSupervisor({
       repos: world.repos,
       runner,
-      kek: options.kek ?? kek,
+      vault,
       adapters: testRegistry(),
       logger: log.logger,
       ...(options.clock === undefined ? {} : { clock: options.clock }),
@@ -82,21 +81,6 @@ describe('supervisor lifecycle', () => {
       expect((error as Error).message).toContain('sandbox self-check failed');
     });
 
-    it('refuses without a current key', async () => {
-      const empty: KekProvider = {
-        get currentVersion(): number {
-          throw new Error('no key loaded');
-        },
-        wrap: () => Promise.reject(new Error('no key')),
-        unwrap: () => Promise.reject(new Error('no key')),
-      };
-      const error = await supervisor({}, { kek: empty })
-        .start()
-        .catch((e: unknown) => e);
-      expect(error).toBeInstanceOf(SupervisorStartError);
-      expect((error as Error).message).toContain('no current key');
-    });
-
     it('refuses when the database does not answer', async () => {
       await world.close();
       const error = await supervisor()
@@ -107,10 +91,10 @@ describe('supervisor lifecycle', () => {
     });
 
     it('recovers expired leases once, then runs queued jobs from its loop', async () => {
-      const stale = await activeConnection(world, kek);
+      const stale = await activeConnection(world);
       const staleJob = await queueOperation(world, stale.id, { retrySafe: false });
       await claimAsDeadWorker();
-      const fresh = await activeConnection(world, kek);
+      const fresh = await activeConnection(world);
       const freshJob = await queueOperation(world, fresh.id);
 
       const sup = supervisor();
@@ -119,6 +103,104 @@ describe('supervisor lifecycle', () => {
       await waitFor(async () => (await job(freshJob)).status === 'succeeded');
       await sup.stop();
       await expect(sup.start()).rejects.toBeInstanceOf(SupervisorStartError);
+    });
+  });
+
+  it('claims only jobs the API authorized with the vault (requireCapability)', async () => {
+    const connection = await activeConnection(world);
+    const unauthorized = await queueOperation(world, connection.id, { authorize: false });
+    const sup = supervisor();
+    expect(await sup.tick()).toEqual([]);
+    expect((await job(unauthorized)).status).toBe('queued');
+    expect(runner.operationCalls).toHaveLength(0);
+    // Once authorized it is claimed and runs.
+    await world.authorize(unauthorized);
+    expect(await sup.tick()).toEqual([unauthorized]);
+    await sup.idle();
+    expect((await job(unauthorized)).status).toBe('succeeded');
+  });
+
+  describe('a stale handler of an earlier attempt (M2)', () => {
+    /** The vault refuses the first token request, but only after `release()`. */
+    function gatedVault() {
+      const gate = deferred<void>();
+      const vault: SupervisorVault = {
+        isolation: world.vault.isolation,
+        check: () => world.vault.check(),
+        async call(operation, params) {
+          if (operation === 'issueAccessCapability') {
+            await gate.promise;
+            throw new VaultCallError('denied', 'forbidden');
+          }
+          return world.vault.call(operation, params);
+        },
+      };
+      return { vault, release: () => gate.resolve() };
+    }
+
+    /** Claims attempt 1, lets its lease expire, requeues it and claims attempt 2 as the same worker. */
+    async function secondAttempt(settings: Partial<SupervisorSettings> = {}) {
+      const connection = await activeConnection(world);
+      const jobId = await queueOperation(world, connection.id);
+      const { vault, release } = gatedVault();
+      // No heartbeat during the test: the stale handler learns nothing about its lease.
+      const sup = supervisor({ leaseMs: 60_000, heartbeatMs: 30_000, ...settings }, {}, vault);
+      expect(await sup.tick()).toEqual([jobId]);
+      await waitFor(async () => (await job(jobId)).status === 'running');
+      await world.repos.jobs.recoverExpiredLeases({
+        now: new Date(Date.now() + 2 * 60 * 60_000),
+        maxAttempts: 3,
+        capabilityAware: true,
+      });
+      expect((await job(jobId)).status).toBe('queued');
+      return { jobId, sup, release };
+    }
+
+    it('a vault refusal in the stale handler does not end the next attempt', async () => {
+      const { jobId, sup, release } = await secondAttempt();
+      // Attempt 2, same worker id, claimed by another tick of the same worker (not this supervisor).
+      const next = await world.repos.jobs.claimNext({
+        workerId: 'worker-test',
+        leaseMs: 60_000,
+        now: new Date(),
+        requireCapability: true,
+      });
+      expect(next?.attemptCount).toBe(2);
+      release();
+      await sup.idle();
+      const after = await job(jobId);
+      expect(after.status).toBe('running');
+      expect(after.attemptCount).toBe(2);
+      expect(after.error).toBeNull();
+      expect((await auditEvents(world)).map((e) => e.eventType)).not.toContain('operation.failed');
+    });
+
+    it('extending or completing needs the right attempt', async () => {
+      const { jobId, sup, release } = await secondAttempt();
+      await world.repos.jobs.claimNext({
+        workerId: 'worker-test',
+        leaseMs: 60_000,
+        now: new Date(),
+        requireCapability: true,
+      });
+      expect(await world.repos.jobs.extendLease(jobId, 'worker-test', 60_000, new Date(), 1)).toBe(
+        false,
+      );
+      expect(await world.repos.jobs.extendLease(jobId, 'worker-test', 60_000, new Date(), 2)).toBe(
+        true,
+      );
+      release();
+      await sup.idle();
+    });
+
+    it('does not start a second handler for a job id that is still winding down', async () => {
+      const { jobId, sup, release } = await secondAttempt();
+      expect(await sup.tick()).toEqual([]);
+      expect(log.lines.join('')).toContain('claimed again');
+      expect(sup.runningJobIds()).toEqual([jobId]);
+      release();
+      await sup.idle();
+      expect(sup.runningJobIds()).toEqual([]);
     });
   });
 
@@ -135,7 +217,7 @@ describe('supervisor lifecycle', () => {
     };
     const ids: string[] = [];
     for (let index = 0; index < 3; index += 1) {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       ids.push(await queueOperation(world, connection.id));
     }
     const sup = supervisor({ concurrency: 2 });
@@ -152,7 +234,7 @@ describe('supervisor lifecycle', () => {
   });
 
   it('aborts a job whose lease was lost and records nothing over recovery', async () => {
-    const connection = await activeConnection(world, kek);
+    const connection = await activeConnection(world);
     const jobId = await queueOperation(world, connection.id);
     let aborted = false;
     runner.operation = (_spec, signal) =>
@@ -169,18 +251,21 @@ describe('supervisor lifecycle', () => {
     await world.repos.jobs.recoverExpiredLeases({
       now: new Date(Date.now() + 60 * 60_000),
       maxAttempts: 3,
+      capabilityAware: true,
     });
     await sup.idle();
     expect(aborted).toBe(true);
-    // Recovery requeued the retry-safe job; this worker did not overwrite that.
+    // The vault had issued the token, so recovery ended the job instead of requeueing it (a retry
+    // never inherits an issued token); this worker did not overwrite that.
     const after = await job(jobId);
-    expect(after.status).toBe('queued');
+    expect(after.status).toBe('failed');
+    expect(after.error?.code).toBe('worker_failure');
     expect((await auditEvents(world)).map((e) => e.eventType)).not.toContain('operation.failed');
     expect(log.lines.join('')).toContain('lease lost');
   });
 
   it('keeps extending the lease while a job runs', async () => {
-    const connection = await activeConnection(world, kek);
+    const connection = await activeConnection(world);
     const jobId = await queueOperation(world, connection.id);
     const release = deferred<void>();
     runner.operation = async () => {
@@ -201,7 +286,7 @@ describe('supervisor lifecycle', () => {
   });
 
   it('shutdown mid-operation aborts the runner and records the job cancelled', async () => {
-    const connection = await activeConnection(world, kek);
+    const connection = await activeConnection(world);
     const jobId = await queueOperation(world, connection.id);
     runner.operation = (_spec, signal) =>
       new Promise((resolve) => {
@@ -218,14 +303,14 @@ describe('supervisor lifecycle', () => {
     const failed = (await auditEvents(world)).find((e) => e.eventType === 'operation.failed')!;
     expect(failed.metadata).toMatchObject({ jobId, status: 'cancelled', errorCode: 'cancelled' });
     // A stopped supervisor claims nothing.
-    const other = await activeConnection(world, kek);
+    const other = await activeConnection(world);
     await queueOperation(world, other.id);
     expect(await sup.tick()).toEqual([]);
   });
 
   describe('maintenance', () => {
     it('ends expired jobs with an audit event and resets a login connection', async () => {
-      const opConnection = await activeConnection(world, kek);
+      const opConnection = await activeConnection(world);
       const unsafeJob = await queueOperation(world, opConnection.id, { retrySafe: false });
       const { connection: loginConn, jobId: loginJob } = await loginConnection(world);
       await claimAsDeadWorker();
@@ -256,7 +341,7 @@ describe('supervisor lifecycle', () => {
     });
 
     it('requeues a retry-safe operation without an audit event', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id, { retrySafe: true });
       await claimAsDeadWorker();
       const report = await supervisor().maintenance();
@@ -265,8 +350,30 @@ describe('supervisor lifecycle', () => {
       expect((await auditEvents(world)).map((e) => e.eventType)).not.toContain('operation.failed');
     });
 
+    it('does not requeue a retry-safe operation whose token was already issued (capabilityAware)', async () => {
+      const connection = await activeConnection(world);
+      const jobId = await queueOperation(world, connection.id, { retrySafe: true });
+      await claimAsDeadWorker();
+      // The dead worker got as far as a token: the session may have been handed out.
+      const claimed = await job(jobId);
+      const issued = await world.service.rpc('supervisor', 'issueAccessCapability', {
+        capabilityId: claimed.capabilityRef,
+        jobId,
+        workerId: 'dead-worker',
+        attempt: claimed.attemptCount,
+        ttlSeconds: 30,
+      });
+      expect(issued['ok']).toBe(true);
+
+      const report = await supervisor().maintenance();
+      expect(report).toMatchObject({ recovered: 1, requeued: 0 });
+      const after = await job(jobId);
+      expect(after.status).toBe('failed');
+      expect(after.error?.code).toBe('worker_failure');
+    });
+
     it('purges results older than the TTL', async () => {
-      const connection = await activeConnection(world, kek);
+      const connection = await activeConnection(world);
       const jobId = await queueOperation(world, connection.id);
       const sup = supervisor();
       await sup.tick();

@@ -1,12 +1,17 @@
 import { toOperationDescriptors, validateOperationInput } from '@aab/adapter-sdk';
-import { canonicalJson } from '@aab/contracts';
+import {
+  canonicalJson,
+  DEFAULT_TOKEN_TTL_SECONDS,
+  SESSION_SNAPSHOT_SECRET_TYPE,
+} from '@aab/contracts';
 import type { AuditDecision, JobError, JobErrorCode, JobStatus, JsonObject } from '@aab/contracts';
 import { ConflictError, verifyJobArgumentsHash } from '@aab/database';
 import { evaluate } from '@aab/policy-engine';
 import { jobError } from '../protocol.js';
-import { openSnapshot } from '../session-store/index.js';
+import { parseSnapshot } from '../session-store/index.js';
 import type { OpenedSnapshot } from '../session-store/index.js';
 import type { OperationJobOutcome } from '../types.js';
+import { failureCodeFor } from '../vault/gateway.js';
 import { errorFacts, intersectOrigins } from './context.js';
 import type { JobContext } from './context.js';
 import { auditAsWorker, OPERATION_REASONS, transitionIfAllowed } from './records.js';
@@ -141,6 +146,15 @@ async function record(ctx: JobContext, entry: OperationRecord): Promise<boolean>
       } else if (change?.kind === 'invalidate') {
         await transitionIfAllowed(tx, job.connectionId, change.to, change.reason);
         const deleted = await tx.vault.deleteForConnection(job.connectionId, now);
+        // The session is gone, so no unused capability may outlive it (a queued job's capability
+        // was bound to the secret that was just deleted). Same transaction as the delete and the
+        // job's completion. This is a worker-side revoke with no key handling (docs/phase-3.md,
+        // "B2 must guarantee": accepted exception).
+        await tx.capabilities.revokeForConnection({
+          connectionId: job.connectionId,
+          reason: 'session_deleted',
+          now,
+        });
         if (deleted > 0) {
           await auditAsWorker(tx, job, now, {
             eventType: 'vault.secret_deleted',
@@ -154,6 +168,7 @@ async function record(ctx: JobContext, entry: OperationRecord): Promise<boolean>
         }
       }
       await tx.jobs.complete(job.id, ctx.settings.workerId, {
+        attempt: job.attemptCount,
         status: entry.status,
         result: entry.status === 'succeeded' ? (entry.result ?? null) : null,
         error: entry.error,
@@ -325,47 +340,97 @@ export async function runOperationJob(ctx: JobContext): Promise<void> {
   }
   if (ctx.signal.aborted) return stopped(ctx);
 
-  // 4. Exactly one snapshot, for this job's connection.
-  let snapshot: OpenedSnapshot | null;
+  // 4. The vault (ADR-014 sections 4, 5 and 9): the capability the API authorized for this job,
+  // a short-lived token for this worker and attempt, then one read. The vault audits the read
+  // (`vault.secret_read`, actor system). No key is held here and nothing falls back to opening a
+  // secret locally: a vault that cannot answer or refuses ends the job.
+  const capabilityId = job.capabilityRef;
+  if (capabilityId === null) {
+    // A claim requires a capability, so this row was not claimed by this code path: refuse.
+    logger.error({ jobId: job.id }, 'claimed job has no capability; job refused');
+    await record(ctx, failure('vault_denied'));
+    return;
+  }
+  // M3: a connection with no stored session needs a new sign-in, as in Phase 2. Metadata only
+  // (no ciphertext, no key); no capability is issued and the vault is not asked.
   try {
-    snapshot = await openSnapshot(repos, connection, ctx.kek);
+    const secrets = await repos.vault.describeForConnection(connection.id);
+    const stored = secrets.some(
+      (secret) =>
+        secret.secretType === SESSION_SNAPSHOT_SECRET_TYPE &&
+        secret.status === 'active' &&
+        secret.activeVersion !== null,
+    );
+    if (!stored) {
+      await record(ctx, reauth(OPERATION_REASONS.noSnapshot, 'no_snapshot'));
+      return;
+    }
   } catch (error) {
+    logger.error({ jobId: job.id, ...errorFacts(error) }, 'secret metadata could not be read');
+    await record(ctx, failure('worker_failure'));
+    return;
+  }
+  let read;
+  try {
+    const issued = await ctx.vault.call('issueAccessCapability', {
+      capabilityId,
+      jobId: job.id,
+      workerId: ctx.settings.workerId,
+      attempt: job.attemptCount,
+      ttlSeconds: DEFAULT_TOKEN_TTL_SECONDS,
+    });
+    read = await ctx.vault.call('readForWorker', {
+      token: issued.token,
+      jobId: job.id,
+      connectionId: connection.id,
+      operation,
+    });
+  } catch (error) {
+    // A stale handler (its lease was lost, the job may be on a later attempt) records nothing.
+    if (ctx.stopReason() === 'lease_lost') return stopped(ctx);
+    const code = failureCodeFor(error);
+    logger.warn(
+      { jobId: job.id, connectionId: connection.id, jobErrorCode: code, ...errorFacts(error) },
+      'the vault did not provide the session',
+    );
+    await record(ctx, failure(code));
+    return;
+  }
+  // P3-17: the arguments about to run are the arguments the capability was bound to when the API
+  // authorized the job. This also catches a row edited together with its hash (step 0 only
+  // proves the row is consistent with itself).
+  if (read.argumentsHash === null || read.argumentsHash !== job.argumentsHash) {
+    // Drop the reference to the plaintext before anything else (a string cannot be zeroed).
+    (read as { plaintext: string }).plaintext = '';
+    if (ctx.stopReason() === 'lease_lost') return stopped(ctx);
+    logger.warn(
+      { jobId: job.id },
+      'job arguments do not match the hash the vault bound; job refused',
+    );
+    await record(ctx, denied(ARGUMENTS_HASH_MISMATCH));
+    return;
+  }
+  let snapshot: OpenedSnapshot;
+  try {
+    snapshot = parseSnapshot(read.plaintext, {
+      version: read.secretVersion,
+      kekVersion: read.kekVersion,
+    });
+    (read as { plaintext: string }).plaintext = '';
+  } catch (error) {
+    (read as { plaintext: string }).plaintext = '';
     logger.error(
       { jobId: job.id, connectionId: connection.id, ...errorFacts(error) },
-      'session snapshot could not be opened',
+      'the stored session is not a valid storage state',
     );
     await record(ctx, failure('worker_failure'));
     return;
   }
-  if (snapshot === null) {
-    await record(ctx, reauth(OPERATION_REASONS.noSnapshot, 'no_snapshot'));
-    return;
-  }
 
-  // 5. Record the read, then hand the job to the sandbox.
+  // 5. Hand the job to the sandbox.
   let outcome: OperationJobOutcome | null = null;
   try {
-    try {
-      const now = ctx.clock();
-      await repos.transaction(async (tx) => {
-        await tx.vault.touchAccessed(snapshot.vaultEntryId, now);
-        await auditAsWorker(tx, job, now, {
-          eventType: 'vault.secret_read',
-          metadata: {
-            jobId: job.id,
-            connectionId: connection.id,
-            vaultEntryId: snapshot.vaultEntryId,
-            snapshotVersion: snapshot.version,
-            keyVersion: snapshot.kekVersion,
-            purpose: 'operation',
-          },
-        });
-      });
-    } catch (error) {
-      logger.error({ jobId: job.id, ...errorFacts(error) }, 'snapshot read could not be audited');
-      outcome = { status: 'failed', error: jobError('worker_failure') };
-    }
-    if (outcome === null && !ctx.signal.aborted) {
+    if (!ctx.signal.aborted) {
       try {
         outcome = await ctx.runner.runOperation(
           {

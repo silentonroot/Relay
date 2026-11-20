@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { chmod, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,10 +6,17 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { generateLocalKek } from '@aab/crypto';
 import { createTestDatabase } from '@aab/database/testing';
-import { afterAll, describe, expect, it } from 'vitest';
-import { ConfigError, loadConfig } from '../src/config.js';
+import { afterAll, describe, expect, it, vi } from 'vitest';
+import { ConfigError, loadConfig, requireVaultSocket } from '../src/config.js';
 import { createOwner, OwnerInputError } from '../src/owner.js';
+import { createVaultGateway, VaultStartupRefusal } from '../src/vault/gateway.js';
+import { verifyVaultAtStart } from '../src/vault/startup.js';
+import { startFakeVault } from './fake-vault.js';
+import type { FakeVault } from './fake-vault.js';
 import { TEST_SCRYPT } from './helpers.js';
+
+// Tests here start tsx child processes and hash passwords; under load 5 s is not enough.
+vi.setConfig({ testTimeout: 30_000 });
 
 const run = promisify(execFile);
 const SERVICE_DIR = fileURLToPath(new URL('..', import.meta.url));
@@ -22,6 +29,10 @@ describe('loadConfig', () => {
       host: '127.0.0.1',
       port: 4000,
       kekDir: undefined,
+      vaultSocket: undefined,
+      vaultIsolation: 'separate-uid',
+      vaultAuthorizationTtlSeconds: 600,
+      vaultCallTimeoutMs: 5_000,
       sessionTtlMinutes: 480,
       cookieSecure: true,
       logLevel: 'info',
@@ -112,6 +123,151 @@ describe('loadConfig', () => {
   });
 });
 
+describe('vault settings', () => {
+  it('parses the vault settings and keeps the safe defaults', () => {
+    expect(
+      loadConfig({
+        DATABASE_URL: DB_URL,
+        AAB_VAULT_SOCKET: '/run/aab-vault/api/vault.sock',
+        AAB_VAULT_ISOLATION: 'shared-uid',
+        AAB_VAULT_AUTHORIZATION_TTL_SECONDS: '900',
+        AAB_VAULT_CALL_TIMEOUT_MS: '2500',
+      }),
+    ).toMatchObject({
+      vaultSocket: '/run/aab-vault/api/vault.sock',
+      vaultIsolation: 'shared-uid',
+      vaultAuthorizationTtlSeconds: 900,
+      vaultCallTimeoutMs: 2500,
+    });
+    // Blank is "not set", as everywhere else in this file's schema.
+    expect(
+      loadConfig({ DATABASE_URL: DB_URL, AAB_VAULT_SOCKET: '', AAB_VAULT_ISOLATION: '' }),
+    ).toMatchObject({ vaultSocket: undefined, vaultIsolation: 'separate-uid' });
+  });
+
+  it('refuses a missing socket where the vault is required, and bad values, naming only variables', () => {
+    expect(() => requireVaultSocket(loadConfig({ DATABASE_URL: DB_URL }))).toThrow(
+      /AAB_VAULT_SOCKET: is required/,
+    );
+    for (const [name, value] of [
+      ['AAB_VAULT_SOCKET', 'relative/vault.sock'],
+      ['AAB_VAULT_ISOLATION', 'whatever'],
+      ['AAB_VAULT_AUTHORIZATION_TTL_SECONDS', '9'],
+      ['AAB_VAULT_AUTHORIZATION_TTL_SECONDS', '3601'],
+      ['AAB_VAULT_AUTHORIZATION_TTL_SECONDS', '1e2'],
+      ['AAB_VAULT_AUTHORIZATION_TTL_SECONDS', '600.5'],
+      ['AAB_VAULT_CALL_TIMEOUT_MS', '99'],
+      ['AAB_VAULT_CALL_TIMEOUT_MS', 'soon'],
+    ] as const) {
+      let message = '';
+      try {
+        loadConfig({ DATABASE_URL: DB_URL, [name]: value });
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message, `${name}=${value}`).toContain(name);
+      expect(message).not.toContain(value);
+    }
+  });
+});
+
+describe('the start-up hello check (ADR-014 section 3, P3-1)', () => {
+  const vaults: FakeVault[] = [];
+  const directories: string[] = [];
+  afterAll(async () => {
+    for (const vault of vaults) await vault.close();
+    for (const directory of directories) await rm(directory, { recursive: true, force: true });
+  });
+  const gatewayFor = async (
+    hello: Parameters<typeof startFakeVault>[0] extends infer O
+      ? O extends { hello?: infer H }
+        ? H
+        : never
+      : never,
+    isolation: 'separate-uid' | 'shared-uid',
+  ) => {
+    const vault = await startFakeVault({ hello });
+    vaults.push(vault);
+    return createVaultGateway({ socketPath: vault.socketPath, isolation, timeoutMs: 500 });
+  };
+
+  it('accepts an api-role vault whose key directory this user cannot open', async () => {
+    const gateway = await gatewayFor(
+      { isolation: 'separate-uid', keyDirectory: '/nonexistent/aab-keys' },
+      'separate-uid',
+    );
+    expect(await verifyVaultAtStart(gateway)).toEqual({ state: 'ready' });
+    expect(gateway.state()).toBe('ready');
+  });
+
+  it("refuses to start when the vault's key directory is readable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'aab-readable-keys-'));
+    directories.push(directory);
+    const gateway = await gatewayFor(
+      { isolation: 'separate-uid', keyDirectory: directory },
+      'separate-uid',
+    );
+    await expect(verifyVaultAtStart(gateway)).rejects.toBeInstanceOf(VaultStartupRefusal);
+    await expect(verifyVaultAtStart(gateway)).rejects.toThrow(directory);
+    expect(gateway.state()).toBe('refused');
+    // A refused vault is never used afterwards, whatever it would answer.
+    await expect(
+      gateway.authorizeJobAccess('8a1b6f5e-3c47-4b0e-9d52-0f1c2e3d4a5b', 600),
+    ).rejects.toBeInstanceOf(VaultStartupRefusal);
+  });
+
+  it('starts with a readable key directory only in the explicit shared-uid mode', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'aab-readable-keys-'));
+    directories.push(directory);
+    const gateway = await gatewayFor(
+      { isolation: 'shared-uid', keyDirectory: directory },
+      'shared-uid',
+    );
+    expect(await verifyVaultAtStart(gateway)).toEqual({ state: 'ready' });
+  });
+
+  it('refuses a vault that answers as another role', async () => {
+    for (const role of ['supervisor', 'admin']) {
+      const gateway = await gatewayFor({ role }, 'shared-uid');
+      await expect(verifyVaultAtStart(gateway)).rejects.toThrow(/other than api/);
+    }
+  });
+
+  it('refuses a vault whose isolation mode differs from the configured one', async () => {
+    const gateway = await gatewayFor({ isolation: 'shared-uid' }, 'separate-uid');
+    await expect(verifyVaultAtStart(gateway)).rejects.toThrow(/AAB_VAULT_ISOLATION/);
+  });
+
+  it('starts degraded when the vault does not answer, and never authorizes through an unchecked vault', async () => {
+    const gateway = createVaultGateway({
+      socketPath: '/nonexistent/aab-vault/api/vault.sock',
+      isolation: 'separate-uid',
+      timeoutMs: 300,
+    });
+    expect(await verifyVaultAtStart(gateway)).toEqual({
+      state: 'unreachable',
+      code: 'unreachable',
+    });
+    expect(gateway.state()).toBe('unverified');
+    await expect(
+      gateway.authorizeJobAccess('8a1b6f5e-3c47-4b0e-9d52-0f1c2e3d4a5b', 600),
+    ).rejects.toMatchObject({ kind: 'unavailable' });
+
+    // A vault that answers wrongly on the first hello is a refusal, even when it came up late.
+    const late = await startFakeVault({ hello: { role: 'admin' } });
+    vaults.push(late);
+    const lateGateway = createVaultGateway({
+      socketPath: late.socketPath,
+      isolation: 'shared-uid',
+      timeoutMs: 300,
+    });
+    await expect(
+      lateGateway.authorizeJobAccess('8a1b6f5e-3c47-4b0e-9d52-0f1c2e3d4a5b', 600),
+    ).rejects.toBeInstanceOf(VaultStartupRefusal);
+    expect(late.requests.map((request) => request.operation)).toEqual(['hello']);
+  });
+});
+
 describe('main.ts startup', () => {
   const directories: string[] = [];
   afterAll(async () => {
@@ -149,6 +305,77 @@ describe('main.ts startup', () => {
     expect(result.stderr).not.toContain(directory);
     expect(result.stderr).not.toContain('synthetic-db-password');
   });
+
+  it('refuses to start without AAB_VAULT_SOCKET', async () => {
+    const result = await start({ DATABASE_URL: DB_URL });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('AAB_VAULT_SOCKET: is required');
+    expect(result.stderr).not.toContain('synthetic-db-password');
+  }, 30_000);
+
+  it("refuses to start when the vault's key directory is readable", async () => {
+    const keys = await mkdtemp(join(tmpdir(), 'aab-readable-keys-'));
+    directories.push(keys);
+    const vault = await startFakeVault({
+      hello: { isolation: 'separate-uid', keyDirectory: keys },
+    });
+    try {
+      const result = await start({
+        DATABASE_URL: DB_URL,
+        AAB_VAULT_SOCKET: vault.socketPath,
+        AAB_VAULT_ISOLATION: 'separate-uid',
+      });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("the API can open the vault's key directory");
+      expect(result.stderr).toContain(keys);
+      expect(result.stderr).not.toContain('synthetic-db-password');
+    } finally {
+      await vault.close();
+    }
+  }, 30_000);
+
+  it('refuses to start when the vault answers as the wrong role', async () => {
+    const vault = await startFakeVault({ hello: { role: 'supervisor', isolation: 'shared-uid' } });
+    try {
+      const result = await start({
+        DATABASE_URL: DB_URL,
+        AAB_VAULT_SOCKET: vault.socketPath,
+        AAB_VAULT_ISOLATION: 'shared-uid',
+      });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('role other than api');
+    } finally {
+      await vault.close();
+    }
+  }, 30_000);
+
+  it('starts degraded, and says so, when the vault does not answer', async () => {
+    const child = spawn(process.execPath, ['--import', 'tsx', 'src/main.ts'], {
+      cwd: SERVICE_DIR,
+      env: {
+        PATH: process.env.PATH ?? '',
+        DATABASE_URL: DB_URL,
+        AAB_VAULT_SOCKET: '/nonexistent/aab-vault/api/vault.sock',
+        AAB_PORT: String(40_000 + (process.pid % 20_000)),
+        AAB_VAULT_ISOLATION: 'shared-uid',
+        AAB_VAULT_CALL_TIMEOUT_MS: '500',
+      },
+    });
+    let output = '';
+    child.stdout.on('data', (chunk: Buffer) => (output += chunk.toString('utf8')));
+    child.stderr.on('data', (chunk: Buffer) => (output += chunk.toString('utf8')));
+    try {
+      const deadline = Date.now() + 15_000;
+      while (!output.includes('starting degraded') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(output).toContain('starting degraded');
+      expect(child.exitCode).toBeNull();
+    } finally {
+      child.kill('SIGTERM');
+      await new Promise((resolve) => child.once('exit', resolve));
+    }
+  }, 40_000);
 });
 
 describe('createOwner (the create-owner command)', () => {
@@ -185,5 +412,5 @@ describe('createOwner (the create-owner command)', () => {
     } finally {
       await database.close();
     }
-  });
+  }, 60_000);
 });

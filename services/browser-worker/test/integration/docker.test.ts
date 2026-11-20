@@ -1,4 +1,8 @@
 import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { resolveJobRunnerConfig } from '../../src/sandbox/config.js';
 import { buildDockerRunArgs } from '../../src/sandbox/docker.js';
@@ -110,6 +114,31 @@ describe.skipIf(reason !== null)(title, () => {
     expect(lines).toContain('lo');
     expect(lines.filter((line) => /^(eth|en|wl|veth)/.test(line))).toEqual([]);
     expect(lines.at(-1)).toBe('0');
+  }, 60_000);
+
+  it('the vault socket directory is absent inside the container (P3-14)', async () => {
+    // A vault-shaped directory with a listening socket on the host; the launcher's flags mount
+    // only the job directory, so none of it can exist in the container.
+    const vaultDir = mkdtempSync(
+      path.join(process.env['XDG_RUNTIME_DIR'] ?? os.tmpdir(), 'aab-v-d-'),
+    );
+    mkdirSync(path.join(vaultDir, 'supervisor'));
+    const socketPath = path.join(vaultDir, 'supervisor', 'vault.sock');
+    const server = net.createServer((socket) => socket.end());
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    try {
+      const output = probe(
+        [
+          `[ -e ${vaultDir} ] && echo dir-present || echo dir-absent`,
+          `[ -e ${socketPath} ] && echo socket-present || echo socket-absent`,
+          'env | grep -c -E "AAB_VAULT|vault.sock" || true',
+        ].join('; '),
+      );
+      expect(output.trim().split('\n')).toEqual(['dir-absent', 'socket-absent', '0']);
+    } finally {
+      server.close();
+      rmSync(vaultDir, { recursive: true, force: true });
+    }
   }, 60_000);
 
   it('refuses user namespaces under the default profiles', () => {

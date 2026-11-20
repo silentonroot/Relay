@@ -31,7 +31,26 @@ const EnvSchema = z.object({
         message: 'expected a postgres:// or postgresql:// connection string',
       }),
   ),
-  AAB_KEK_DIR: z.preprocess(blankToUndefined, AbsolutePath),
+  // The supervisor-role socket of the vault (ADR-014 section 1).
+  AAB_VAULT_SOCKET: z.preprocess(
+    blankToUndefined,
+    z
+      .string({ error: 'is required (the supervisor-role socket of the vault)' })
+      .max(4096)
+      .refine((value) => isAbsolute(value) && !value.includes('\0'), {
+        message: 'expected an absolute path',
+      }),
+  ),
+  // Mirrors the vault's AAB_VAULT_ISOLATION; the vault's `hello` must agree. In `separate-uid`
+  // the supervisor refuses to start if it can open the vault's key directory.
+  AAB_VAULT_ISOLATION: z.preprocess(
+    blankToUndefined,
+    z
+      .enum(['separate-uid', 'shared-uid'], { error: 'expected "separate-uid" or "shared-uid"' })
+      .default('separate-uid'),
+  ),
+  // Per vault call, connect included (ADR-014 section 9: five seconds).
+  AAB_VAULT_CALL_TIMEOUT_MS: int(100, 60_000, 5_000),
   AAB_WORKER_SANDBOX: z.preprocess(
     blankToUndefined,
     z.enum(['bubblewrap', 'docker', 'unsafe-process']).default('bubblewrap'),
@@ -55,7 +74,11 @@ const EnvSchema = z.object({
 
 export interface WorkerConfig {
   databaseUrl: string;
-  kekDir: string;
+  /** Path of the vault's supervisor-role socket. */
+  vaultSocket: string;
+  vaultIsolation: 'separate-uid' | 'shared-uid';
+  /** Timeout of one vault call, in milliseconds. */
+  vaultCallTimeoutMs: number;
   sandbox: 'bubblewrap' | 'docker' | 'unsafe-process';
   concurrency: number;
   pollIntervalMs: number;
@@ -76,6 +99,14 @@ export class ConfigError extends Error {
 
 /** Parses the environment. Throws ConfigError listing variable names and problems only. */
 export function loadWorkerConfig(env: Record<string, string | undefined>): WorkerConfig {
+  // Phase 3 inverts the old requirement: the supervisor holds no key (P3-1) and refuses to start
+  // when a key directory is configured. Checked first, so no other problem hides it; the value is
+  // never used or echoed.
+  if (typeof env['AAB_KEK_DIR'] === 'string' && env['AAB_KEK_DIR'].trim() !== '') {
+    throw new ConfigError([
+      'AAB_KEK_DIR: must not be set for the browser worker; only the vault reads key material',
+    ]);
+  }
   const result = EnvSchema.safeParse(env);
   if (!result.success) {
     throw new ConfigError(
@@ -83,9 +114,18 @@ export function loadWorkerConfig(env: Record<string, string | undefined>): Worke
     );
   }
   const data = result.data;
+  if (data.AAB_WORKER_SANDBOX === 'unsafe-process' && data.AAB_VAULT_ISOLATION !== 'shared-uid') {
+    // The runner then shares the supervisor's user, so it could open the vault's supervisor
+    // socket: the separate-uid claim (P3-14) cannot hold. Allowed only where nothing is claimed.
+    throw new ConfigError([
+      'AAB_WORKER_SANDBOX: unsafe-process is allowed only with AAB_VAULT_ISOLATION=shared-uid',
+    ]);
+  }
   return {
     databaseUrl: data.DATABASE_URL,
-    kekDir: data.AAB_KEK_DIR,
+    vaultSocket: data.AAB_VAULT_SOCKET,
+    vaultIsolation: data.AAB_VAULT_ISOLATION,
+    vaultCallTimeoutMs: data.AAB_VAULT_CALL_TIMEOUT_MS,
     sandbox: data.AAB_WORKER_SANDBOX,
     concurrency: data.AAB_WORKER_CONCURRENCY,
     pollIntervalMs: data.AAB_WORKER_POLL_MS,

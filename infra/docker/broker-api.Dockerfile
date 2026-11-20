@@ -24,6 +24,7 @@ RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/contracts/package.json packages/contracts/
 COPY packages/crypto/package.json packages/crypto/
+COPY packages/vault-client/package.json packages/vault-client/
 COPY packages/audit/package.json packages/audit/
 COPY packages/policy-engine/package.json packages/policy-engine/
 COPY packages/database/package.json packages/database/
@@ -40,6 +41,7 @@ RUN pnpm install --frozen-lockfile --prod --filter "@aab/broker-api..."
 COPY tsconfig.base.json ./
 COPY packages/contracts packages/contracts
 COPY packages/crypto packages/crypto
+COPY packages/vault-client packages/vault-client
 COPY packages/audit packages/audit
 COPY packages/policy-engine packages/policy-engine
 COPY packages/database packages/database

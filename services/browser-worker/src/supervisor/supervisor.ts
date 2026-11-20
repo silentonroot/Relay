@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { VaultCallError } from '@aab/vault-client';
 import type { ExecutionJob } from '@aab/database';
+import { VaultStartupRefusal } from '../vault/gateway.js';
 import { errorFacts, resolveSupervisorSettings } from './context.js';
 import type { JobContext, StopReason, SupervisorDeps } from './context.js';
 import { runLoginJob } from './login.js';
@@ -45,7 +47,7 @@ interface RunningJob {
 export function createSupervisor(deps: SupervisorDeps): Supervisor {
   const settings = resolveSupervisorSettings(deps.settings);
   const clock = deps.clock ?? (() => new Date());
-  const { repos, runner, kek, adapters, logger } = deps;
+  const { repos, runner, vault, adapters, logger } = deps;
   const running = new Map<string, RunningJob>();
 
   let state: 'created' | 'running' | 'stopping' | 'stopped' = 'created';
@@ -53,6 +55,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
   let ticking: Promise<string[]> | null = null;
   let maintaining: Promise<MaintenanceReport> | null = null;
   let lastMaintenanceMs = 0;
+  let vaultState: 'unknown' | 'ready' | 'unreachable' | 'refused' = 'unknown';
 
   async function checkStartUp(): Promise<void> {
     try {
@@ -61,12 +64,17 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
       throw new SupervisorStartError('refusing to start: the database did not answer');
     }
     try {
-      const version = kek.currentVersion;
-      if (!Number.isSafeInteger(version) || version < 1) throw new Error('no key');
-    } catch {
-      throw new SupervisorStartError(
-        'refusing to start: the key-encryption key provider has no current key',
-      );
+      await vault.check();
+      vaultState = 'ready';
+    } catch (error) {
+      if (error instanceof VaultStartupRefusal) {
+        // The vault answered and is wrong for this worker: a configuration error.
+        throw new SupervisorStartError(`refusing to start: ${error.message}`);
+      }
+      // The vault did not answer: start, claim nothing while it is down (P3-11, ADR-014 section 9)
+      // and check again before every claim.
+      vaultState = 'unreachable';
+      logger.warn(errorFacts(error), 'the vault did not answer; no job is claimed until it does');
     }
     try {
       await runner.selfCheck();
@@ -77,7 +85,17 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     }
   }
 
-  function launch(job: ExecutionJob): void {
+  /** Starts a handler for a claimed job. False when one for the same id is still winding down. */
+  function launch(job: ExecutionJob): boolean {
+    const stale = running.get(job.id);
+    if (stale !== undefined) {
+      // The same job id was claimed again while an earlier attempt's handler is still winding
+      // down (its lease was lost and recovery requeued it). Stop the old one and do not start a
+      // second handler for the id: the new claim's lease runs out and recovery decides again.
+      logger.warn({ jobId: job.id }, 'job claimed again while its earlier attempt still runs');
+      stale.stop('lease_lost');
+      return false;
+    }
     const controller = new AbortController();
     let reason: StopReason | null = null;
     const stop = (why: StopReason) => {
@@ -96,6 +114,9 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
           settings.workerId,
           settings.leaseMs,
           clock(),
+          // This attempt only: a stale handler of an earlier attempt must not keep a later one's
+          // lease alive (same worker id, requeued and claimed again).
+          job.attemptCount,
         );
         if (!held) {
           logger.warn({ jobId: job.id }, 'job lease lost; aborting');
@@ -125,7 +146,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     const ctx: JobContext = {
       repos,
       runner,
-      kek,
+      vault,
       adapters,
       clock,
       logger,
@@ -146,11 +167,40 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         logger.error({ jobId: job.id, ...errorFacts(error) }, 'job handler failed');
       } finally {
         clearInterval(heartbeat);
-        running.delete(job.id);
+        // Only this claim's own entry: a stale handler must not remove a newer one.
+        if (running.get(job.id)?.job === job) running.delete(job.id);
         if (state === 'running') setImmediate(() => void tick());
       }
     })();
     running.set(job.id, { job, stop, done });
+    return true;
+  }
+
+  /** Checks the vault before a claim; logs only when its state changes. */
+  async function vaultReady(): Promise<boolean> {
+    try {
+      await vault.check();
+      if (vaultState !== 'ready') logger.info('the vault answers; claiming jobs');
+      vaultState = 'ready';
+      return true;
+    } catch (error) {
+      const next = error instanceof VaultStartupRefusal ? 'refused' : 'unreachable';
+      if (vaultState !== next) {
+        if (error instanceof VaultStartupRefusal) {
+          logger.error({ reason: error.message }, 'the vault is misconfigured; no job is claimed');
+        } else {
+          logger.warn(
+            {
+              ...errorFacts(error),
+              ...(error instanceof VaultCallError ? { vaultCode: error.code } : {}),
+            },
+            'the vault is unreachable; no job is claimed',
+          );
+        }
+      }
+      vaultState = next;
+      return false;
+    }
   }
 
   function tick(): Promise<string[]> {
@@ -158,20 +208,23 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     ticking = (async () => {
       const started: string[] = [];
       while ((state === 'created' || state === 'running') && running.size < settings.concurrency) {
+        // P3-11: no claim while the vault is unreachable or is not what this worker may use.
+        if (!(await vaultReady())) break;
         let job: ExecutionJob | null;
         try {
           job = await repos.jobs.claimNext({
             workerId: settings.workerId,
             leaseMs: settings.leaseMs,
             now: clock(),
+            // Phase 3: only a job the API authorized with the vault (`capability_ref`) is claimed.
+            requireCapability: true,
           });
         } catch (error) {
           logger.error(errorFacts(error), 'claiming a job failed');
           break;
         }
         if (job === null) break;
-        launch(job);
-        started.push(job.id);
+        if (launch(job)) started.push(job.id);
       }
       return started;
     })().finally(() => {
@@ -187,6 +240,9 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
       const changed = await repos.jobs.recoverExpiredLeases({
         now,
         maxAttempts: settings.maxAttempts,
+        // Phase 3: a job whose token was issued may have been read; only never-issued
+        // capabilities are requeued (ADR-014 section 6).
+        capabilityAware: true,
       });
       for (const job of changed) {
         if (job.status === 'queued') {

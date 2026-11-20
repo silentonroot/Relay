@@ -31,6 +31,9 @@ import type { LogDestination } from './logging.js';
 import { registerExecutionRoutes } from './routes/execution.js';
 import { registerResourceRoutes } from './routes/resources.js';
 import { registerSystemRoutes, SERVICE_VERSION } from './routes/system.js';
+import { registerVaultRoutes } from './routes/vault.js';
+import { sweepUnauthorizedJobs } from './vault/authorize.js';
+import type { VaultGateway } from './vault/gateway.js';
 
 export interface BuildAppDeps {
   database: DatabaseHandle;
@@ -51,6 +54,16 @@ export interface BuildAppDeps {
    * `loginPath`); the API never runs them. Defaults to a registry holding the Northstar adapter.
    */
   adapters?: AdapterRegistry;
+  /**
+   * The vault as the `api` role (ADR-014). `main.ts` always passes one; tests of the Phase 2 path
+   * and `dev:memory` omit it, and then no job is authorized (see `AppContext.vault`).
+   */
+  vault?: VaultGateway;
+  /**
+   * How often the sweep ends queued jobs the vault never authorized (ADR-014 section 5). Runs only
+   * with a vault. Default 15 s; 0 turns the timer off (tests call `app.sweepVaultAuthorizations`).
+   */
+  vaultSweepIntervalMs?: number;
 }
 
 function defaultAdapterRegistry(): AdapterRegistry {
@@ -113,6 +126,7 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
     config,
     adapters: deps.adapters ?? defaultAdapterRegistry(),
     clock,
+    vault: deps.vault,
     passwordParams: deps.passwordParams,
     passwords,
     dummyPasswordHash: await passwords.hash(generateToken()),
@@ -126,6 +140,33 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
   app.addHook('onClose', async () => {
     await Promise.allSettled([...background]);
   });
+  const sweep = () => sweepUnauthorizedJobs(ctx, app.log);
+  app.decorate('sweepVaultAuthorizations', sweep);
+  const sweepEvery = deps.vaultSweepIntervalMs ?? 15_000;
+  if (deps.vault !== undefined && sweepEvery > 0) {
+    let running = false;
+    const timer = setInterval(() => {
+      if (running) return;
+      running = true;
+      sweep()
+        .catch((error: unknown) =>
+          app.log.error({ err: error }, 'vault authorization sweep failed'),
+        )
+        .finally(() => {
+          running = false;
+        });
+    }, sweepEvery);
+    timer.unref();
+    app.addHook('onClose', async () => clearInterval(timer));
+  }
+  if (deps.vault?.isolation === 'shared-uid') {
+    // ADR-014 section 2: nothing in the vault's design protects against code running as the
+    // same user. Said once at start so an operator cannot miss which mode this is.
+    app.log.warn(
+      'vault isolation is shared-uid: any process of this user can reach every vault socket ' +
+        'and read the key files; use separate users outside development',
+    );
+  }
 
   app.decorate('routeTable', []);
   app.decorateRequest('auth', null);
@@ -192,6 +233,7 @@ export async function buildApp(deps: BuildAppDeps): Promise<FastifyInstance> {
       registerAuthRoutes(typed, ctx, limits);
       registerResourceRoutes(typed, ctx);
       registerExecutionRoutes(typed, ctx, limits);
+      registerVaultRoutes(typed, ctx);
     },
     { prefix: API_PREFIX },
   );

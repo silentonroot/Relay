@@ -1,48 +1,23 @@
-import { canonicalJson, checkPlainJson, SESSION_SNAPSHOT_SECRET_TYPE } from '@aab/contracts';
-import type { Connection } from '@aab/contracts';
-import { LocalFileKekProvider, openSecret, sealSecret } from '@aab/crypto';
-import type { KekProvider, SecretAad } from '@aab/crypto';
-import type { Repositories } from '@aab/database';
+import { canonicalJson, checkPlainJson, VAULT_MAX_PLAINTEXT_BYTES } from '@aab/contracts';
 import { StorageStateSchema } from '../protocol.js';
 import type { StorageState } from '../types.js';
 
 /*
- * The session store: the only code in the worker that seals or opens a secret (ADR-002,
- * ADR-003, ADR-013). Everything it returns to callers is either metadata or a short-lived
- * plaintext snapshot with a `dispose()`.
- *
- * Associated data is always rebuilt from the connection row the caller loaded, never from
- * anything stored beside the ciphertext, so a ciphertext row moved onto another connection,
- * owner, organization, secret or version fails to open.
+ * The session store: parsing, validation, origin filtering and the size cap for a storage
+ * state. Sealing and opening are the vault's alone (ADR-014): this module holds no key, imports
+ * no crypto and never sees a ciphertext. What it hands to callers is either a base64url
+ * plaintext to send to the vault (`encodeSnapshot`) or a short-lived parsed state with a
+ * `dispose()` (`parseSnapshot`).
  */
 
-/** The key provider type, re-exported so no other module needs to import the crypto package. */
-export type { KekProvider };
-
-/**
- * Loads the local key-encryption keys (ADR-003). Fails closed on an unsafe directory or key
- * file; the error names the path, never key material.
- */
-export function loadLocalKek(directory: string): Promise<KekProvider> {
-  return LocalFileKekProvider.load(directory);
-}
-
-/** Largest serialized snapshot that will be sealed. Well under the runner's job line cap. */
-export const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
-
-/** The connection fields the associated data is built from. */
-export type SnapshotConnection = Pick<Connection, 'id' | 'organizationId' | 'ownerUserId'>;
-
-export interface StoredSnapshot {
-  vaultEntryId: string;
-  version: number;
-  kekVersion: number;
-}
+/** Largest serialized snapshot that will be sent to the vault. Well under the runner's job line cap. */
+export const MAX_SNAPSHOT_BYTES = VAULT_MAX_PLAINTEXT_BYTES;
 
 export interface OpenedSnapshot {
   readonly storageState: StorageState;
-  readonly vaultEntryId: string;
+  /** Version of the stored session the vault read (its `secretVersion`). */
   readonly version: number;
+  /** Version of the key-encryption key the vault opened it with (its `kekVersion`). */
   readonly kekVersion: number;
   /** Zeroes the plaintext buffer and drops the parsed state's contents. Idempotent. */
   dispose(): void;
@@ -57,118 +32,62 @@ export class SnapshotTooLargeError extends Error {
 }
 
 /**
- * A stored snapshot could not be decrypted or did not validate. Deliberately generic: it
- * carries no plaintext, no ciphertext and no `cause`.
+ * A snapshot did not validate as a storage state. Deliberately generic: it carries no
+ * plaintext and no `cause`.
  */
 export class SnapshotOpenError extends Error {
   override readonly name = 'SnapshotOpenError';
-  readonly reason: 'decrypt' | 'invalid';
-  constructor(reason: 'decrypt' | 'invalid') {
-    super(
-      reason === 'decrypt'
-        ? 'the session snapshot could not be decrypted'
-        : 'the session snapshot is not a valid storage state',
-    );
-    this.reason = reason;
+  readonly reason = 'invalid' as const;
+  constructor() {
+    super('the session snapshot is not a valid storage state');
   }
 }
 
-function aadFor(connection: SnapshotConnection, secretId: string, version: number): SecretAad {
-  return {
-    organizationId: connection.organizationId,
-    userId: connection.ownerUserId,
-    connectionId: connection.id,
-    secretId,
-    secretType: SESSION_SNAPSHOT_SECRET_TYPE,
-    secretVersion: version,
-  };
-}
-
-export interface StoreSnapshotInput {
-  connection: SnapshotConnection;
-  storageState: StorageState;
-  kek: KekProvider;
-  now: Date;
-}
-
 /**
- * Seals a storage state and stores it as the connection's active snapshot. Pass the
- * repositories of the caller's transaction to make the write atomic with other changes.
- * Returns metadata only.
+ * Validates a storage state and serializes it for `completeLogin`: canonical JSON, base64url.
+ * Throws {@link SnapshotOpenError} for an invalid state and {@link SnapshotTooLargeError} over
+ * the cap, before anything is sent. The intermediate buffers are zeroed; the returned string is
+ * the caller's to send and drop (JavaScript cannot zero a string).
  */
-export async function storeSnapshot(
-  repos: Repositories,
-  input: StoreSnapshotInput,
-): Promise<StoredSnapshot> {
-  // Validate before sealing so nothing unparseable is ever stored.
-  const parsed = StorageStateSchema.safeParse(input.storageState);
-  if (!parsed.success) throw new SnapshotOpenError('invalid');
+export function encodeSnapshot(state: StorageState): string {
+  const parsed = StorageStateSchema.safeParse(state);
+  if (!parsed.success) throw new SnapshotOpenError();
   const plaintext = Buffer.from(canonicalJson(parsed.data), 'utf8');
   try {
     if (plaintext.byteLength > MAX_SNAPSHOT_BYTES) throw new SnapshotTooLargeError();
-    const ensured = await repos.vault.ensureSecret({
-      connectionId: input.connection.id,
-      secretType: SESSION_SNAPSHOT_SECRET_TYPE,
-      now: input.now,
-    });
-    const version = ensured.nextVersion;
-    const sealed = await sealSecret({
-      plaintext,
-      aad: aadFor(input.connection, ensured.secretId, version),
-      kek: input.kek,
-    });
-    await repos.vault.putVersion({
-      secretId: ensured.secretId,
-      version,
-      sealed,
-      now: input.now,
-    });
-    return { vaultEntryId: ensured.secretId, version, kekVersion: sealed.kekVersion };
+    return plaintext.toString('base64url');
   } finally {
     plaintext.fill(0);
   }
 }
 
 /**
- * Opens the connection's active snapshot, or returns null when there is none. Raises
- * {@link SnapshotOpenError} when it cannot be decrypted or does not validate.
+ * Parses the plaintext `readForWorker` returned (base64url of the storage-state JSON).
+ * Raises {@link SnapshotOpenError} when it does not validate.
  *
- * About `dispose()`: the decrypted buffer is zeroed as soon as it has been parsed, and
+ * About `dispose()`: the decoded buffer is zeroed as soon as it has been parsed, and
  * `dispose()` zeroes it again and empties the parsed state's arrays. JavaScript cannot
- * guarantee more than that: the parsed cookie values are immutable strings that stay in the
- * heap until the garbage collector reclaims them, the engine may have copied buffers while
- * moving them, and the runner's stdin pipe held its own copy.
+ * guarantee more than that: the base64url string the vault client received and the parsed
+ * cookie values are immutable strings that stay in the heap until the garbage collector reclaims
+ * them, the engine may have copied buffers while moving them, and the runner's stdin pipe holds
+ * its own copy.
  */
-export async function openSnapshot(
-  repos: Repositories,
-  connection: SnapshotConnection,
-  kek: KekProvider,
-): Promise<OpenedSnapshot | null> {
-  const active = await repos.vault.getActive(connection.id, SESSION_SNAPSHOT_SECRET_TYPE);
-  if (active === null) return null;
-
-  let plaintext: Buffer;
-  try {
-    plaintext = await openSecret({
-      sealed: active.sealed,
-      aad: aadFor(connection, active.secretId, active.version),
-      kek,
-    });
-  } catch {
-    throw new SnapshotOpenError('decrypt');
-  }
-
+export function parseSnapshot(
+  plaintextBase64Url: string,
+  meta: { version: number; kekVersion: number },
+): OpenedSnapshot {
+  const plaintext = Buffer.from(plaintextBase64Url, 'base64url');
   let state: StorageState;
   try {
     let value: unknown;
     try {
       value = JSON.parse(plaintext.toString('utf8'));
     } catch {
-      throw new SnapshotOpenError('invalid');
+      throw new SnapshotOpenError();
     }
-    if (checkPlainJson(value) !== null) throw new SnapshotOpenError('invalid');
+    if (checkPlainJson(value) !== null) throw new SnapshotOpenError();
     const parsed = StorageStateSchema.safeParse(value);
-    if (!parsed.success) throw new SnapshotOpenError('invalid');
+    if (!parsed.success) throw new SnapshotOpenError();
     state = parsed.data;
   } finally {
     plaintext.fill(0);
@@ -177,9 +96,8 @@ export async function openSnapshot(
   let disposed = false;
   return {
     storageState: state,
-    vaultEntryId: active.secretId,
-    version: active.version,
-    kekVersion: active.sealed.kekVersion,
+    version: meta.version,
+    kekVersion: meta.kekVersion,
     dispose() {
       if (disposed) return;
       disposed = true;
@@ -234,11 +152,25 @@ export function isEmptyStorageState(state: StorageState): boolean {
   return state.cookies.length === 0 && state.origins.length === 0;
 }
 
-/** Earliest positive cookie expiry, or null when every cookie is a session cookie. */
-export function sessionExpiry(state: StorageState): Date | null {
+/** Cookie expiries this close to now are ignored by {@link sessionExpiry}. */
+export const SESSION_EXPIRY_MARGIN_MS = 5 * 60_000;
+
+/**
+ * Earliest positive cookie expiry that is more than {@link SESSION_EXPIRY_MARGIN_MS} away, or
+ * null when there is none (every cookie is a session cookie or about to expire). A short-lived
+ * cookie (a CSRF or flash cookie) must not make the whole login fail: the vault refuses an expiry
+ * that is not in the future, and one a few seconds away would be stale before it is stored.
+ */
+export function sessionExpiry(
+  state: StorageState,
+  now: Date = new Date(),
+  marginMs: number = SESSION_EXPIRY_MARGIN_MS,
+): Date | null {
+  const floor = now.getTime() + marginMs;
   let earliest: number | null = null;
   for (const cookie of state.cookies) {
     if (!Number.isFinite(cookie.expires) || cookie.expires <= 0) continue;
+    if (cookie.expires * 1000 <= floor) continue;
     if (earliest === null || cookie.expires < earliest) earliest = cookie.expires;
   }
   if (earliest === null) return null;

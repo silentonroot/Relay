@@ -20,6 +20,7 @@
     "@aab/database": "workspace:*",
     "@aab/audit": "workspace:*",
     "@aab/crypto": "workspace:*",
+    "@aab/vault-client": "workspace:*",
     "@aab/policy-engine": "workspace:*",
     "fastify": "^5.12.8",
     "@fastify/cookie": "^11.1.5",

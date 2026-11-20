@@ -1,16 +1,20 @@
 import { Writable } from 'node:stream';
 import { AdapterRegistry, defineAdapter, defineOperation } from '@aab/adapter-sdk';
 import type { SanitizedResult } from '@aab/adapter-sdk';
+import { SESSION_SNAPSHOT_SECRET_TYPE } from '@aab/contracts';
 import type { Connection, JsonObject } from '@aab/contracts';
-import { InMemoryKekProvider } from '@aab/crypto';
 import { createRepositories, hashJobArguments, schema } from '@aab/database';
 import type { DatabaseHandle, Repositories } from '@aab/database';
 import { createTestDatabase } from '@aab/database/testing';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { join } from 'node:path';
 import { pino } from 'pino';
 import type { Logger } from 'pino';
 import { z } from 'zod';
-import { storeSnapshot } from '../../src/session-store/index.js';
+import { createSupervisorVault } from '../../src/vault/gateway.js';
+import type { SupervisorVault } from '../../src/vault/gateway.js';
+import { makeKekDir, makeSocketDir, removeDir } from '../../../vault/test/helpers.js';
+import { openStored, putSealed, startService } from '../../../vault/test/service-helpers.js';
+import type { Service, Tenant } from '../../../vault/test/service-helpers.js';
 import type {
   JobRunner,
   LoginHandle,
@@ -81,10 +85,6 @@ export function testRegistry(): AdapterRegistry {
   return registry;
 }
 
-export function testKek(): InMemoryKekProvider {
-  return new InMemoryKekProvider([[1, randomBytes(32)]]);
-}
-
 /** Captures every log line so tests can assert nothing secret was written. */
 export function captureLogger(level: pino.Level = 'debug'): { logger: Logger; lines: string[] } {
   const lines: string[] = [];
@@ -123,6 +123,14 @@ export interface World {
   scope: { organizationId: string; userId: string };
   applicationId: string;
   agentId: string;
+  /** A REAL vault (the real operations, temporary sockets and key directory) on this database. */
+  service: Service;
+  /** The supervisor's gateway to that vault's supervisor-role socket. */
+  vault: SupervisorVault;
+  /** What the API does after it enqueues a job: `authorizeJobAccess` on the api-role socket. */
+  authorize(jobId: string, ttlSeconds?: number): Promise<void>;
+  /** The stored session as the vault opens it (a test-side check with the vault's keys), or null. */
+  openStored(connectionId: string): Promise<string | null>;
   close(): Promise<void>;
 }
 
@@ -131,6 +139,14 @@ export async function createWorld(
 ): Promise<World> {
   const handle = await createTestDatabase();
   const repos = createRepositories(handle.db);
+  const socketDir = await makeSocketDir();
+  const kekDir = await makeKekDir();
+  const service = await startService({ reuse: { dbHandle: handle, kekDir, socketDir } });
+  const vault = createSupervisorVault({
+    socketPath: service.vault.sockets.supervisor,
+    isolation: 'shared-uid',
+    timeoutMs: 5_000,
+  });
   const owner = await repos.organizations.bootstrapLocalOwner({
     email: 'owner@example.test',
     passwordHash: 'synthetic-hash-not-used',
@@ -151,7 +167,29 @@ export async function createWorld(
     scope,
     applicationId: app.id,
     agentId: agent.id,
-    close: () => handle.close(),
+    service,
+    vault,
+    async authorize(jobId, ttlSeconds = 600) {
+      const response = await service.rpc('api', 'authorizeJobAccess', { jobId, ttlSeconds });
+      if (response['ok'] !== true) {
+        throw new Error(`authorizeJobAccess refused: ${JSON.stringify(response)}`);
+      }
+    },
+    openStored: (connectionId) =>
+      openStored(
+        service,
+        {
+          organization: { id: scope.organizationId },
+          user: { id: scope.userId },
+        } as Tenant,
+        connectionId,
+      ),
+    async close() {
+      await service.stop().catch(() => undefined);
+      await removeDir(socketDir);
+      await removeDir(join(kekDir, '..'));
+      await handle.close().catch(() => undefined);
+    },
   };
 }
 
@@ -175,6 +213,7 @@ let connectionCounter = 0;
 export async function loginConnection(
   world: World,
   applicationId = world.applicationId,
+  options: { authorize?: boolean } = {},
 ): Promise<{ connection: Connection; jobId: string }> {
   const created = await world.repos.connections.create(world.scope, {
     applicationId,
@@ -192,13 +231,14 @@ export async function loginConnection(
     connectionId: created.id,
     timeoutMs: 600_000,
   });
+  // The API authorizes the job with the vault right after it enqueues it (ADR-014 section 5).
+  if (options.authorize !== false) await world.authorize(job.id, 660);
   return { connection, jobId: job.id };
 }
 
 /** An `active` connection with a stored snapshot, a hint and an allow grant. */
 export async function activeConnection(
   world: World,
-  kek: InMemoryKekProvider,
   options: {
     state?: StorageState | null;
     hint?: string | null;
@@ -207,13 +247,13 @@ export async function activeConnection(
     operation?: string;
   } = {},
 ): Promise<Connection> {
-  const { connection } = await loginConnection(world, options.applicationId);
+  const { connection } = await loginConnection(world, options.applicationId, { authorize: false });
   // The login job is not needed: end it as the API would never leave it.
   await world.repos.jobs.cancelForConnection(connection.id, new Date());
   await world.repos.connections.transitionStatus(world.scope, connection.id, { to: 'active' });
   const state = options.state === undefined ? stateWith('default') : options.state;
   if (state !== null) {
-    await storeSnapshot(world.repos, { connection, storageState: state, kek, now: new Date() });
+    await sealSnapshot(world, connection, state);
   }
   await world.repos.connections.recordSession(connection.id, {
     externalAccountHint: options.hint === undefined ? 'user@example.test' : options.hint,
@@ -230,16 +270,64 @@ export async function activeConnection(
   return fresh!;
 }
 
+/** Seals a state for the connection with the vault's own keys, as an earlier login would have. */
+export async function sealSnapshot(
+  world: World,
+  connection: Pick<Connection, 'id'>,
+  state: StorageState,
+): Promise<void> {
+  const ensured = await world.repos.vault.ensureSecret({
+    connectionId: connection.id,
+    secretType: SESSION_SNAPSHOT_SECRET_TYPE,
+    now: new Date(),
+  });
+  const tenant = {
+    organization: { id: world.scope.organizationId },
+    user: { id: world.scope.userId },
+  } as Tenant;
+  await putSealed(
+    world.service,
+    tenant,
+    connection.id,
+    ensured.secretId,
+    ensured.nextVersion,
+    JSON.stringify(state),
+  );
+}
+
 export async function queueOperation(
   world: World,
   connectionId: string,
-  options: { operation?: string; arguments?: JsonObject; retrySafe?: boolean } = {},
+  options: {
+    operation?: string;
+    arguments?: JsonObject;
+    retrySafe?: boolean;
+    /** Skip the API's `authorizeJobAccess`: the job has no capability and is never claimed. */
+    authorize?: boolean;
+  } = {},
 ): Promise<string> {
   const operation = options.operation ?? 'orders.list';
   const args = options.arguments ?? { limit: 5 };
   const retrySafe = options.retrySafe ?? true;
-  // The route stores the id of the policy.evaluated event; any uuid serves here.
-  const policyDecisionId = randomUUID();
+  // The route stores the id of the policy.evaluated event the authorization re-checks: an allow
+  // that names the grants it matched.
+  const grants = await world.repos.grants.listForEvaluation({
+    agentId: world.agentId,
+    connectionId,
+    operation,
+  });
+  const policyDecisionId = (
+    await world.repos.audit.append({
+      organizationId: world.scope.organizationId,
+      actorType: 'system',
+      agentId: world.agentId,
+      connectionId,
+      eventType: 'policy.evaluated',
+      decision: 'allow',
+      metadata: { operation, outcome: 'allow', matchedGrantIds: grants.map((grant) => grant.id) },
+      timestamp: new Date(),
+    })
+  ).id;
   const job = await world.repos.jobs.createOperation({
     organizationId: world.scope.organizationId,
     requestedByUserId: world.scope.userId,
@@ -263,6 +351,7 @@ export async function queueOperation(
     policyDecisionId,
     timeoutMs: 30_000,
   });
+  if (options.authorize !== false) await world.authorize(job.id);
   return job.id;
 }
 

@@ -105,6 +105,11 @@ export interface CompleteJobInput {
   /** Stored for every status except `succeeded`. The message is truncated to 300 characters. */
   error?: JobError | null | undefined;
   auditEventId?: string | null | undefined;
+  /**
+   * The attempt (`attempt_count`) the caller claimed. When given, the job must still be on that
+   * attempt, so a stale handler of an earlier attempt on the same worker id cannot end a later one.
+   */
+  attempt?: number | undefined;
   now: Date;
 }
 
@@ -434,12 +439,16 @@ export function createJobRepository(db: Db) {
       });
     },
 
-    /** Pushes the lease out. False when the job is no longer running under that worker. */
+    /**
+     * Pushes the lease out. False when the job is no longer running under that worker (and, when
+     * `attempt` is given, on that attempt).
+     */
     async extendLease(
       jobId: string,
       workerId: string,
       leaseMs: number,
       now: Date,
+      attempt?: number,
     ): Promise<boolean> {
       if (!isUuid(jobId)) return false;
       requirePositiveInt(leaseMs, 'leaseMs');
@@ -451,6 +460,7 @@ export function createJobRepository(db: Db) {
             eq(executionJobs.id, jobId),
             eq(executionJobs.status, 'running'),
             eq(executionJobs.workerId, workerId),
+            attempt === undefined ? undefined : eq(executionJobs.attemptCount, attempt),
           ),
         )
         .returning({ id: executionJobs.id });
@@ -498,12 +508,80 @@ export function createJobRepository(db: Db) {
               eq(executionJobs.id, jobId),
               eq(executionJobs.status, 'running'),
               eq(executionJobs.workerId, workerId),
+              input.attempt === undefined
+                ? undefined
+                : eq(executionJobs.attemptCount, input.attempt),
             ),
           )
           .returning(),
       );
       if (rows[0] === undefined) throw new ConflictError('job is not running under this worker');
       return toExecutionJob(rows[0]);
+    },
+
+    /**
+     * Phase 3 (ADR-014 sections 5 and 9, step B3a): ends a job that is still `queued` and has no
+     * capability, as `failed` with `vault_unavailable` or `vault_denied`. One conditional UPDATE:
+     * a job that was claimed, cancelled or authorized in the meantime matches no row and is left
+     * alone (returns null). The caller records the audit event in the same transaction. Not
+     * scoped: only the API's authorization step and its sweep use it.
+     */
+    async failQueuedWithoutCapability(
+      jobId: string,
+      input: { error: JobError & { code: 'vault_unavailable' | 'vault_denied' }; now: Date },
+    ): Promise<ExecutionJob | null> {
+      if (!isUuid(jobId)) return null;
+      const [row] = await translateDbErrors('job', () =>
+        db
+          .update(executionJobs)
+          .set({
+            status: 'failed',
+            errorCode: input.error.code,
+            errorMessage: input.error.message.slice(0, MAX_ERROR_MESSAGE_LENGTH),
+            finishedAt: input.now,
+            updatedAt: input.now,
+          })
+          .where(
+            and(
+              eq(executionJobs.id, jobId),
+              eq(executionJobs.status, 'queued'),
+              isNull(executionJobs.capabilityRef),
+            ),
+          )
+          .returning(),
+      );
+      return row === undefined ? null : toExecutionJob(row);
+    },
+
+    /**
+     * Queued jobs created before `createdBefore` that still have no capability, oldest first, at
+     * most `limit`. For the API's maintenance sweep (ADR-014 section 5). Unscoped.
+     */
+    async listQueuedWithoutCapability(
+      olderThanSeconds: number,
+      limit: number,
+    ): Promise<ExecutionJob[]> {
+      requirePositiveInt(limit, 'limit');
+      if (!Number.isFinite(olderThanSeconds) || olderThanSeconds < 0) {
+        throw new ValidationError('invalid age', [
+          { path: 'olderThanSeconds', message: 'expected a non-negative number' },
+        ]);
+      }
+      const rows = await db
+        .select()
+        .from(executionJobs)
+        .where(
+          and(
+            eq(executionJobs.status, 'queued'),
+            isNull(executionJobs.capabilityRef),
+            // The database's clock, as for every capability decision: an API host whose clock is
+            // wrong cannot make a young job look old.
+            sql`${executionJobs.createdAt} < statement_timestamp() - make_interval(secs => ${olderThanSeconds}::double precision)`,
+          ),
+        )
+        .orderBy(asc(executionJobs.createdAt), asc(executionJobs.id))
+        .limit(limit);
+      return rows.map(toExecutionJob);
     },
 
     /**

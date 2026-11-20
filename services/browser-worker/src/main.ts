@@ -9,12 +9,12 @@ import {
   displayFromEnvironment,
   resolveJobRunnerConfig,
 } from './sandbox/index.js';
-import { loadLocalKek } from './session-store/index.js';
 import { createSupervisor, SupervisorStartError } from './supervisor/index.js';
 import { errorFacts } from './supervisor/context.js';
+import { createSupervisorVault } from './vault/gateway.js';
 
 /*
- * Browser worker entry point: `node --import tsx src/main.ts`. Builds the supervisor, starts
+ * Browser worker entry point: `node --import tsx src/main.ts`. Builds the supervisor (which holds no key: the vault does, P3-1), starts
  * it, and stops it gracefully on SIGINT or SIGTERM. Exits non-zero when start-up fails.
  * Database migrations are the API's job; the worker expects a migrated database.
  */
@@ -36,7 +36,11 @@ async function main(): Promise<void> {
 
   let database: DatabaseHandle | null = null;
   try {
-    const kek = await loadLocalKek(config.kekDir);
+    const vault = createSupervisorVault({
+      socketPath: config.vaultSocket,
+      isolation: config.vaultIsolation,
+      timeoutMs: config.vaultCallTimeoutMs,
+    });
     const runnerConfig = resolveJobRunnerConfig({
       sandbox: config.sandbox,
       ...(config.runtimeDir === undefined ? {} : { runtimeBaseDir: config.runtimeDir }),
@@ -68,7 +72,7 @@ async function main(): Promise<void> {
     const supervisor = createSupervisor({
       repos: createRepositories(db.db),
       runner,
-      kek,
+      vault,
       adapters,
       logger,
       settings: {
@@ -103,11 +107,9 @@ async function main(): Promise<void> {
     process.once('SIGTERM', () => shutdown('SIGTERM'));
   } catch (error) {
     await database?.close().catch(() => undefined);
-    // Start-up and key-store errors carry fixed, secret-free messages; anything else is
-    // reported by type only.
+    // Start-up errors carry fixed, secret-free messages; anything else is reported by type only.
     const message =
-      error instanceof SupervisorStartError ||
-      (error instanceof Error && error.name === 'KekStoreError')
+      error instanceof SupervisorStartError
         ? error.message
         : `start-up failed (${errorFacts(error).errorType})`;
     logger.fatal(errorFacts(error), message);

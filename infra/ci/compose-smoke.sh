@@ -49,10 +49,14 @@ db_password="$(openssl rand -hex 24)"
 printf '%s' "${db_password}" >"${AAB_HOST_SECRETS_DIR}/postgres_password"
 printf 'DATABASE_URL=postgres://aab:%s@postgres:5432/aab\n' "${db_password}" \
   >"${AAB_HOST_SECRETS_DIR}/broker-api.env"
+# The vault's own file (same database role for now, see infra/compose.yaml).
+printf 'DATABASE_URL=postgres://aab:%s@postgres:5432/aab\n' "${db_password}" \
+  >"${AAB_HOST_SECRETS_DIR}/vault.env"
 openssl rand -base64 18 >"${work}/owner_password"
 # The containers run as other users and read these through bind mounts.
 chmod 755 "${work}" "${AAB_HOST_SECRETS_DIR}"
-chmod 644 "${AAB_HOST_SECRETS_DIR}/postgres_password" "${AAB_HOST_SECRETS_DIR}/broker-api.env"
+chmod 644 "${AAB_HOST_SECRETS_DIR}/postgres_password" "${AAB_HOST_SECRETS_DIR}/broker-api.env" \
+  "${AAB_HOST_SECRETS_DIR}/vault.env"
 unset db_password
 
 # --- build and start ---------------------------------------------------------------------
@@ -101,6 +105,20 @@ compose exec -T broker-api node -e "
     () => process.exit(0),
   );" || fail "the API container has outbound network access"
 
+say "vault container hardening and role isolation"
+compose exec -T vault sh -c '
+  [ "$(id -u)" != "0" ] || { echo "the vault runs as root"; exit 1; }
+  ! touch /app/.write-test 2>/dev/null || { echo "root filesystem is writable"; exit 1; }
+  ls /var/lib/aab/keys/kek-v1.key >/dev/null || { echo "no key file in the key volume"; exit 1; }
+' || fail "vault container hardening check failed"
+# The API sees its own role socket and nothing else of the vault: no key volume, no other roles.
+compose exec -T broker-api sh -c '
+  [ -S /run/aab-vault/api/vault.sock ] || { echo "the api-role socket is missing"; exit 1; }
+  [ ! -e /var/lib/aab/keys ] || { echo "the key volume is visible to the API"; exit 1; }
+  [ ! -e /run/aab-vault/supervisor ] || { echo "the supervisor socket is visible to the API"; exit 1; }
+  [ ! -e /run/aab-vault/admin ] || { echo "the admin socket is visible to the API"; exit 1; }
+' || fail "the API container can see more of the vault than its own socket"
+
 say "owner bootstrap, login and a denied operation"
 compose exec -T broker-api node --import tsx src/scripts/create-owner.ts --email owner@example.test \
   <"${work}/owner_password" >/dev/null
@@ -139,6 +157,12 @@ expect("login", status, 200)
 csrf = session["csrfToken"]
 cookie = next(c for c in jar if c.name == "aab_session")
 expect("session cookie is HttpOnly", cookie.has_nonstandard_attr("HttpOnly"), True)
+
+status, vault_status = call("GET", "/v1/vault/status")
+expect("vault status through the API", status, 200)
+expect("vault is shared-uid in compose", vault_status["isolation"], "shared-uid")
+if vault_status["currentKekVersion"] < 1:
+    sys.exit("FAILED: the vault reports no current key version")
 
 status, application = call("POST", "/v1/applications/register", {
     "adapterId": "northstar", "adapterVersion": "0.1.0", "name": "Northstar",

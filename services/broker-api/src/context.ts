@@ -4,6 +4,7 @@ import type { Db, Repositories, Scope, ValidSession } from '@aab/database';
 import type { FastifyBaseLogger } from 'fastify';
 import type { PasswordService } from './auth/passwords.js';
 import type { AppConfig } from './config.js';
+import type { VaultGateway } from './vault/gateway.js';
 
 /** What a request authenticated by the session cookie carries. */
 export interface RequestAuth {
@@ -44,6 +45,12 @@ export interface AppContext {
    */
   adapters: AdapterRegistry;
   clock: () => Date;
+  /**
+   * The vault, as the `api` role. Undefined only where no vault is wired (tests of the Phase 2
+   * path, `dev:memory`): then jobs are not authorized and not swept, and nothing claims them
+   * with `requireCapability`. `main.ts` refuses to start without one.
+   */
+  vault: VaultGateway | undefined;
   passwordParams: ScryptParams | undefined;
   /** Every password hash and verification goes through this, behind one limiter (F-5). */
   passwords: PasswordService;
@@ -67,5 +74,7 @@ declare module 'fastify' {
   interface FastifyInstance {
     /** Every route registered on this app, for tests that must cover all of them. */
     routeTable: { method: string; url: string; public: boolean }[];
+    /** Runs the vault authorization sweep once; returns how many jobs it ended. For tests. */
+    sweepVaultAuthorizations: () => Promise<number>;
   }
 }

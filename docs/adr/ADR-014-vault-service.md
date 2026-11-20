@@ -776,6 +776,132 @@ Changes after the review of B2a and B2b; where they differ from the text above, 
   completion" sent an empty storage state as its payload, which the vault now refuses; it sends a
   valid one (the assertions are unchanged). Nothing else was changed or loosened.
 
+### As built in step B3a (2026-11-19, partly done)
+
+The API side of the wiring, as far as it is done. Where it differs from the text above, this wins.
+
+- **`packages/vault-client`** (`@aab/vault-client`; depends on `@aab/contracts` only, imports no
+  crypto) is the caller's client: one connection per request, one request line, a response line capped
+  at 4 MiB, a 5 s default timeout over the whole exchange, the response checked against the contracts
+  schemas and its id against the request's. Errors are `VaultCallError` with a kind and a short code
+  and nothing from the request or the reply: `unavailable` (connect failed, timeout, connection closed,
+  malformed, oversize or mismatched reply, and the vault's own `service_unavailable`, `internal_error`
+  and `not_implemented`) and `denied` (`forbidden` and every other refusal: `not_found`,
+  `validation_failed`, `conflict`, `malformed`, and a request that fails the contracts schema, which is
+  not sent). `internal_error` and `not_implemented` are read as `unavailable` because they are
+  failures, not refusals; both fail the job closed either way. `services/vault/src/admin-client.ts` was
+  not refactored onto it (that needs a dependency in `services/vault/package.json`).
+- **Start-up (section 3).** The API reads `AAB_VAULT_SOCKET` (the api-role socket, required by
+  `main.ts`, not by `loadConfig`, so tests and `dev:memory` run without a vault), `AAB_VAULT_ISOLATION`
+  (default `separate-uid`, mirrors the vault's), `AAB_VAULT_AUTHORIZATION_TTL_SECONDS` (10 to 3,600,
+  default 600) and `AAB_VAULT_CALL_TIMEOUT_MS` (100 to 60,000, default 5,000). Numbers are strict
+  decimal integers. It still refuses `AAB_KEK_DIR`. It then sends `hello` and refuses to start when the
+  vault answers with a role other than `api`, with an isolation mode other than the configured one, or
+  (in `separate-uid` mode) when it can open the directory `hello` names as `keyDirectory`; the message
+  names the path, as section 3 says. No separate probe-path variable exists: the directory is the one
+  the vault reports.
+- **A vault that does not answer at start is not a refusal.** The ADR does not say. Revocation must work
+  while the vault is down (section 7) and each job fails closed (section 9), so the API starts degraded
+  and logs a warning. Every authorization and status call first runs the same `hello` check until it
+  passes once, so no capability is authorized through an unchecked vault, and a vault that later answers
+  wrongly is refused for good. (The check runs until it passes once, not before every call; the
+  supervisor, by contrast, checks before every claim. B3 review L4: the API logs one error line when
+  the check turns to a refusal.) Changing this to a refusal is one line in `main.ts`.
+- **Status.** `GET /v1/vault/status` (route `vaultStatus` added to `packages/contracts` `Routes`; the
+  response schema is the existing `StatusResult`) is owner-only, answers 503 without detail when the vault
+  is unreachable. The `api` role may call `status` (section 4), so nothing was skipped.
+- **Revocation (section 7).** `connections.revoke`, `grants.revoke` and `agents.disable` already revoke
+  the unused capabilities in their own transaction (B1); the route test proves it end to end with a real
+  vault. The connection route now also appends `vault.secret_revoked` (ids and the number of versions
+  deleted) when the connection has secret rows, in the same transaction; `vault.secret_deleted` is
+  unchanged.
+- **authorizeJobAccess and failure (sections 5 and 9).** After the execute commit (only for the job this
+  request created, not an idempotent replay) and after the connect commit, the API calls the vault with
+  `AAB_VAULT_AUTHORIZATION_TTL_SECONDS` (operations) or the login timeout plus 60 s (logins). On
+  `unavailable` or `denied` the job ends `failed` with `vault_unavailable` or `vault_denied` through
+  `jobs.failQueuedWithoutCapability` (one conditional UPDATE: still `queued`, `capability_ref IS NULL`),
+  with `operation.failed` or `connection.auth_failed` as `actor_type = 'system'` (metadata `source`
+  `authorize` or `sweep`) in the same transaction; a login also returns its connection to
+  `authentication_required`. A call that timed out after the vault committed therefore does not fail the
+  job. The sweep (`sweepUnauthorizedJobs`, every 15 s, at most 50 jobs per run, stopped on app close) ends
+  queued jobs with no capability older than 60 s the same way, using `listQueuedWithoutCapability`. Both
+  repository functions are additive, in `packages/database` (`test/job-vault-failure.test.ts`).
+
+### As built in step B3b (2026-11-19, local WIP commits, not reviewed)
+
+The supervisor side of the wiring. Where it differs from the text above, this wins.
+
+- **No key in the worker (section 3, P3-1).** `@aab/crypto` is no longer a dependency of
+  `services/browser-worker`; no source file imports it or names `sealSecret`, `openSecret`,
+  `rewrapSecret` or a KEK provider (`test/session-store/import-boundary.test.ts`). `AAB_KEK_DIR`, if set
+  and not blank, is a configuration error checked before any other variable. The worker takes
+  `AAB_VAULT_SOCKET` (supervisor-role socket, required), `AAB_VAULT_ISOLATION` (default `separate-uid`)
+  and `AAB_VAULT_CALL_TIMEOUT_MS` (default 5,000). The session store keeps parsing, validation, the size
+  cap, origin filtering and `dispose()` (`encodeSnapshot`, `parseSnapshot`); `storeSnapshot`,
+  `openSnapshot` and `loadLocalKek` are gone.
+- **The gateway is mirrored, not generalised.** `services/browser-worker/src/vault/gateway.ts` repeats the
+  API's `hello` check with the supervisor role (role, isolation, and in `separate-uid` an `opendir` probe
+  of the reported key directory). Moving it into `packages/vault-client` would have needed a role
+  parameter and a different operation surface for each caller; the API's gateway and tests were left as
+  they are.
+- **Start and claim (sections 3 and 9, P3-11).** A vault that answers wrongly refuses the start
+  (`SupervisorStartError`); one that does not answer does not (as the API, section 7: nothing here may
+  depend on the vault being up to start). Before **every** claim the supervisor repeats the full
+  `hello` check; while it fails nothing is claimed and the state change is logged once. It claims with
+  `requireCapability: true` and recovers expired leases with `capabilityAware: true`, as B1 prepared.
+- **Operations (sections 4 to 6).** After claim and the supervisor's own checks (step 0 hash, policy,
+  obligations) it calls `issueAccessCapability` (the job's `capability_ref`, its own `workerId`, the job's
+  `attempt_count`, token lifetime 30 s) and immediately `readForWorker`. The `argumentsHash` the vault
+  returns is compared with `job.arguments_hash`; a null or different value denies the job
+  (`arguments_hash_mismatch`, `operation.denied`) before anything runs (P3-17). This closes the residual
+  risk Phase 2 recorded (a writer who replaces the arguments and recomputes the hash): the test that
+  documented it now asserts the job is refused. The capability is spent by then (the vault returns the
+  hash only on a read), which is acceptable because the job ends. `unavailable` ends the job
+  `vault_unavailable`, `denied` ends it `vault_denied`; a claimed job without a `capability_ref`
+  (should not exist) ends `vault_denied`. Nothing falls back to opening a secret locally.
+- **The read is audited by the vault only.** The worker's `touchAccessed` and `vault.secret_read` are
+  gone (the vault writes `vault.secret_read` as `system`, section 10).
+- **Logins.** After capture the supervisor still filters by origin, fails `login_not_completed` itself
+  when nothing is left (no vault call at all, not even a token), runs the identity pre-check, derives
+  `sessionExpiresAt` with `sessionExpiry(filtered)` and then calls `issueAccessCapability` and
+  `completeLogin`. The vault seals, activates, records, audits (`vault.secret_stored`,
+  `connection.auth_completed`, `system`) and completes the job in its transaction; the supervisor writes
+  none of that and no worker-attributed copy. A failure ends the login through the existing
+  `connection.auth_failed` path with `vault_unavailable` or `vault_denied`.
+- **Decision: login `durationMs` and `sandbox`.** Phase 2 put them on `connection.auth_completed`. The
+  vault writes that event and cannot know them, and no audit event type exists for a supervisor-side
+  copy (adding one touches `packages/contracts`). They are dropped from the audit trail and logged by the
+  supervisor at info level (`login job finished`). Operation events (`operation.*`) still carry both.
+- **Behaviour changes to know.** (1) An `active` connection with no stored session still ends
+  `reauth_required` / `expired` (`no_snapshot`), as in Phase 2: the supervisor reads the secret
+  metadata (`describeForConnection`, no ciphertext, no key) before asking for a token, and with no
+  active version it records that outcome and makes no vault call (B3 review M3; the first B3b version
+  let the vault refuse the read and ended `vault_denied` silently). (2) The vault refuses a `sessionExpiresAt` in the past
+  and caps one beyond 400 days, so a login whose earliest cookie already expired fails `vault_denied`,
+  and a long-lived cookie records an expiry 400 days out. (3) A job whose lease expired after its token was
+  issued is ended by recovery, not requeued (the B1 rule, now switched on).
+- **Left as Phase 2 had it.** When a job's outcome invalidates the session (`reauth_required`,
+  `identity_mismatch`) the supervisor still deletes the stored versions through the database
+  (`vault.deleteForConnection`) and appends `vault.secret_deleted` as `worker`. That is a database write,
+  not key handling; routing it through the vault is a later decision.
+- **Review fixes (B3 review, 2026-11-19).** M1: a login's token is issued only after the owner
+  completes, so the supervisor reads the capability's `expires_at` (metadata) at claim and gives the
+  window `min(job timeout, remaining - 45 s)`; under 5 s it fails the login `timeout` before a window
+  opens. The API's login lifetime is now the handoff timeout plus 300 s (queue time shares the budget).
+  M2: `jobs.extendLease` and `jobs.complete` take the attempt and match `attempt_count`; the
+  supervisor's handlers pass theirs, a stale handler returns early on `lease_lost`, and a claim for a
+  job id that still has a handler is refused. L1: in `separate-uid` both gateways also try the other
+  roles' sockets and refuse to start if one connects. L5: invalidating a session also revokes the
+  connection's unused capabilities (`session_deleted`). L6: expiries within 5 minutes of now are
+  ignored when deriving `sessionExpiresAt`. L3: the sweep's age uses the database clock.
+- **Infra.** `infra/docker/vault.Dockerfile`, a `vault` service and a one-shot `vault-init-kek` in
+  `infra/compose.yaml`, one socket volume per role (`vault-api`, `vault-supervisor`, `vault-admin`),
+  the key volume in the vault containers only, the API on `vault-api` only. Compose runs the vault in
+  `shared-uid` terms (one user in the container; the volumes are the separation). Both Dockerfiles that
+  copy workspace packages were updated (`vault-client` added to the API image, which B3a had missed;
+  `crypto` replaced by `vault-client` in the runner image). Validated with `docker compose config` only;
+  nothing was built or started. `docs/operations.md` has the `separate-uid` setup and `LimitCORE=0`.
+
 ## What a compromised component can and cannot do after Phase 3
 
 These statements are the design. They become claims only when the tests named in

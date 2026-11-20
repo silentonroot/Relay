@@ -36,6 +36,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
  * Environment overrides: AAB_CHROMIUM_PATH, AAB_E2E_DEMO_DIR (default: ../northstar-demo next to the repository),
  * AAB_E2E_PG_DIR, AAB_E2E_PG_PORT, AAB_E2E_PG_BIN. Temporary files go under os.tmpdir().
  * The step letters in the test names are the Phase 2 acceptance steps A to K.
+ *
+ * Phase 3 (B3b): the vault runs as a fourth process (shared-uid isolation: one user, one
+ * directory mode), the API and the worker talk to it over their own role sockets, and the worker
+ * holds no key: it is started without AAB_KEK_DIR and would refuse to start with it.
  */
 
 const ENABLED = process.env['AAB_E2E'] === '1';
@@ -44,6 +48,7 @@ const run = promisify(execFile);
 const REPO = path.resolve(import.meta.dirname, '../../../..');
 const API_DIR = path.join(REPO, 'services/broker-api');
 const WORKER_DIR = path.join(REPO, 'services/browser-worker');
+const VAULT_DIR = path.join(REPO, 'services/vault');
 const DEMO_DIR = process.env['AAB_E2E_DEMO_DIR'] ?? path.resolve(REPO, '..', 'northstar-demo');
 const UID = process.getuid?.() ?? 1000;
 const PG_DIR = process.env['AAB_E2E_PG_DIR'] ?? `/run/user/${UID}/aab-pg`;
@@ -195,8 +200,8 @@ function writeWatchSpec(done = false): void {
     JSON.stringify({
       done,
       groups: PROCS.map((proc) => proc.pid).filter((pid) => pid > 0),
-      markers: [S.runtimeDir, S.tmp],
-      dirs: [S.runtimeDir, S.tmp],
+      markers: [S.runtimeDir, S.socketDir, S.tmp].filter((entry) => entry !== ''),
+      dirs: [S.runtimeDir, S.socketDir, S.tmp].filter((entry) => entry !== ''),
       dbName: S.dbName,
       pgBin: PG_BIN,
       pgDir: PG_DIR,
@@ -214,6 +219,8 @@ interface State {
   tmp: string;
   runtimeDir: string;
   keyDir: string;
+  /** The vault's socket directory: `<dir>/<role>/vault.sock`. */
+  socketDir: string;
   keyBytes: Buffer;
   demoDb: string;
   display: string;
@@ -224,6 +231,7 @@ interface State {
   apiBase: string;
   xvfb: Proc | null;
   demo: Proc | null;
+  vault: Proc | null;
   api: Proc | null;
   worker: Proc | null;
   /** Output of earlier API and worker processes (before the restart). */
@@ -252,6 +260,7 @@ const S: State = {
   tmp: '',
   runtimeDir: '',
   keyDir: '',
+  socketDir: '',
   keyBytes: Buffer.alloc(0),
   demoDb: '',
   display: '',
@@ -262,6 +271,7 @@ const S: State = {
   apiBase: '',
   xvfb: null,
   demo: null,
+  vault: null,
   api: null,
   worker: null,
   oldApiLogs: [],
@@ -472,6 +482,36 @@ function startProcessEnv(extra: Record<string, string>): Record<string, string> 
 
 /* ------------------------------------------------------------------ stack control */
 
+const vaultSocket = (role: 'api' | 'supervisor' | 'admin') =>
+  path.join(S.socketDir, role, 'vault.sock');
+
+async function startVault(): Promise<void> {
+  S.vault = new Proc('vault', NODE, ['--import', 'tsx', 'src/main.ts'], {
+    cwd: VAULT_DIR,
+    env: startProcessEnv({
+      DATABASE_URL: S.dbUrl,
+      AAB_KEK_DIR: S.keyDir,
+      AAB_VAULT_SOCKET_DIR: S.socketDir,
+      AAB_VAULT_ISOLATION: 'shared-uid',
+      AAB_LOG_LEVEL: 'info',
+    }),
+  });
+  await waitFor(
+    () => {
+      if (S.vault?.exit !== null) {
+        throw new Error(`the vault exited early:\n${S.vault?.text().slice(-1500)}`);
+      }
+      return (
+        (S.vault?.text().match(/vault listening/g) ?? []).length >= 3 &&
+        existsSync(vaultSocket('api')) &&
+        existsSync(vaultSocket('supervisor'))
+      );
+    },
+    60_000,
+    'the vault to listen on its three role sockets',
+  );
+}
+
 async function startApi(): Promise<void> {
   S.api = new Proc('api', NODE, ['--import', 'tsx', 'src/main.ts'], {
     cwd: API_DIR,
@@ -481,6 +521,8 @@ async function startApi(): Promise<void> {
       AAB_PORT: String(S.apiPort),
       AAB_COOKIE_SECURE: 'false',
       AAB_LOG_LEVEL: 'info',
+      AAB_VAULT_SOCKET: vaultSocket('api'),
+      AAB_VAULT_ISOLATION: 'shared-uid',
     }),
   });
   await waitFor(
@@ -507,7 +549,9 @@ async function startWorker(): Promise<void> {
     // WAYLAND_DISPLAY and XDG_RUNTIME_DIR are deliberately absent.
     env: startProcessEnv({
       DATABASE_URL: S.dbUrl,
-      AAB_KEK_DIR: S.keyDir,
+      // No AAB_KEK_DIR: the worker holds no key and refuses to start with one (P3-1).
+      AAB_VAULT_SOCKET: vaultSocket('supervisor'),
+      AAB_VAULT_ISOLATION: 'shared-uid',
       DISPLAY: S.display,
       XAUTHORITY: S.xauth,
       AAB_WORKER_RUNTIME_DIR: S.runtimeDir,
@@ -767,6 +811,7 @@ function logHaystacks(): Record<string, string> {
   return {
     'api stdout/stderr': [...S.oldApiLogs, S.api?.text() ?? ''].join('\n'),
     'worker stdout/stderr': [...S.oldWorkerLogs, S.worker?.text() ?? ''].join('\n'),
+    'vault stdout/stderr': S.vault?.text() ?? '',
   };
 }
 
@@ -867,6 +912,10 @@ describe.skipIf(!ENABLED)(
       S.tmp = mkdtempSync(path.join(os.tmpdir(), 'e2e-'));
       S.runtimeDir = `/run/user/${UID}/aabe-${random}`;
       mkdirSync(S.runtimeDir, { mode: 0o700 });
+      // The vault's socket directory: short (socket paths are limited to ~100 bytes), outside the
+      // repository, owned by this user and closed to everyone else.
+      S.socketDir = `/run/user/${UID}/aabv-${random}`;
+      mkdirSync(S.socketDir, { mode: 0o700 });
       S.keyDir = path.join(S.tmp, 'keys');
       S.demoDb = path.join(S.tmp, 'northstar.sqlite');
       S.xauth = path.join(S.tmp, 'Xauthority');
@@ -946,6 +995,7 @@ describe.skipIf(!ENABLED)(
         const logs = logHaystacks();
         writeFileSync(path.join(keep, 'api.log'), logs['api stdout/stderr'] ?? '');
         writeFileSync(path.join(keep, 'worker.log'), logs['worker stdout/stderr'] ?? '');
+        writeFileSync(path.join(keep, 'vault.log'), logs['vault stdout/stderr'] ?? '');
         writeFileSync(path.join(keep, 'demo.log'), S.demo?.text() ?? '');
         if (S.dbName !== '') {
           const audit = await psql(
@@ -966,6 +1016,7 @@ describe.skipIf(!ENABLED)(
       writeWatchSpec(true);
       watchdog?.kill('SIGKILL');
       if (S.runtimeDir !== '') rmSync(S.runtimeDir, { recursive: true, force: true });
+      if (S.socketDir !== '') rmSync(S.socketDir, { recursive: true, force: true });
       if (S.tmp !== '') rmSync(S.tmp, { recursive: true, force: true });
       process.stdout.write(`\nPhase 2 e2e metrics: ${JSON.stringify(S.metrics, null, 2)}\n`);
     }, 60_000);
@@ -1050,7 +1101,8 @@ describe.skipIf(!ENABLED)(
         expect(S.keyBytes.length).toBe(32);
         expect(path.relative(REPO, S.keyDir).startsWith('..')).toBe(true);
 
-        /* API (no AAB_KEK_DIR) and worker */
+        /* vault (the only process that reads the key), then the API (no AAB_KEK_DIR) and the worker */
+        await startVault();
         S.apiPort = await freePort();
         S.apiBase = `http://127.0.0.1:${S.apiPort}`;
         await startApi();
@@ -1412,6 +1464,7 @@ describe.skipIf(!ENABLED)(
         const sandboxArgs = table.get(sandbox[0] as number)?.argv ?? [];
         expect(sandboxArgs).toEqual(expect.arrayContaining(['--die-with-parent', '--clearenv']));
         expect(sandboxArgs.join(' ')).not.toContain(S.keyDir);
+        expect(sandboxArgs.join(' ')).not.toContain(S.socketDir);
       }
       const mainPid = chromium[0] as number;
       const namespaces: string[] = [];
@@ -1442,6 +1495,9 @@ describe.skipIf(!ENABLED)(
       if (existsSync(`${root}/app/package.json`)) {
         expect(existsSync(`${root}${S.keyDir}`)).toBe(false);
         expect(existsSync(`${root}${path.join(S.keyDir, 'kek-v1.key')}`)).toBe(false);
+        // P3-14: nor the vault's sockets.
+        expect(existsSync(`${root}${S.socketDir}`)).toBe(false);
+        expect(existsSync(`${root}${vaultSocket('supervisor')}`)).toBe(false);
         expect(existsSync(`${root}${PG_DIR}`)).toBe(false);
         expect(existsSync(`${root}${os.homedir()}`)).toBe(false);
         expect(existsSync(`${root}${S.demoDb}`)).toBe(false);
@@ -1554,13 +1610,15 @@ describe.skipIf(!ENABLED)(
     });
 
     /* ============================================================ shutdown, then the log checks */
-    step('shutdown: SIGTERM both services; nothing of ours is left running', async () => {
+    step('shutdown: SIGTERM the services; nothing of ours is left running', async () => {
       S.metrics['rss MiB at end (api, worker)'] =
         `${Math.round(rssKb(S.api?.pid ?? 0) / 1024)}, ${Math.round(rssKb(S.worker?.pid ?? 0) / 1024)}`;
       await S.worker?.stop();
       await S.api?.stop();
+      await S.vault?.stop();
       expect(S.worker?.exit).toEqual({ code: 0, signal: null });
       expect(S.api?.exit).toEqual({ code: 0, signal: null });
+      expect(S.vault?.exit).toEqual({ code: 0, signal: null });
       const tree = browserTree(S.pids.workerAfter);
       expect(tree.chromium).toEqual([]);
       expect(tree.bwrap).toEqual([]);

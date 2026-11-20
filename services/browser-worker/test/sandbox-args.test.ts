@@ -29,6 +29,43 @@ function pairs(args: readonly string[], flag: string): string[] {
   return args.flatMap((arg, index) => (arg === flag ? [args[index + 1] ?? ''] : []));
 }
 
+describe('the vault socket directory is not given to the sandbox (P3-14)', () => {
+  const VAULT_DIR = '/run/aab-vault-socket-dir-canary';
+
+  it('appears in no argument or environment value of either launcher', async () => {
+    const previous = { ...process.env };
+    process.env['AAB_VAULT_SOCKET'] = `${VAULT_DIR}/supervisor/vault.sock`;
+    process.env['AAB_VAULT_SOCKET_DIR'] = VAULT_DIR;
+    try {
+      const docker = buildDockerRunArgs(
+        resolveJobRunnerConfig({ sandbox: 'docker', docker: { image: 'aab/browser-runner:test' } }),
+        request,
+      );
+      const bwrap = await buildBubblewrapArgs(resolveJobRunnerConfig({}), request);
+      for (const args of [docker, bwrap.args]) {
+        expect(args.join('\n')).not.toContain(VAULT_DIR);
+        expect(args.join('\n')).not.toMatch(/AAB_VAULT|vault\.sock/);
+      }
+      // The Docker job gets exactly one mount, its own job directory.
+      expect(pairs(docker, '--mount')).toEqual([
+        `type=bind,source=${request.jobDir},target=/run/aab,readonly`,
+      ]);
+      // bubblewrap binds only the system, the code, the runtime binaries and the job's own socket.
+      const sources = ['--bind', '--ro-bind', '--ro-bind-try'].flatMap((flag) =>
+        pairs(bwrap.args, flag),
+      );
+      expect(sources.filter((source) => /vault|\/run\/user|\/run\//.test(source))).toEqual([
+        request.socketPath,
+      ]);
+    } finally {
+      for (const key of ['AAB_VAULT_SOCKET', 'AAB_VAULT_SOCKET_DIR']) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+    }
+  });
+});
+
 describe('docker arguments', () => {
   const config = resolveJobRunnerConfig({
     sandbox: 'docker',
