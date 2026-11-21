@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from 'vitest';
-import { chmod, copyFile, mkdir, mkdtemp, readFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,6 +33,7 @@ interface Fixture {
   ids: { organizationId: string; userId: string; connectionId: string; secretId: string };
   secretType: string;
   plaintextUtf8: string;
+  syntheticKekHex: string;
   row: {
     algorithm: string;
     ciphertext: string;
@@ -72,7 +73,9 @@ async function phase2Snapshot(options: { corruptCiphertext?: boolean } = {}) {
   const kekDir = join(await mkdtemp(join(tmpdir(), 'aab-kek-')), 'keys');
   await mkdir(kekDir, { mode: 0o700 });
   await chmod(kekDir, 0o700);
-  await copyFile(join(FIXTURES, 'phase2-kek-v1.key'), join(kekDir, 'kek-v1.key'));
+  const kek = Buffer.from(fixture.syntheticKekHex, 'hex');
+  expect(kek.length).toBe(32);
+  await writeFile(join(kekDir, 'kek-v1.key'), kek, { mode: 0o600 });
   await chmod(join(kekDir, 'kek-v1.key'), 0o600);
   const socketDir = await makeSocketDir();
   cleanups.push(async () => {

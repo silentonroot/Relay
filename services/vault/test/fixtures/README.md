@@ -2,8 +2,9 @@
 
 **Everything here is synthetic test material. None of it protects, or ever protected, real data.**
 
-- `phase2-kek-v1.key` is a 32-byte key-encryption key generated for this fixture only, with the
-  Phase 2 `generateLocalKek`. It is published in the repository on purpose: it exists so that a
+- The synthetic key is a 32-byte key-encryption key generated for this fixture only, with the
+  Phase 2 `generateLocalKek`. It is stored as the `syntheticKekHex` field of `phase2-snapshot.json`
+  (lowercase hex). It is published in the repository on purpose: it exists so that a
   test can open one synthetic ciphertext. It must never be used as, copied to, or derived into a
   real KEK. The secret scan (`.gitleaks.toml`) allowlists this directory for that reason and
   for no other.

@@ -1,5 +1,5 @@
 {
-  "_comment": "SYNTHETIC test fixture. Sealed by the Phase 2 code at git 640bd27 (packages/crypto sealSecret + LocalFileKekProvider) with the synthetic KEK in phase2-kek-v1.key. Not a real secret.",
+  "_comment": "SYNTHETIC test fixture. Sealed by the Phase 2 code at git 640bd27 (packages/crypto sealSecret + LocalFileKekProvider) with the synthetic KEK in the syntheticKekHex field. Not a real secret.",
   "sealedWithCommit": "640bd277dfad1d7c104b0f5f39638393da8b9f41",
   "ids": {
     "organizationId": "0a11f1c0-5a17-4c0d-8a00-000000000001",
@@ -18,5 +18,6 @@
     "wrappedDek": "1a3d594d3f732eb7de881e9a73d19e1bef4075061c4da31490a3334afa71bfa0b66b6b7e2a5c2d08dd390342112a41d58a47d91a4110fe7226602fd2",
     "kekVersion": 1,
     "aadVersion": 1
-  }
+  },
+  "syntheticKekHex": "1a4149d816c1c5e0b26f77049c4bd5664586109c80f6e7909fe0e385c1fc6a74"
 }
