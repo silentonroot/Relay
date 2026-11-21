@@ -58,13 +58,13 @@ job has neither a sandbox-capable browser nor the runner image. The Docker ones 
 
 ## Nightly: scheduled maintenance
 
-| Job          | What it does                                                                                                                                                                               |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `sandbox`    | Prepares the runner (`infra/ci/sandbox-prereqs.sh`) and runs the whole browser-worker suite with `AAB_REQUIRE_INTEGRATION=1`, so a missing prerequisite fails the run instead of skipping. |
-| `e2e`        | Checks out the Northstar demo next to the broker and runs the 15-step end-to-end test. Needs the repository variable `NORTHSTAR_DEMO_REPOSITORY`; without it the job passes with a notice. |
-| `image-scan` | Rebuilds the three images with fresh base layers and scans each for HIGH and CRITICAL vulnerabilities that have a fix (`infra/ci/scan-image.sh`).                                          |
-| `audit`      | The dependency audit and the secret scan again, because advisories appear without a commit.                                                                                                |
-| `report`     | When a scheduled run fails, opens an issue titled "Nightly run failed", or comments on the open one. It writes job results and a link, never log content.                                  |
+| Job          | What it does                                                                                                                                                                                    |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sandbox`    | Prepares the runner (`infra/ci/sandbox-prereqs.sh`) and runs the whole browser-worker suite with `AAB_REQUIRE_INTEGRATION=1`, so a missing prerequisite fails the run instead of skipping.      |
+| `e2e`        | Checks out the Northstar demo next to the broker and runs the 15-step end-to-end test. Needs the repository variable `NORTHSTAR_DEMO_REPOSITORY`; without it the job passes with a notice.      |
+| `image-scan` | Rebuilds the four images (broker-api, dashboard, browser-runner, vault) with fresh base layers and scans each for HIGH and CRITICAL vulnerabilities that have a fix (`infra/ci/scan-image.sh`). |
+| `audit`      | The dependency audit and the secret scan again, because advisories appear without a commit.                                                                                                     |
+| `report`     | When a scheduled run fails, opens an issue titled "Nightly run failed", or comments on the open one. It writes job results and a link, never log content.                                       |
 
 Why these are not in the pull-request gate: the sandbox and end-to-end tests start a real browser
 for every job and need a kernel setting changed on the runner; the image scan and the audit fail

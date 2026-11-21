@@ -6,7 +6,7 @@ name: Nightly
 #   sandbox     the bubblewrap + Chromium isolation tests, with skipping turned into failure
 #   e2e         the 15-step end-to-end test against the Northstar demo (needs the repository
 #               variable NORTHSTAR_DEMO_REPOSITORY; skipped with a notice without it)
-#   image-scan  rebuilds the three images and scans them for known vulnerabilities
+#   image-scan  rebuilds the four images (API, dashboard, runner, vault) and scans them for known vulnerabilities
 #   audit       dependency advisories, and a secret scan of the full history
 #   report      opens or updates one issue when a scheduled run fails
 #
@@ -142,7 +142,7 @@ jobs:
         # is pinned by digest and reads an image archive, so it needs no Docker socket.
         run: |
           status=0
-          for name in broker-api dashboard browser-runner; do
+          for name in broker-api dashboard browser-runner vault; do
             echo "::group::${name}"
             docker build --pull --file "infra/docker/${name}.Dockerfile" --tag "aab/${name}:scan" .
             infra/ci/scan-image.sh "aab/${name}:scan" || status=1
