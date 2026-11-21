@@ -2,7 +2,7 @@
 
 - **Status:** Planning, with steps B0.5 and B1 implemented (2026-11-16; both reviewed by Opus and pushed as 44f353b and 2dfc330),
   steps B2a (vault skeleton, protocol, crypto helpers; 2026-11-17) and B2b (vault operations; 2026-11-19) implemented and reviewed by Opus (B2a, B2b and the B2 review fixes committed and pushed as 06bfcdf and eaf7167; CI passed), and the wiring B3a (API) and B3b (supervisor, infra; 2026-11-19) implemented and reviewed by Opus (no Critical or High; 3 Medium and 8 Low findings, all fixed with tests). Verified on 2026-11-19 on PostgreSQL 17: database 319, vault 196, vault-client 12, contracts 72, browser-worker 272 (+15 skipped e2e) and broker-api 158 tests passing (three broker-api files hit 10 s hook timeouts under load on the first run and passed alone; hook timeout now 60 s); typecheck, lint and format clean; the Phase 2 end-to-end test passed twice (15/15) with the vault in the path. Compose and the Docker images were checked with `docker compose config` only, not built locally (CI builds them). Written on 2026-11-16 from [ADR-014](adr/ADR-014-vault-service.md) and the code as
-  it stood at commit `b714c6d`. `services/vault` exists (B2a, B2b) and is wired to the API and the supervisor (B3a, B3b); step B4 (key versioning and rewrap; 2026-11-19, reviewed by Opus: one High (operations procedure), two Medium and three Low findings, all fixed; verified on PostgreSQL 17 with every suite and the end-to-end test passing twice) is implemented; step B5a (the API half of B5: vault metadata reads and the two lifecycle actions, 2026-11-20; reviewed by Opus: no Critical or High, three Medium and six Low findings, all fixed with tests) and B5b (dashboard screens, 2026-11-20; checked in a browser against the real local stack, not separately reviewed) are implemented; verified on PostgreSQL 17 with every suite and the end-to-end test passing twice. B6a (the socket negative tests and the coverage map) and B6b (the Phase 3 end-to-end test) are implemented and were run locally on 2026-11-20, and B6c (coverage gaps closed, statuses, the checklist and the review scope; docs and tests only) is written; see the subsections under B6. The Opus internal review of B6 is done (no Critical or High; three Medium and seven Low findings, all fixed; see "B6 review fixes"), and every suite plus both end-to-end files (twice, 21/21) passed on PostgreSQL 17 on 2026-11-20. **Nightly run 44898131882 (scheduled, 2026-11-21, commit 4efa110, which contains all of B6): the End-to-end test job passed (both end-to-end files, about 85 s), and so did Advisories and secret scan and Sandbox isolation tests; Rebuild and scan images failed on the dashboard image (its nginx-unprivileged 1.30-alpine base has Critical and High findings; issue #4, Dependabot PR #2 waits on the owner), so the run as a whole failed. Whether the vault image was scanned in that run is not known. Still pending: the independent review of the vault boundary (by a person who is not the author; to be scheduled by the owner) and a nightly run in which every job passes, the image scan included. Phase 3 is not done and real credentials stay excluded.**
+  it stood at commit `b714c6d`. `services/vault` exists (B2a, B2b) and is wired to the API and the supervisor (B3a, B3b); step B4 (key versioning and rewrap; 2026-11-19, reviewed by Opus: one High (operations procedure), two Medium and three Low findings, all fixed; verified on PostgreSQL 17 with every suite and the end-to-end test passing twice) is implemented; step B5a (the API half of B5: vault metadata reads and the two lifecycle actions, 2026-11-20; reviewed by Opus: no Critical or High, three Medium and six Low findings, all fixed with tests) and B5b (dashboard screens, 2026-11-20; checked in a browser against the real local stack, not separately reviewed) are implemented; verified on PostgreSQL 17 with every suite and the end-to-end test passing twice. B6a (the socket negative tests and the coverage map) and B6b (the Phase 3 end-to-end test) are implemented and were run locally on 2026-11-20, and B6c (coverage gaps closed, statuses, the checklist and the review scope; docs and tests only) is written; see the subsections under B6. The Opus internal review of B6 is done (no Critical or High; three Medium and seven Low findings, all fixed; see "B6 review fixes"), and every suite plus both end-to-end files (twice, 21/21) passed on PostgreSQL 17 on 2026-11-20. **Recorded runs, 2026-11-21, commit 1a364c9: nightly run 44930337067 (manual, after pull request #2 moved the dashboard base image to nginx 1.31) passed all four jobs (Sandbox isolation tests, Rebuild and scan images, End-to-end test, Advisories and secret scan), and CI run 44930268590 (`ci.yml`, push) passed all five. The image scan covers all four images, the vault included. Earlier, the scheduled nightly run 44898131882 (commit 4efa110) had passed three jobs and failed the image scan on the dashboard image (issue #4, still open; its cause was fixed by PR #2). Step B6 is still not done, only because the independent review of the vault boundary (by a person who is not the author; to be scheduled by the owner) has not happened. Phase 3 is not done and real credentials stay excluded.**
 - **Specification:** §6 (vault), §11 (`vault_access_capabilities`, `execution_jobs.capability_ref`),
   §15 Phase 3. Exit criteria: workers can use only secrets for authorized jobs; database-only theft
   yields ciphertext; vault tests pass.
@@ -57,7 +57,7 @@ Commit or tag reviewed: not done (the reviewer names the commit; the evidence be
 
 Evidence marks: "ran" means the test ran and passed in a local run on 2026-11-20 on one machine (the
 in-process database and a throwaway PostgreSQL 17); "read" means a person or model read it and nothing
-was run. The only recorded nightly run of Phase 3 is run 44898131882 (scheduled, 2026-11-21, commit 4efa110); it is cited where a line rests on it (the end-to-end test, the secret scan, the dependency audit), and no other line is a recorded run. That run failed as a whole, on the dashboard image scan, which is unrelated to Phase 3 (issue #4).
+was run. The recorded runs of Phase 3 are nightly run 44930337067 (manual, 2026-11-21, commit 1a364c9; all four jobs passed: the sandbox, image scan, end-to-end and audit jobs) and CI run 44930268590 (`ci.yml`, push, same commit; all five jobs passed, including the vault, API and database suites); the earlier scheduled run 44898131882 (commit 4efa110) passed three jobs and failed the image scan on the dashboard image (issue #4, still open; fixed by PR #2). A line rests on a recorded run where it cites one. Lines marked "local run" were first made locally on 2026-11-20; the same suites have since passed in the runs above, which only job conclusions were checked for, not logs.
 
 ## 1. Scope
 
@@ -91,7 +91,7 @@ was run. The only recorded nightly run of Phase 3 is run 44898131882 (scheduled,
 - [x] `docs/threat-model.md` updated for new assets, entry points and attackers (section 4.10,
       2026-11-16) and its statuses set from the coverage map (2026-11-20, B6c).
 - [x] Each abuse case VS-1 to VS-22 has a negative test or a recorded reason: 19 rows have tests
-      (local run); VS-12 and VS-19 are accepted limits with their reasons (no test by design); VS-9
+      (local run 2026-11-20, then CI run 44930268590 and nightly run 44930337067, 2026-11-21); VS-12 and VS-19 are accepted limits with their reasons (no test by design); VS-9
       keeps its two tested parts and records why a third user's connect is not tested (needs a second
       uid). VS-9 is still **Partial** in the threat model.
 
@@ -109,13 +109,13 @@ was run. The only recorded nightly run of Phase 3 is run 44898131882 (scheduled,
 
 - [x] Canary scan extended to tokens, MACs and vault logs (P3-15). Done in B6b (`phase3.e2e.test.ts`
       step 4); ran locally in B6b and again in B6c (see the B6c section), and passed in nightly run
-      44898131882 (scheduled, 2026-11-21, commit 4efa110; End-to-end test job; the run as a whole failed
-      on the unrelated dashboard image scan).
+      44930337067 (manual, 2026-11-21, commit 1a364c9; all four jobs passed; it also passed in the
+      earlier scheduled run 44898131882).
 - [x] Secret scan clean. The "Advisories and secret scan" job of the nightly workflow (gitleaks over the
-      full history) passed in nightly run 44898131882 (scheduled, 2026-11-21, commit 4efa110, which
-      contains all of B6); only the job result was checked, not its log. The run as a whole failed on
-      the unrelated dashboard image scan. The repository's other secret scan is the `secret-scan` job of
-      `ci.yml` (gitleaks); it passed at that commit (CI run 44867034364). A local run was
+      full history) passed in nightly run 44930337067 (manual, 2026-11-21, commit 1a364c9, all four jobs
+      passed; it also passed in scheduled run 44898131882 at 4efa110); only the job result was checked,
+      not its log. The repository's other secret scan is the `secret-scan` job of
+      `ci.yml` (gitleaks); it passed at 1a364c9 (CI run 44930268590) and at 4efa110 (CI run 44867034364). A local run was
       made in the B6 review fixes with a gitleaks v8.30.1 image that was already on the machine (the
       version CI pins; its digest was not compared), invoked as the CI job does (the `git` command, no
       network, read-only mount): 24 commits scanned including the review-fixes commit, no leaks found.
@@ -199,10 +199,11 @@ was run. The only recorded nightly run of Phase 3 is run 44898131882 (scheduled,
 - [x] Install-script allowlist unchanged: `pnpm-workspace.yaml` has no diff since commit 640bd27
       (read).
 - [x] Dependency audit passes. The blocking audit (`pnpm audit --prod --audit-level high`) is a step of the
-      "Advisories and secret scan" job of the nightly workflow, which passed in nightly run 44898131882
-      (scheduled, 2026-11-21, commit 4efa110); only the job result was checked, not its log. The run as a
-      whole failed on the unrelated dashboard image scan. The local B6c run did not use the network, and
-      the `dependency-audit` job of `ci.yml` passed at that commit (CI run 44867034364).
+      "Advisories and secret scan" job of the nightly workflow, which passed in nightly run 44930337067
+      (manual, 2026-11-21, commit 1a364c9; all four jobs passed; it also passed in scheduled run
+      44898131882 at 4efa110); only the job result was checked, not its log. The local B6c run did not
+      use the network, and the `dependency-audit` job of `ci.yml` passed at 1a364c9 (CI run
+      44930268590, "Dependency audit") and at 4efa110 (CI run 44867034364).
 
 ## 12. Claims review
 
@@ -233,8 +234,8 @@ was run. The only recorded nightly run of Phase 3 is run 44898131882 (scheduled,
 - [ ] Reviewer. Not done: the independent review of the vault boundary is not scheduled
       (see "Independent review: scope").
 - [ ] Open exceptions. None recorded; the exceptions would be the unchecked boxes above (8.1,
-      8.3, 9.3) and the failed image scan of nightly run 44898131882 (the dashboard image; whether the vault
-      image was scanned is not known), each with what it needs.
+      8.3, 9.3), each with what it needs. The image scan is no longer one: it passed for all four images
+      in nightly run 44930337067 (2026-11-21).
 ```
 
 ## 3. Implementation breakdown
@@ -633,10 +634,11 @@ secrets-scan,startup-database,cli}.test.ts` plus the B2a files. Covered on PGlit
 - Done when: P3-5, P3-15 and P3-16 pass in a recorded nightly run, every VS row has a proving test or
   a recorded reason, and the review is scheduled with its scope written down. Real credentials stay
   excluded until the review's findings are closed.
-- Status on 2026-11-21: P3-5, P3-15 and P3-16 passed in nightly run 44898131882 (End-to-end test job; the
-  run as a whole failed on the unrelated dashboard image scan). Every VS row has a proving test or a
-  recorded reason (B6c). The scope of the review is written down, but the review is not scheduled, so
-  the step is not done.
+- Status on 2026-11-21: P3-5, P3-15 and P3-16 passed in nightly run 44898131882 (End-to-end test job; that
+  scheduled run failed as a whole on the dashboard image scan) and again in nightly run 44930337067 (manual,
+  commit 1a364c9), in which all four jobs passed. Every VS row has a proving test or a recorded reason
+  (B6c). The scope of the review is written down, but the review is not scheduled. The step is not done,
+  and the only reason is the independent review: the nightly condition is met, the review has not happened.
 - Model: Opus for the tests and the internal review; the independent review is by a person.
 
 #### B6a Socket negative tests and coverage map (2026-11-20)
@@ -651,7 +653,7 @@ real runs.
 with their package or service. "Proven" means a named test asserts the property and its assertion was
 read in B6a, or (marked in the gap column) that the name exists and the body was not re-read. "Partial"
 says what is missing; "none" is an accepted limit with no test by design. Counts: 34 proven, 9 partial,
-3 none, of 46 rows (20 invariants, 22 `VS` rows and 4 others). After B6b: 39 proven, 4 partial, 3 none; after B6c: 42 proven, 1 partial (VS-9), 3 none, because P3-7, VS-6 and P3-19 were closed by tests (see their rows); P3-5, P3-15, P3-16, VA-12 and VS-16 became proven on a local run of the end-to-end test, and that test then passed in nightly run 44898131882 (scheduled, 2026-11-21, commit 4efa110; End-to-end test job, both end-to-end files, about 85 s; the run as a whole failed on the unrelated dashboard image scan).
+3 none, of 46 rows (20 invariants, 22 `VS` rows and 4 others). After B6b: 39 proven, 4 partial, 3 none; after B6c: 42 proven, 1 partial (VS-9), 3 none, because P3-7, VS-6 and P3-19 were closed by tests (see their rows); P3-5, P3-15, P3-16, VA-12 and VS-16 became proven on a local run of the end-to-end test, and that test then passed in nightly run 44898131882 (scheduled, 2026-11-21, commit 4efa110; End-to-end test job, both end-to-end files, about 85 s; that run failed on the dashboard image scan) and in nightly run 44930337067 (manual, 2026-11-21, commit 1a364c9), in which all four jobs passed. The vault, API and database suites passed in CI run 44930268590 at the same commit.
 
 | P3/VS id | Proving test(s)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Status  | Gap or reason                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -734,13 +736,15 @@ the vault in the path of every read. The shared set-up moved to `test/e2e/harnes
 (`fileParallelism: false`), and each run has its own database, directories and display, so the two files
 share no port, database or socket (the demo port 4100 is free again when a file ends).
 
-**Status: passed in a recorded nightly run.** Local run: one machine, 2026-11-20, PostgreSQL 17. Recorded
-run: nightly run 44898131882 (scheduled, 2026-11-21, commit 4efa110, which contains all of B6). Its End-to-end
-test job succeeded with `NORTHSTAR_DEMO_REPOSITORY` set: the demo checkout, the runner preparation with
-PostgreSQL and `pnpm run test:e2e` (both files, phase2 and phase3) passed in about 85 s. Only the job and step
-results were checked, not the logs. The run as a whole failed, on its Rebuild and scan images job (the
-dashboard image; issue #4), which is unrelated to this test. Only the threat-model rows VA-12 and VS-16 and
-the acceptance-matrix row AT-009 (still Implemented (unverified), awaiting the lead) were updated from it.
+**Status: passed in recorded nightly runs.** Local run: one machine, 2026-11-20, PostgreSQL 17. Recorded
+runs: nightly run 44898131882 (scheduled, 2026-11-21, commit 4efa110, which contains all of B6), whose End-to-end
+test job succeeded with `NORTHSTAR_DEMO_REPOSITORY` set (the demo checkout, the runner preparation with
+PostgreSQL and `pnpm run test:e2e`, both files, phase2 and phase3, in about 85 s) although the run failed
+as a whole on its image scan (the dashboard image; issue #4); and nightly run 44930337067 (manual, 2026-11-21,
+commit 1a364c9, after pull request #2), in which all four jobs passed. Only the job and step results were
+checked, not the logs. After the second run the threat-model rows that waited on a nightly run were moved to
+**Exists** (with CI run 44930268590 for the vault, API and database suites); the acceptance-matrix row
+AT-009 stays Implemented (unverified), awaiting the lead.
 
 Steps (all synthetic data; the worker holds no key):
 
@@ -1062,7 +1066,7 @@ not under review, only their use.
 **Evidence the reviewer gets.**
 
 - The coverage map above (every invariant and `VS` row to a named test, with the gap column) and the
-  statuses in the threat model and the acceptance matrix (AT-009), each marked as a local run or, for the end-to-end test, as nightly run 44898131882 (2026-11-21).
+  statuses in the threat model and the acceptance matrix (AT-009), as marked there: plain Exists rests on nightly run 44930337067 and CI run 44930268590 (both 2026-11-21, commit 1a364c9); AT-009 awaits the lead.
 - The suites: `corepack pnpm --filter @aab/vault test`, `@aab/database`, `@aab/broker-api` and
   `@aab/browser-worker`, each on the default in-process database (PGlite) and with
   `AAB_TEST_DATABASE_URL` pointing at a PostgreSQL 17 server whose role may create databases (the
@@ -1072,10 +1076,12 @@ typecheck`, `lint`, `format:check`.
   Northstar demo checked out next to the repository (`AAB_E2E_DEMO_DIR`):
   `AAB_E2E=1 AAB_E2E_PG_BIN=/usr/lib/postgresql/17/bin vitest run --root services/browser-worker test/e2e/phase3.e2e.test.ts`
   (about 70 to 90 s; the Phase 2 file `phase2.e2e.test.ts` shares its harness). The nightly workflow runs
-  it with `NORTHSTAR_DEMO_REPOSITORY` set; nightly run 44898131882 (scheduled, 2026-11-21, commit 4efa110)
-  ran it and it passed. That run failed as a whole on the dashboard image scan, and whether the vault image was
-  scanned in it is not known, so it does not show that the vault image scans clean. The other rows stay
-  "local run".
+  it with `NORTHSTAR_DEMO_REPOSITORY` set; nightly run 44930337067 (manual, 2026-11-21, commit 1a364c9) ran
+  it and all four of its jobs passed, so it also shows that the four images, the vault image included,
+  scanned with no blocking findings (the job loops over them and fails on the first with findings; only job
+  conclusions were checked, not logs). The earlier scheduled run 44898131882 failed on the dashboard image
+  scan, fixed by pull request #2. The vault, API and database suites passed in CI run 44930268590. This is
+  not a review: no one but the authors has read the boundary.
 - The B6a, B6b and B6c sections of this file (what each added, what each does not prove, the mutation
   checks) and [ADR-014](adr/ADR-014-vault-service.md).
 - What the reviewer must still produce: findings with severity, the commit read, and a statement of
