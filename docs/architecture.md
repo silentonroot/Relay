@@ -1,7 +1,8 @@
 # Architecture
 
-This document describes how Agent Access Broker (AAB) is put together. It separates what exists at
-the end of Phase 2 from the target architecture of the specification (`docs/spec/aab-spec.md`,
+This document describes how Agent Access Broker (AAB) is put together. It separates what exists
+(Phase 2, plus the Phase 3 vault boundary of [ADR-014](adr/ADR-014-vault-service.md), which has had local
+tests only and no independent review) from the target architecture of the specification (`docs/spec/aab-spec.md`,
 version 0.3), because the two are still far apart and mixing them would overstate what the software
 does.
 
@@ -27,12 +28,14 @@ worker perform it. The worker returns a minimal, sanitized result. The rule unde
 that **an agent is not a credential holder**
 ([ADR-001](adr/ADR-001-trust-boundaries-worker-isolation.md)).
 
-At the end of Phase 2 AAB can connect one synthetic application, store an encrypted session for it,
-and run two read operations on it through a sandboxed browser, called by the signed-in owner acting
-as one of their agents. It is still not a usable product: there is no vault service, no approvals, no
-write operations, no agent credentials, no agent gateway and no MCP server.
+AAB can connect one synthetic application, store an encrypted session for it, and run two read
+operations on it through a sandboxed browser, called by the signed-in owner acting as one of their
+agents. Since Phase 3 the key-encryption key is held by a separate **vault service** only: the API and
+the worker's supervisor hold no key and get a session only through single-use capabilities on the
+vault's per-role Unix sockets. It is still not a usable product: there are no approvals, no write
+operations, no agent credentials, no agent gateway and no MCP server.
 
-## 2. The system today (end of Phase 2)
+## 2. The system today (Phase 2 and the Phase 3 vault)
 
 ```mermaid
 flowchart LR
@@ -45,9 +48,12 @@ flowchart LR
     API["broker-api: Fastify"]
   end
   PG[("PostgreSQL")]
-  K[["Key directory: KEK file"]]
+  subgraph VB["Vault boundary, its own process, Unix sockets only"]
+    V["Vault service: api, supervisor and admin sockets"]
+    K[["Key directory: KEK files, readable by the vault only"]]
+  end
   subgraph WK["Browser worker service, run on the host, not in Compose"]
-    SUP["Supervisor: job loop, session store, policy re-check"]
+    SUP["Supervisor: job loop, snapshot parsing, policy re-check, vault client"]
     PX["Egress proxy, one per job"]
     subgraph SBX["Per-job sandbox: bubblewrap, no network, no key"]
       RUN["Runner: Chromium and the adapter"]
@@ -58,7 +64,10 @@ flowchart LR
   NG -->|"/v1"| API
   API -->|"policy decision, job rows, audit"| PG
   SUP -->|"claims jobs, writes outcomes"| PG
-  SUP -->|"reads the key at start-up"| K
+  API -->|"api socket: authorize a job's access"| V
+  SUP -->|"supervisor socket: issue, read, complete login"| V
+  V -->|"reads the KEK at start-up"| K
+  V -->|"capabilities, sealed versions, audit"| PG
   SUP -->|"job on stdin, result on stdout"| RUN
   RUN -->|"Unix socket"| PX
   PX -->|"allowed origins only"| APP
@@ -82,15 +91,23 @@ What the diagram shows and what it leaves out:
 - The Northstar adapter now has `execute`, `checkSession`, `loginPath` and `sessionCheckPaths` for
   `orders.list` and `orders.get`. Both the API and the worker load it from a static registry. The API
   reads it as data (descriptors, schemas, the login path); only the worker runs its code.
+- The vault is a third long-lived process with its own database connection. It listens on three Unix
+  sockets and never on TCP: `api` (authorize a job's access, status), `supervisor` (issue a token, read a
+  session, complete a login) and `admin` (status, rewrap, retirement check). The socket a request
+  arrives on is its role, and each operation has a fixed set of roles; no request field selects one.
+  It is the only process that loads the KEK and the only one that seals, opens or rewraps a secret. It
+  releases a session only against a single-use, expiring capability bound to one job, connection,
+  operation, secret version, worker and attempt ([ADR-014](adr/ADR-014-vault-service.md), sections 1
+  to 6). Revocation is a database transaction in the API, not a vault call (ADR-014 section 7).
 
 ### 2.1 The two worker roles
 
 The worker service has two roles ([ADR-013](adr/ADR-013-per-job-sandbox-egress-proxy.md)):
 
-| Role           | Lifetime    | Holds                                                                                          | Does not hold                                                         |
-| -------------- | ----------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| **Supervisor** | Long-lived  | The database connection, the KEK, the session store, the egress proxy and the sandbox launcher | A browser. It never parses a web page.                                |
-| **Runner**     | One per job | One decrypted session snapshot, one validated operation, a browser, the adapter code           | The KEK, database credentials, any other connection's data, a network |
+| Role           | Lifetime    | Holds                                                                                                                              | Does not hold                                                                                                                                                |
+| -------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Supervisor** | Long-lived  | The database connection, a vault client on the supervisor-role socket, snapshot parsing, the egress proxy and the sandbox launcher | A key (it refuses to start with `AAB_KEK_DIR` set, and in `separate-uid` isolation if it can open the key directory), a browser. It never parses a web page. |
+| **Runner**     | One per job | One decrypted session snapshot, one validated operation, a browser, the adapter code                                               | The KEK, any vault socket, database credentials, any other connection's data, a network                                                                      |
 
 The supervisor treats the runner as untrusted. Everything the runner writes is read under a size cap,
 checked as plain JSON, parsed with a strict schema and bounded; the runner's error text is thrown away
@@ -155,18 +172,30 @@ sandbox starts. That rule is provisional until the owner confirms it.
 ### 2.4 Where the key lives
 
 The key-encryption key is a file in a directory outside the repository and the database
-([ADR-003](adr/ADR-003-local-vault-root-key.md)). Only the worker's supervisor reads it, in its session
-store (`src/session-store/index.ts`), which is the only code in the worker that seals or opens a
-secret. The runner's sandbox does not mount the directory, the API is run without `AAB_KEK_DIR`
-(it would load and permission-check a key directory if given one, but uses no key), and Compose does
-not mount it anywhere. A test checks that only the session store and the scripts import
-the crypto package and that the runner, sandbox and egress code import neither it nor the database
-package. Until Phase 3 moves this behind a vault service, a compromised supervisor or host has the key
-and every session.
+([ADR-003](adr/ADR-003-local-vault-root-key.md)). Only the vault process reads it
+(`services/vault/src/keys.ts`), and only the vault calls `sealSecret`, `openSecret` or `rewrapSecret`
+([ADR-014](adr/ADR-014-vault-service.md) section 3). The API and the worker's supervisor hold no key:
+both refuse to start when `AAB_KEK_DIR` is set, and in `separate-uid` isolation both refuse to start
+when their user can open the vault's key directory. Under `shared-uid` isolation (one user, explicit
+only) that check is a warning: any process of that user can read the key files, so nothing there
+protects against code running as that user. The same holds under the Docker launcher, where the
+supervisor can reach the container engine's socket, which is root-equivalent. The runner's sandbox mounts
+neither the key directory nor the vault's socket directory, and Compose mounts the key volume into the
+vault (and the one-shot that creates the first key) only. Tests check that no module of the worker or
+the API imports the sealing, opening or rewrapping functions or a KEK provider
+(`services/browser-worker/test/session-store/import-boundary.test.ts`,
+`services/broker-api/test/import-boundary.test.ts`).
 
-The session store builds the encryption's associated data from the connection row it loaded, so a
-ciphertext row moved to another connection, owner, secret or version does not open. Only the login
-handoff writes a snapshot; an operation job never writes session state back.
+The vault builds the encryption's associated data from the connection row and the capability binding,
+never from anything stored beside the ciphertext, so a ciphertext row moved to another connection,
+owner, secret or version does not open. Only the login handoff writes a snapshot, through the vault's
+`completeLogin`; an operation job never writes session state back. The worker's session store
+(`services/browser-worker/src/session-store/index.ts`) now only parses, validates and size-limits a
+storage state and hands the vault its base64url plaintext.
+
+What a compromised component reaches after Phase 3 is in ADR-014 ("What a compromised component can
+and cannot do after Phase 3") and in [`security.md`](security.md): a compromised supervisor reads the
+sessions of the jobs it claims, not the key; the database role is still shared by every service.
 
 ## 3. The target architecture (specification section 3)
 
@@ -208,8 +237,8 @@ flowchart TD
 ```
 
 In this diagram the control plane's registry, policy library and audit library are built, and so are
-the queue (as a polling loop over `execution_jobs`) and the browser worker. The vault service, the
-approval service, the orchestrator, the agent gateway and API workers are **planned**. The target has
+the queue (as a polling loop over `execution_jobs`), the browser worker and, since Phase 3, the vault
+service. The approval service, the orchestrator, the agent gateway and API workers are **planned**. The target has
 three planes with different jobs:
 
 - **Control plane.** Authenticates callers, evaluates policy, records decisions, creates jobs. It
@@ -218,8 +247,9 @@ three planes with different jobs:
   plaintext session material in memory for one job. The claim is that the _model_ cannot see it. The
   claim is not that no process ever does.
 - **Vault boundary.** The only code that turns ciphertext into plaintext and the only reader of the
-  key-encryption keys. It releases plaintext to a worker that presents a capability bound to one job,
-  one connection and one operation.
+  key-encryption keys (built in Phase 3 as `services/vault`, with KEK files only; a KMS is not built).
+  It releases plaintext to a worker that presents a capability bound to one job, one connection and
+  one operation.
 
 The owner brought worker isolation forward into Phase 2: every job runs in its own sandbox with no
 network, reachable only through the supervisor's egress proxy
@@ -242,41 +272,45 @@ flowchart BT
   NS --> CT
   DB["database"] --> CT
   DB --> AU
+  VC["vault-client"] --> CT
   API["services/broker-api"] --> CT
   API --> DB
   API --> AU
   API --> CR
+  API --> VC
   API --> PE
   API --> SDK
   API --> NS
   BW["services/browser-worker"] --> CT
   BW --> DB
   BW --> AU
-  BW --> CR
+  BW --> VC
   BW --> PE
   BW --> SDK
   BW --> NS
   VLT["services/vault"] --> CT
   VLT --> CR
+  VLT --> DB
   DASH["apps/dashboard"] --> CT
 ```
 
 Dependencies are taken from each package's `package.json`. Workspace package names use the `@aab/`
 scope.
 
-| Package                       | Kind                | What it holds                                                                                                                                                                                                                                                                                                                                                          | Depends on (workspace)                                                            |
-| ----------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| `packages/contracts`          | Library, the bottom | Every shared schema and type, the error codes, the `Routes` constant, `OperationDescriptor`, the policy request and decision, `CONNECTION_TRANSITIONS`, `canonicalJson`.                                                                                                                                                                                               | none (Zod)                                                                        |
-| `packages/audit`              | Pure library        | `computeEventHash`, `verifyChain`, `redactMetadata`. No I/O.                                                                                                                                                                                                                                                                                                           | contracts                                                                         |
-| `packages/crypto`             | Library             | `sealSecret`, `openSecret`, `rewrapSecret`, KEK providers, scrypt password hashing, token generation and hashing. The only file access is the local KEK provider, which reads key files. Used by the API for password and token hashing and by the worker's session store for sessions.                                                                                | contracts                                                                         |
-| `packages/policy-engine`      | Pure library        | `evaluate`: one function, no I/O, no clock of its own.                                                                                                                                                                                                                                                                                                                 | contracts                                                                         |
-| `packages/adapter-sdk`        | Pure library        | `defineAdapter`, `defineOperation`, input validation, output sanitization, the navigation guard, the adapter registry, the `BrowserSession` and `WorkerContext` interfaces.                                                                                                                                                                                            | contracts                                                                         |
-| `packages/adapters/northstar` | Adapter             | Operation definitions, UI selector constants, `execute` and `checkSession` for the synthetic demo. Read operations only.                                                                                                                                                                                                                                               | contracts, adapter-sdk                                                            |
-| `packages/database`           | Library with I/O    | Drizzle schema, SQL migrations, the migration runner, repositories, PGlite test helper (`@aab/database/testing`).                                                                                                                                                                                                                                                      | contracts, audit                                                                  |
-| `services/broker-api`         | Service             | Fastify control plane: owner login and sessions, the resource routes, `POST /v1/operations/execute`, `GET /v1/operations/:jobId` and the login handoff routes. Creates jobs; never runs a browser or reads a key.                                                                                                                                                      | contracts, database, audit, crypto, policy-engine, adapter-sdk, adapter-northstar |
-| `services/browser-worker`     | Service             | The supervisor (job loop, session store, policy re-check, egress proxy, sandbox launchers) and the runner (browser facade, login and operation drivers) that runs inside the sandbox.                                                                                                                                                                                  | contracts, database, audit, crypto, policy-engine, adapter-sdk, adapter-northstar |
-| `services/vault`              | Service (skeleton)  | Built in step B2a: configuration with refusals, per-role Unix sockets and their safety checks, the newline-delimited JSON protocol with strict schemas, the `hello` operation, KEK loading and capability MAC key derivation, a redacting logger. Every other operation is a stub answering `not_implemented` until B2b. Not yet called by the API or the worker (B3). | contracts, crypto                                                                 |
-| `apps/dashboard`              | Web app             | React 19, Vite, TanStack Query. Talks to the API through a typed client and never to the database.                                                                                                                                                                                                                                                                     | contracts                                                                         |
+| Package                       | Kind                | What it holds                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Depends on (workspace)                                                                          |
+| ----------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `packages/contracts`          | Library, the bottom | Every shared schema and type, the error codes, the `Routes` constant, `OperationDescriptor`, the policy request and decision, `CONNECTION_TRANSITIONS`, `canonicalJson`.                                                                                                                                                                                                                                                                                                               | none (Zod)                                                                                      |
+| `packages/audit`              | Pure library        | `computeEventHash`, `verifyChain`, `redactMetadata`. No I/O.                                                                                                                                                                                                                                                                                                                                                                                                                           | contracts                                                                                       |
+| `packages/crypto`             | Library             | `sealSecret`, `openSecret`, `rewrapSecret`, KEK providers, scrypt password hashing, token generation and hashing. The only file access is the local KEK provider, which reads key files. Used by the vault for sessions, key versions and the capability MAC keys, and by the API for password and token hashing.                                                                                                                                                                      | contracts                                                                                       |
+| `packages/vault-client`       | Library with I/O    | The client for the vault's Unix sockets, used by the API (api role) and the supervisor (supervisor role): typed calls with size and time limits. It holds no key and has no database access.                                                                                                                                                                                                                                                                                           | contracts                                                                                       |
+| `packages/policy-engine`      | Pure library        | `evaluate`: one function, no I/O, no clock of its own.                                                                                                                                                                                                                                                                                                                                                                                                                                 | contracts                                                                                       |
+| `packages/adapter-sdk`        | Pure library        | `defineAdapter`, `defineOperation`, input validation, output sanitization, the navigation guard, the adapter registry, the `BrowserSession` and `WorkerContext` interfaces.                                                                                                                                                                                                                                                                                                            | contracts                                                                                       |
+| `packages/adapters/northstar` | Adapter             | Operation definitions, UI selector constants, `execute` and `checkSession` for the synthetic demo. Read operations only.                                                                                                                                                                                                                                                                                                                                                               | contracts, adapter-sdk                                                                          |
+| `packages/database`           | Library with I/O    | Drizzle schema, SQL migrations, the migration runner, repositories, PGlite test helper (`@aab/database/testing`).                                                                                                                                                                                                                                                                                                                                                                      | contracts, audit                                                                                |
+| `services/broker-api`         | Service             | Fastify control plane: owner login and sessions, the resource routes, `POST /v1/operations/execute`, `GET /v1/operations/:jobId` and the login handoff routes. Creates jobs; never runs a browser or reads a key.                                                                                                                                                                                                                                                                      | contracts, database, audit, crypto, vault-client, policy-engine, adapter-sdk, adapter-northstar |
+| `services/browser-worker`     | Service             | The supervisor (job loop, vault gateway, snapshot parsing, policy re-check, egress proxy, sandbox launchers) and the runner (browser facade, login and operation drivers) that runs inside the sandbox.                                                                                                                                                                                                                                                                                | contracts, database, audit, vault-client, policy-engine, adapter-sdk, adapter-northstar         |
+| `services/vault`              | Service             | The vault (ADR-014): configuration with refusals, per-role Unix sockets and their safety checks, the newline-delimited JSON protocol with strict schemas, KEK loading, the operations `hello`, `authorizeJobAccess`, `issueAccessCapability`, `readForWorker`, `completeLogin`, `status`, `rewrap` and `kekRetirementCheck`, capability MACs, the rejection audit, the `vault` admin command and `init-kek`. Called by the API and the worker's supervisor; Phase 3, local tests only. | contracts, crypto, database                                                                     |
+| `apps/dashboard`              | Web app             | React 19, Vite, TanStack Query. Talks to the API through a typed client and never to the database.                                                                                                                                                                                                                                                                                                                                                                                     | contracts                                                                                       |
 
 Rules that the graph encodes:
 
@@ -292,9 +326,12 @@ Rules that the graph encodes:
   API reads adapters as data: policy descriptors come from `toOperationDescriptors`, input schemas
   validate arguments, and `loginPath` tells it whether a login can start. Only the worker runs
   adapter code, and only the runner, inside the sandbox.
-- **Key handling stays in one module.** Only the worker's session store and its scripts import
-  `@aab/crypto`; the runner, sandbox and egress code import neither it nor the database package. A
-  test enforces this (`test/session-store/import-boundary.test.ts`).
+- **Key handling stays in one service.** Only `services/vault` calls `sealSecret`, `openSecret` or
+  `rewrapSecret` or loads a KEK provider. The worker no longer depends on `@aab/crypto`; the API uses it
+  only for password and token hashing. Tests enforce this
+  (`services/browser-worker/test/session-store/import-boundary.test.ts`,
+  `services/broker-api/test/import-boundary.test.ts`), and the runner, sandbox and egress code import
+  neither the crypto package nor the database package.
 - Each package has one writer at a time. Nobody edits another package to make their own compile.
 
 Planned packages: `packages/agent-gateway` (Phase 6), `services/orchestrator` (Phase 7), `packages/observability` (when a
@@ -339,8 +376,13 @@ erDiagram
   login job per connection is non-terminal.
 - `operation_requests` maps an agent and an idempotency key to a job, with a hash of the request.
 - `vault_secrets` and `vault_secret_versions` hold the session snapshots: ciphertext, nonce, tag, the
-  wrapped data key and the key version, never plaintext. Deleting a connection's secret removes the
-  version rows and keeps the metadata row.
+  wrapped data key and the key version, never plaintext. Only the vault writes them. Deleting a
+  connection's secret removes the version rows and keeps the metadata row; revoking a connection sets
+  its secrets to the terminal status `revoked` (a trigger refuses any move out of it).
+- `vault_access_capabilities` (migration `0005_phase3_vault.sql`) holds one row per capability: the
+  binding (job, connection, operation, purpose, secret, arguments hash), the two stages' timestamps, the
+  token's SHA-256 hash (never the token) and two MACs under keys derived from the KEK, so a row written
+  or edited around the vault fails its check. Used and revoked rows are kept for seven days after expiry.
 - Approval and workflow tables are created by later migrations, in the phase that introduces the code
   that maintains them.
 
@@ -412,7 +454,7 @@ The properties this path is meant to have:
 
 ## 7. Operation path
 
-### 7.1 From `POST /v1/operations/execute` to the audit event (Phase 2)
+### 7.1 From `POST /v1/operations/execute` to the audit event (Phase 2, with the Phase 3 vault)
 
 This is the path of a read operation, called today by the signed-in owner who names one of their own
 agents (spec §8.3, §12.2). Writes, approvals, agent credentials and the gateway are not part of it.
@@ -423,6 +465,7 @@ sequenceDiagram
   participant O as Owner (dashboard)
   participant A as broker-api
   participant D as PostgreSQL
+  participant V as Vault service
   participant S as Worker supervisor
   participant R as Runner in the sandbox
   participant P as Egress proxy
@@ -438,10 +481,13 @@ sequenceDiagram
     A-->>O: 409 reauth_required, no job
   else allowed
     A->>D: one transaction with the policy.evaluated event, the queued job and the idempotency record
+    A->>V: authorizeJobAccess on the api socket (a capability, stage 1)
   end
-  S->>D: claim the job under a lease, one running job per connection
+  S->>D: claim the job under a lease, one running job per connection, only if it holds an authorization
   S->>D: load connection, agent and grants, validate and evaluate policy again
-  S->>D: open the snapshot with the KEK and audit vault.secret_read
+  S->>V: issueAccessCapability on the supervisor socket, then readForWorker with the token
+  V->>D: consume the capability, open the snapshot with the KEK, audit vault.secret_read
+  V-->>S: the snapshot, once
   S->>P: start the job's egress proxy with the allowed origins
   S->>R: start the sandbox, job and snapshot on standard input
   R->>R: start Chromium, run checkSession, compare the account label, run execute
@@ -472,8 +518,15 @@ Step by step, with where each rule lives:
    and grants itself and evaluates policy again (INV-3); a revoked grant, a disabled agent, an inactive
    connection or an operation that is not a read ends the job as `denied` or `cancelled` before any
    snapshot is opened.
-5. **Exactly one snapshot** is opened, for this connection, and the read is audited
-   (`vault.secret_read`) before the runner starts.
+5. **Exactly one snapshot** is opened, by the vault, for this connection, and the read is audited
+   (`vault.secret_read`) before the runner starts. The API asked the vault to authorize the job right
+   after the job committed (a job without an authorization is never claimed); the supervisor gets a
+   single-use token from the vault when it needs the session and presents it in the next call. The vault
+   consumes the capability in one conditional update that also checks the job, connection, operation,
+   secret version, worker and attempt, and refuses (with a plain `forbidden` and an audited reason) a
+   used, expired, revoked or mismatched token. A job whose capability cannot be authorized or redeemed
+   ends `vault_unavailable` or `vault_denied` and is not retried after a session was handed out. The
+   supervisor never opens a ciphertext and holds no key.
 6. **The sandbox runs the job.** Inside it the facade checks every navigation and redirect hop against
    the operation's allowed paths; `checkSession` runs first, a changed account label ends the job with
    `identity_mismatch`, and a navigation that lands on the login path means the session expired
@@ -488,7 +541,9 @@ Step by step, with where each rule lives:
    job, or `202` with the job still `queued` or `running`.
 
 A job whose worker dies is recovered by its expired lease: a retry-safe read is requeued (up to three
-attempts), anything else ends as `outcome_unknown`. Lease recovery writes its audit event in a second
+attempts) only if its capability was never issued, a read whose session was already handed out ends
+`failed` with `worker_failure` and its capability revoked (ADR-014 section 5), and anything else ends as
+`outcome_unknown`. Lease recovery writes its audit event in a second
 transaction, which a crash can interrupt (backlog AAB-019).
 
 Invariants this path satisfies, with the tests in the
@@ -510,6 +565,7 @@ sequenceDiagram
   participant O as Owner
   participant A as broker-api
   participant D as PostgreSQL
+  participant V as Vault service
   participant S as Worker supervisor
   participant R as Runner with a headed Chromium
 
@@ -524,8 +580,9 @@ sequenceDiagram
   S->>D: sees the request while polling and tells the runner to complete
   R->>R: run checkSession, capture the storage state, close the window
   R-->>S: storage state and the account label
-  S->>S: keep only allowed origins, compare the label with an earlier one, seal with the KEK
-  S->>D: one transaction with the snapshot, connection to active, the events and the job completion
+  S->>S: keep only allowed origins and the size cap, check the account label against the recorded one
+  S->>V: issueAccessCapability, then completeLogin with the storage state (a seal capability)
+  V->>D: one transaction: seal with the KEK, the snapshot, connection to active, the events and the job completion
   A-->>O: 200 with the connection, or 202 to keep checking
 ```
 
@@ -540,9 +597,10 @@ desktop session or on Wayland (threat model SB-11).
 
 ### 7.3 What the full path adds later (planned)
 
-The specification's path (§8.3) also has an approval service, single-use scoped worker capabilities
-from a vault service, postcondition checks for writes, `outcome_unknown` for unconfirmed writes and
-agent credentials through the gateway. **None of that exists.** Until agents have credentials
+The specification's path (§8.3) also has an approval service, postcondition checks for writes,
+`outcome_unknown` for unconfirmed writes and agent credentials through the gateway. **None of that
+exists.** (Single-use scoped worker capabilities from a vault service exist since Phase 3, for reads and
+for login completion: section 7.1.) Until agents have credentials
 (Phase 6), the execute endpoint is called only by the signed-in owner.
 
 ## 8. Connection lifecycle
@@ -595,21 +653,21 @@ stateDiagram-v2
 
 ## 9. Trust boundaries by phase
 
-| Boundary             | End of Phase 2                                                                                                                                                                                                                                                 | Planned                                                                                                                                                     |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Agent to broker      | No agent interface exists. The signed-in owner calls the execute endpoint as one of their agents.                                                                                                                                                              | Phase 6: per-agent credentials, grant-filtered tool discovery ([ADR-007](adr/ADR-007-mcp-authentication-discovery.md), proposed).                           |
-| Owner to broker      | Cookie session, CSRF header, rate limiting and the first-owner bootstrap are built and tested against the in-process database; the end-to-end test ran them against PostgreSQL 18.                                                                             | OIDC and roles in Phase 10.                                                                                                                                 |
-| Broker to worker     | Job rows in PostgreSQL. The worker re-evaluates policy with grants it loads itself; reads only.                                                                                                                                                                | Approvals and writes in Phase 4; orchestration in Phase 7.                                                                                                  |
-| Supervisor to runner | One sandbox per job (bubblewrap): no network, no key, no database credentials, read-only mounts, empty environment. Job on standard input, outcome on standard output, treated as hostile. Docker launcher: default mode run, with Chromium's own sandbox off. | A reviewed seccomp and AppArmor pair for the Docker opt-in mode, resource limits for bubblewrap jobs, a seccomp filter (backlog AAB-017, AAB-018, AAB-024). |
-| Worker to secrets    | The supervisor reads the KEK and calls the crypto library directly through the session store. The runner receives one decrypted snapshot for one job.                                                                                                          | Phase 3: vault service, single-use capabilities, the KEK out of the supervisor.                                                                             |
-| Worker to target     | The egress proxy allows only the job's exact origins and checks resolved addresses; the facade checks paths and redirect hops inside the sandbox. A compromised runner is held to the origins, not to the paths.                                               | Subresource path limits are not planned; the origin limit is the control.                                                                                   |
-| Tenant to tenant     | Scoped repositories and isolation tests exist ([ADR-010](adr/ADR-010-tenant-ready-schema.md)). One organization in practice.                                                                                                                                   | Phase 10, with independent verification.                                                                                                                    |
-| Audit integrity      | Hash chain and verification library exist ([ADR-009](adr/ADR-009-audit-integrity.md)); the chain verified in the end-to-end run. No route verifies.                                                                                                            | Export to a protected sink. Not designed.                                                                                                                   |
+| Boundary             | Today (Phase 2 and the Phase 3 vault)                                                                                                                                                                                                                                                                                                                                                           | Planned                                                                                                                                                                               |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agent to broker      | No agent interface exists. The signed-in owner calls the execute endpoint as one of their agents.                                                                                                                                                                                                                                                                                               | Phase 6: per-agent credentials, grant-filtered tool discovery ([ADR-007](adr/ADR-007-mcp-authentication-discovery.md), proposed).                                                     |
+| Owner to broker      | Cookie session, CSRF header, rate limiting and the first-owner bootstrap are built and tested against the in-process database; the end-to-end test ran them against PostgreSQL 18.                                                                                                                                                                                                              | OIDC and roles in Phase 10.                                                                                                                                                           |
+| Broker to worker     | Job rows in PostgreSQL. The worker re-evaluates policy with grants it loads itself; reads only.                                                                                                                                                                                                                                                                                                 | Approvals and writes in Phase 4; orchestration in Phase 7.                                                                                                                            |
+| Supervisor to runner | One sandbox per job (bubblewrap): no network, no key, no database credentials, read-only mounts, empty environment. Job on standard input, outcome on standard output, treated as hostile. Docker launcher: default mode run, with Chromium's own sandbox off.                                                                                                                                  | A reviewed seccomp and AppArmor pair for the Docker opt-in mode, resource limits for bubblewrap jobs, a seccomp filter (backlog AAB-017, AAB-018, AAB-024).                           |
+| Worker to secrets    | The supervisor holds no key. It asks the separate vault process, on its own Unix socket, for a snapshot and gets one only against a single-use, expiring capability bound to the job, connection, operation, secret version, worker and attempt (Phase 3, ADR-014; local tests only, no independent review). The runner receives one decrypted snapshot for one job and cannot reach the vault. | Separate database roles per service (AAB-036, Phase 9) and an independent review of the vault boundary before any real credential. KMS or HSM and multi-host are out of scope so far. |
+| Worker to target     | The egress proxy allows only the job's exact origins and checks resolved addresses; the facade checks paths and redirect hops inside the sandbox. A compromised runner is held to the origins, not to the paths.                                                                                                                                                                                | Subresource path limits are not planned; the origin limit is the control.                                                                                                             |
+| Tenant to tenant     | Scoped repositories and isolation tests exist ([ADR-010](adr/ADR-010-tenant-ready-schema.md)). One organization in practice.                                                                                                                                                                                                                                                                    | Phase 10, with independent verification.                                                                                                                                              |
+| Audit integrity      | Hash chain and verification library exist ([ADR-009](adr/ADR-009-audit-integrity.md)); the chain verified in the end-to-end run. No route verifies.                                                                                                                                                                                                                                             | Export to a protected sink. Not designed.                                                                                                                                             |
 
 ## 10. Packaging
 
-`infra/compose.yaml` describes four services: PostgreSQL, a one-shot `migrate` job, the API, and the
-dashboard container. They share an internal network with no route out. The dashboard is also attached
+`infra/compose.yaml` describes six services: PostgreSQL, a one-shot `migrate` job, a one-shot
+`vault-init-kek`, the vault (the only service with the key volume), the API, and the dashboard container. They share an internal network with no route out. The dashboard is also attached
 to a second network, which exists only so that it can publish its port, and it is the only service
 that publishes one, on loopback. The containers drop all capabilities, run with a read-only root filesystem and have
 resource limits. The file is validated with `docker compose config` in CI. On 2026-11-13 the three

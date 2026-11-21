@@ -213,3 +213,65 @@ describe('P3-6: freshness and uniqueness are inside the MACs', () => {
     expect(service.log.text()).toContain('resolved to no organization');
   });
 });
+
+/*
+ * VS-1 RESIDUAL. These tests DOCUMENT a gap; they do not show that the design is safe.
+ *
+ * `used_at` and `revoked_at` are not covered by either MAC (services/vault/src/mac.ts), and the
+ * consume statement judges them as plain columns (`c.used_at is null and c.revoked_at is null`). So
+ * a writer with database access who also holds a spent token can clear `used_at` and redeem it
+ * again inside its windows (`token_expires_at`, `expires_at`), and one who clears `revoked_at` of a
+ * capability that was revoked while its connection and secret are still active can reopen it (when
+ * the connection itself is revoked, its status and the secret's, checked in the same statement, still
+ * stop the read: that case is not exercised here). The
+ * token hash, the bindings, the windows, the running job and the connection and secret checks of the
+ * same statement still apply; what the writer gains is the repeat. Closing it needs the spent and
+ * revoked states to be inside the MAC (or an append-only record): not done in Phase 3 (docs/threat-model.md VS-1).
+ */
+describe('VS-1 residual (documents the gap, proves nothing about safety): used_at and revoked_at are not under the MAC', () => {
+  it('a database writer with a spent token clears used_at and redeems it a second time', async () => {
+    const tenant = await seedTenant(service.repos, 'residual-rearm-used');
+    const op = await seedSealedOperation(service, tenant);
+    const prepared = await prepare(service, op);
+    ok(await service.rpc('supervisor', 'readForWorker', readParams(prepared)));
+    const spent = await service.rpc('supervisor', 'readForWorker', readParams(prepared));
+    expect(isPlainForbidden(spent)).toBe(true);
+    expect(await rejectedReasons(service, tenant.organization.id)).toEqual(['used']);
+
+    // The re-arm: one column, no MAC to fail (the vault cannot tell the row was edited).
+    await execSql(
+      service,
+      sql`update vault_access_capabilities set used_at = null where id = ${prepared.capabilityId}::uuid`,
+    );
+    const again = await service.rpc('supervisor', 'readForWorker', readParams(prepared));
+    // RESIDUAL: this is accepted. The answer is the same session again, and a second read is audited.
+    expect(again['ok']).toBe(true);
+    expect(JSON.stringify(again)).toContain('plaintext');
+    expect(await auditEvents(service, tenant.organization.id, 'vault.secret_read')).toHaveLength(2);
+    // It is spent again after that read.
+    const spentAgain = await service.rpc('supervisor', 'readForWorker', readParams(prepared));
+    expect(isPlainForbidden(spentAgain)).toBe(true);
+  });
+
+  it('a database writer clears revoked_at of a revoked capability (its connection and secret still active) and redeems it', async () => {
+    const tenant = await seedTenant(service.repos, 'residual-rearm-revoked');
+    const op = await seedSealedOperation(service, tenant);
+    const prepared = await prepare(service, op);
+    await service.repos.capabilities.revokeForConnection({
+      connectionId: op.connectionId,
+      reason: 'owner_requested',
+      now: new Date(),
+    });
+    const refused = await service.rpc('supervisor', 'readForWorker', readParams(prepared));
+    expect(isPlainForbidden(refused)).toBe(true);
+    expect(await rejectedReasons(service, tenant.organization.id)).toEqual(['revoked']);
+
+    await execSql(
+      service,
+      sql`update vault_access_capabilities set revoked_at = null, revoked_reason = null where id = ${prepared.capabilityId}::uuid`,
+    );
+    const again = await service.rpc('supervisor', 'readForWorker', readParams(prepared));
+    // RESIDUAL: accepted, because nothing but the capability row says it was revoked here.
+    expect(again['ok']).toBe(true);
+  });
+});

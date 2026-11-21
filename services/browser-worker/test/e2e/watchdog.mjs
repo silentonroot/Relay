@@ -61,6 +61,16 @@ await sleep(1500); // a normal afterAll gets the first go
 const spec = readSpec();
 if (spec === null || spec.done === true) process.exit(0);
 
+// Processes the test froze: a stopped process ignores SIGTERM, so resume and kill them first.
+for (const pid of spec.pids ?? []) {
+  for (const signal of ['SIGCONT', 'SIGKILL']) {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // Gone.
+    }
+  }
+}
 for (const pid of spec.groups ?? []) signalGroup(pid, 'SIGTERM');
 await sleep(1500);
 for (const pid of spec.groups ?? []) signalGroup(pid, 'SIGKILL');

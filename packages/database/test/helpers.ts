@@ -1,10 +1,12 @@
 import { randomBytes } from 'node:crypto';
 import type { Organization, User } from '@aab/contracts';
 import { PGlite } from '@electric-sql/pglite';
+import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/pglite';
+import { readMigrationFiles } from 'drizzle-orm/migrator';
 import pg from 'pg';
-import { createDatabase, migrate } from '../src/index.js';
-import type { DatabaseHandle, Repositories, Scope } from '../src/index.js';
+import { createDatabase, migrate, MIGRATIONS_FOLDER } from '../src/index.js';
+import type { DatabaseHandle, Db, Repositories, Scope } from '../src/index.js';
 import { createTestDatabase } from '../src/testing.js';
 
 /**
@@ -57,6 +59,29 @@ export async function openEmptyTestDb(): Promise<DatabaseHandle> {
 }
 
 /** The job arguments hash, as the execute route computes it. */
+/**
+ * Applies only the first `count` migrations, with the same bookkeeping as `migrate`, so a later
+ * `migrate(db)` applies the rest: a database as an earlier phase left it.
+ */
+export async function migrateFirst(db: Db, count: number): Promise<void> {
+  const migrations = readMigrationFiles({ migrationsFolder: MIGRATIONS_FOLDER }).slice(0, count);
+  await db.transaction(async (tx) => {
+    await tx.execute(sql`create schema if not exists drizzle`);
+    await tx.execute(
+      sql`create table if not exists drizzle.__drizzle_migrations (id serial primary key, hash text not null, created_at bigint)`,
+    );
+    for (const migration of migrations) {
+      for (const statement of migration.sql) {
+        if (statement.trim() === '') continue;
+        await tx.execute(sql.raw(statement));
+      }
+      await tx.execute(
+        sql`insert into drizzle.__drizzle_migrations (hash, created_at) values (${migration.hash}, ${migration.folderMillis})`,
+      );
+    }
+  });
+}
+
 export { hashJobArguments as jobArgumentsHash } from '../src/index.js';
 
 /** Placeholder that only has the shape of a hash. No real password was ever involved. */

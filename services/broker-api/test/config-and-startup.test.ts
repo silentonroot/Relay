@@ -5,9 +5,19 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { generateLocalKek } from '@aab/crypto';
+import {
+  AUTHORIZATION_TTL_MAX_SECONDS,
+  AUTHORIZATION_TTL_MIN_SECONDS,
+  DEFAULT_AUTHORIZATION_TTL_SECONDS,
+} from '@aab/contracts';
 import { createTestDatabase } from '@aab/database/testing';
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import { ConfigError, loadConfig, requireVaultSocket } from '../src/config.js';
+import {
+  ConfigError,
+  LOGIN_AUTHORIZATION_TTL_SECONDS,
+  loadConfig,
+  requireVaultSocket,
+} from '../src/config.js';
 import { createOwner, OwnerInputError } from '../src/owner.js';
 import { createVaultGateway, VaultStartupRefusal } from '../src/vault/gateway.js';
 import { verifyVaultAtStart } from '../src/vault/startup.js';
@@ -169,6 +179,84 @@ describe('vault settings', () => {
       expect(message).not.toContain(value);
     }
   });
+});
+
+describe('the authorization lifetime setting (P3-7, VS-6: no lifetime by accident)', () => {
+  const NAME = 'AAB_VAULT_AUTHORIZATION_TTL_SECONDS';
+  const load = (value: string | undefined) =>
+    loadConfig({ DATABASE_URL: DB_URL, ...(value === undefined ? {} : { [NAME]: value }) });
+
+  it('refuses a lifetime that is not a safe integer inside 10 to 3,600, naming only the variable', () => {
+    for (const value of [
+      '0',
+      '-1',
+      '-600',
+      '9',
+      '3601',
+      '1000000',
+      '99999999999999999999',
+      '600.5',
+      '1e2',
+      '0x20',
+      '+600',
+      '0600',
+      ' 600',
+      '600 ',
+      'NaN',
+      'Infinity',
+      '-Infinity',
+      'soon',
+    ]) {
+      let message = '';
+      try {
+        load(value);
+      } catch (error) {
+        expect(error).toBeInstanceOf(ConfigError);
+        message = (error as Error).message;
+      }
+      expect(message, `value ${JSON.stringify(value)} must be refused`).toContain(NAME);
+      // Values that are not short numbers must not be echoed back.
+      if (value.length > 6) expect(message).not.toContain(value);
+    }
+  });
+
+  it('accepts exactly the bounds, and an unset or blank setting is the default inside the bounds', () => {
+    expect(load('10').vaultAuthorizationTtlSeconds).toBe(AUTHORIZATION_TTL_MIN_SECONDS);
+    expect(load('3600').vaultAuthorizationTtlSeconds).toBe(AUTHORIZATION_TTL_MAX_SECONDS);
+    // "Missing" is not a refusal here: the owner decision (phase 3, question 6) is a default of 600 s
+    // inside the bounds, and the loaded value is always a safe integer inside them.
+    for (const value of [undefined, '', '   ']) {
+      const seconds = load(value).vaultAuthorizationTtlSeconds;
+      expect(seconds).toBe(DEFAULT_AUTHORIZATION_TTL_SECONDS);
+      expect(Number.isSafeInteger(seconds)).toBe(true);
+      expect(seconds).toBeGreaterThanOrEqual(AUTHORIZATION_TTL_MIN_SECONDS);
+      expect(seconds).toBeLessThanOrEqual(AUTHORIZATION_TTL_MAX_SECONDS);
+    }
+  });
+
+  it('keeps the login lifetime, which is not a setting, inside the bounds', () => {
+    expect(Number.isSafeInteger(LOGIN_AUTHORIZATION_TTL_SECONDS)).toBe(true);
+    expect(LOGIN_AUTHORIZATION_TTL_SECONDS).toBeGreaterThanOrEqual(AUTHORIZATION_TTL_MIN_SECONDS);
+    expect(LOGIN_AUTHORIZATION_TTL_SECONDS).toBeLessThanOrEqual(AUTHORIZATION_TTL_MAX_SECONDS);
+  });
+
+  it('refuses to start as a process on an out-of-range lifetime, before any other work', async () => {
+    for (const value of ['0', '-5', '3601', 'Infinity']) {
+      const result = await run(process.execPath, ['--import', 'tsx', 'src/main.ts'], {
+        cwd: SERVICE_DIR,
+        env: {
+          PATH: process.env.PATH ?? '',
+          DATABASE_URL: DB_URL,
+          AAB_VAULT_SOCKET: '/nonexistent/api/vault.sock',
+          [NAME]: value,
+        },
+        timeout: 20_000,
+      }).catch((error: { code: number; stderr: string }) => error);
+      expect((result as { code?: number }).code, value).toBe(1);
+      expect(result.stderr).toContain(NAME);
+      expect(result.stderr).not.toContain('synthetic-db-password');
+    }
+  }, 60_000);
 });
 
 describe('the start-up hello check (ADR-014 section 3, P3-1)', () => {

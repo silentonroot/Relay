@@ -1,0 +1,9 @@
+# Extends gitleaks' default rules; nothing is turned off globally.
+[extend]
+useDefault = true
+
+# Synthetic test material only (see the README in that directory): a throwaway key-encryption key
+# and one ciphertext sealed with it by the Phase 2 code, kept as a golden fixture (P3-19).
+[[allowlists]]
+description = "synthetic Phase 2 golden fixture (throwaway KEK and one ciphertext)"
+paths = ['''services/vault/test/fixtures/''']

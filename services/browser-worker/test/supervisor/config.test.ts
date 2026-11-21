@@ -4,6 +4,11 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import {
+  DEFAULT_TOKEN_TTL_SECONDS,
+  TOKEN_TTL_MAX_SECONDS,
+  TOKEN_TTL_MIN_SECONDS,
+} from '@aab/contracts';
 import { describe, expect, it } from 'vitest';
 import { ConfigError, loadWorkerConfig } from '../../src/config.js';
 import { createLogger } from '../../src/logging.js';
@@ -153,6 +158,79 @@ describe('worker configuration', () => {
       'absolute path',
     );
   });
+});
+
+describe('lifetime and timeout settings (P3-7, VS-6: no lifetime by accident)', () => {
+  // The supervisor reads no capability or token lifetime: the token lifetime it requests is the
+  // contract default constant. What it does read are call, lease and result lifetimes; each is a
+  // bounded integer and the process refuses to start on a value outside its bounds.
+  const bounds = [
+    ['AAB_VAULT_CALL_TIMEOUT_MS', 100, 60_000],
+    ['AAB_WORKER_LEASE_MS', 5_000, 3_600_000],
+    ['AAB_JOB_RESULT_TTL_MINUTES', 1, 10_080],
+  ] as const;
+
+  it.each(bounds)(
+    'refuses %s when it is zero, negative, fractional, NaN, Infinity or out of range',
+    (name, min, max) => {
+      for (const value of [
+        '0',
+        '-1',
+        String(-min),
+        String(min - 1),
+        String(max + 1),
+        String(min + 0.5),
+        'NaN',
+        'Infinity',
+        '-Infinity',
+        '1e400',
+        'soon',
+      ]) {
+        const error = configError({ ...minimal, [name]: value });
+        expect(error.message, `${name}=${value}`).toContain(name);
+        if (value === 'soon') expect(error.message).not.toContain(value);
+      }
+    },
+  );
+
+  it.each(bounds)(
+    'accepts exactly the bounds of %s, and blank is the default',
+    (name, min, max) => {
+      expect(() => loadWorkerConfig({ ...minimal, [name]: String(min) })).not.toThrow();
+      expect(() => loadWorkerConfig({ ...minimal, [name]: String(max) })).not.toThrow();
+      expect(() => loadWorkerConfig({ ...minimal, [name]: '' })).not.toThrow();
+    },
+  );
+
+  it('has no setting for a capability or token lifetime, and requests an in-bound token lifetime', () => {
+    const config = loadWorkerConfig({
+      ...minimal,
+      AAB_VAULT_AUTHORIZATION_TTL_SECONDS: '99999',
+      AAB_VAULT_TOKEN_TTL_SECONDS: '99999',
+    });
+    expect(JSON.stringify(config)).not.toContain('99999');
+    expect(Number.isSafeInteger(DEFAULT_TOKEN_TTL_SECONDS)).toBe(true);
+    expect(DEFAULT_TOKEN_TTL_SECONDS).toBeGreaterThanOrEqual(TOKEN_TTL_MIN_SECONDS);
+    expect(DEFAULT_TOKEN_TTL_SECONDS).toBeLessThanOrEqual(TOKEN_TTL_MAX_SECONDS);
+  });
+
+  it('refuses to start as a process on an out-of-range lease, before opening anything', async () => {
+    for (const value of ['0', '-5', 'Infinity']) {
+      const result = await run(TSX, ['src/main.ts'], {
+        cwd: WORKER_DIR,
+        env: {
+          PATH: process.env['PATH'] ?? '',
+          DATABASE_URL: 'postgres://aab:synthetic-db-password@127.0.0.1:1/aab',
+          AAB_VAULT_SOCKET: '/nonexistent/supervisor/vault.sock',
+          AAB_WORKER_LEASE_MS: value,
+        },
+        timeout: 60_000,
+      }).catch((error: { code: number; stdout: string; stderr: string }) => error);
+      expect((result as { code?: number }).code, value).toBe(1);
+      expect(result.stderr).toContain('AAB_WORKER_LEASE_MS');
+      expect(result.stderr).not.toContain('synthetic-db-password');
+    }
+  }, 180_000);
 });
 
 describe('logger', () => {

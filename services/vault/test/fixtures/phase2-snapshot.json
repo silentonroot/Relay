@@ -1,0 +1,22 @@
+{
+  "_comment": "SYNTHETIC test fixture. Sealed by the Phase 2 code at git 640bd27 (packages/crypto sealSecret + LocalFileKekProvider) with the synthetic KEK in phase2-kek-v1.key. Not a real secret.",
+  "sealedWithCommit": "640bd277dfad1d7c104b0f5f39638393da8b9f41",
+  "ids": {
+    "organizationId": "0a11f1c0-5a17-4c0d-8a00-000000000001",
+    "userId": "0a11f1c0-5a17-4c0d-8a00-000000000002",
+    "connectionId": "0a11f1c0-5a17-4c0d-8a00-000000000003",
+    "secretId": "0a11f1c0-5a17-4c0d-8a00-000000000004"
+  },
+  "secretType": "session_snapshot",
+  "secretVersion": 1,
+  "plaintextUtf8": "{\"cookies\":[{\"domain\":\"localhost\",\"expires\":-1,\"httpOnly\":true,\"name\":\"sid\",\"path\":\"/\",\"sameSite\":\"Lax\",\"secure\":false,\"value\":\"PHASE2-GOLDEN-COOKIE-synthetic\"}],\"origins\":[]}",
+  "row": {
+    "algorithm": "aab-envelope-v1/aes-256-gcm",
+    "ciphertext": "475de10fc118939c94a6221377106e67d2b8546ea6bc7bb2c1ddf2b288a8b745a7bd7b26a639e5d76e1e562409f144ebcf4a1b35aff217771544b29694ebeb9adff1bd811505d743f9c45b6caf38ced665e2050b23fa775b0719bcd9b215c994dbefe1d1dac54bc0e734fb5e38f413177904e88054600c5b69da66e650b9d38353a4f6f54731473458ee22d4d7d177d32b8bffe72b4920ed096831a02a42a86c3f5fc5f0aeb41bee8a4440e2aa128b",
+    "nonce": "959cd51056479448cd2d246d",
+    "authTag": "facf67c05b0fa061d309419d5d19842a",
+    "wrappedDek": "1a3d594d3f732eb7de881e9a73d19e1bef4075061c4da31490a3334afa71bfa0b66b6b7e2a5c2d08dd390342112a41d58a47d91a4110fe7226602fd2",
+    "kekVersion": 1,
+    "aadVersion": 1
+  }
+}

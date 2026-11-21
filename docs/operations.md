@@ -272,11 +272,17 @@ version references it. The vault does the re-wrap (`vault rewrap`); the exact or
 
 ## The vault and its admin command (Phase 3)
 
-Status: step B3b. The vault service (`services/vault`) answers every operation of ADR-014 section 4,
-the API (B3a) and the browser worker's supervisor (B3b) use it, and neither holds a key. Key rotation
-(B4, below) works; the dashboard (B5) is a later step. Local tests ran with a real vault on temporary sockets;
-the `separate-uid` setup below, the systemd unit and the Compose vault have not been run on a real
-host or in containers by the people who wrote them.
+Status: steps B1 to B6 are built. The vault service (`services/vault`) answers every operation of
+ADR-014 section 4, the API and the browser worker's supervisor use it, and neither holds a key. Key
+rotation (below) works, and the dashboard (step B5) has a **Vault** page with the key status, shown to
+owners only (`GET /v1/vault/status`: KEK versions, how many stored versions each wraps, the vault's
+counters), and, per connection, the vault metadata of its secrets and the last 24 hours of capabilities
+(`GET /v1/connections/:id/vault`), with two actions that need no vault because they only remove
+authority: "delete stored session" (`POST /v1/connections/:id/vault/delete-session`) and "revoke unused
+capabilities" (`POST /v1/connections/:id/vault/revoke-capabilities`). Local tests ran with a real vault on
+temporary sockets, and the Phase 3 end-to-end test ran the whole stack locally on one machine (not in CI); the
+`separate-uid` setup below, the systemd unit and the Compose vault have not been run on a real host or in
+containers by the people who wrote them, and nothing has had an independent review.
 
 Start it (one user, a developer laptop; for `separate-uid` see "Separate-uid setup" below):
 
@@ -288,6 +294,27 @@ export AAB_VAULT_ISOLATION=shared-uid         # explicit; refused unless set
 corepack pnpm --filter @aab/vault run init-kek     # first key, kek-v1.key
 corepack pnpm --filter @aab/vault run start
 ```
+
+Vault settings (all strict decimal integers where numeric: `1e2`, `0x10`, blanks and signs are refused;
+an error names the variable, never the value):
+
+| Variable                                       | Default        | Meaning                                                                                              |
+| ---------------------------------------------- | -------------- | ---------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                                 | required       | A `postgres://` string for a migrated database. The vault does not migrate.                          |
+| `AAB_KEK_DIR`                                  | required       | Absolute, normalized path of the key directory, owned by the vault's user, mode 0700.                |
+| `AAB_VAULT_SOCKET_DIR`                         | required       | Absolute, normalized path; the vault creates `api/`, `supervisor/` and `admin/` below it.            |
+| `AAB_VAULT_ISOLATION`                          | `separate-uid` | `separate-uid` or `shared-uid`.                                                                      |
+| `AAB_VAULT_GROUP_API`, `_SUPERVISOR`, `_ADMIN` | none           | A group name or numeric gid per role; all three required in `separate-uid`, refused in `shared-uid`. |
+| `AAB_VAULT_MAX_CONNECTIONS`                    | `16`           | Open connections per role socket, 1 to 256.                                                          |
+| `AAB_VAULT_IDLE_TIMEOUT_MS`                    | `60000`        | A connection with no traffic for this long is closed, 1000 to 3600000.                               |
+| `AAB_VAULT_REQUEST_TIMEOUT_MS`                 | `10000`        | A request line must complete and be answered within this long, 100 to 120000.                        |
+| `AAB_VAULT_ADMIN_REQUEST_TIMEOUT_MS`           | `120000`       | The admin socket's request timeout, 1000 to 600000.                                                  |
+| `AAB_LOG_LEVEL`                                | `info`         | `fatal`, `error`, `warn`, `info`, `debug`, `trace` or `silent`. The vault logs little at any level.  |
+
+The vault takes no authorization lifetime (the API sends one with every request, see below).
+`AAB_VAULT_TOKEN_TTL_SECONDS` (1 to 120, default 30) is still parsed and range-checked by the vault, but
+by reading `services/vault/src` no code uses the parsed value: the token lifetime comes from the
+supervisor's request. Leave it unset.
 
 The vault refuses to start when it cannot read its tables through `DATABASE_URL` (it does not
 migrate), when the key or socket directory is unsafe, or off Linux. Sockets are
