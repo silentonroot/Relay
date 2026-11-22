@@ -313,7 +313,7 @@ check that closes it exists. Backlog tickets (AAB-017 to AAB-031) are in [`backl
     GitHub and passed (first run 2026-11-13); its `containers` job builds the container images and
     starts the Compose stack. The nightly workflow holds the sandbox and end-to-end tests; its first
     three runs failed (2026-11-14 and 2026-11-15) and a manual run on 2026-11-16 (run 43806552036)
-    passed all four jobs. No scheduled run has passed yet. The images and the stack were also built and started by hand on 2026-11-13 (the checks, including
+    passed all four jobs. The first scheduled run to pass was run 45017912889 on 2026-11-22. The images and the stack were also built and started by hand on 2026-11-13 (the checks, including
     those that close F-4, F-5 and F-9 as configuration-only claims, are listed in the threat model,
     section 6.1; they were manual, not automated tests). Base images are pinned by tag and digest (2026-11-13).
     (AAB-020, AAB-031)
