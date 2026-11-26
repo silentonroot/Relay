@@ -407,8 +407,8 @@ importers:
         specifier: ^10.4.0
         version: 10.4.0
       playwright-core:
-        specifier: ^1.60.0
-        version: 1.65.0
+        specifier: ^1.65.1
+        version: 1.65.1
       tsx:
         specifier: ^4.23.15
         version: 4.23.15
@@ -2134,8 +2134,8 @@ packages:
     resolution: {integrity: sha512-bk1ZMTwG/Vymx+zPoa28MhNzucFvXJWp3csrSuxuHPSMeUettaCoQ5Jvg07mtC4JGNpcfTwz41oVCnNgBK9+vA==}
     hasBin: true
 
-  playwright-core@1.65.0:
-    resolution: {integrity: sha512-vNSKgH6YqtN7cdT/L334zo0a+YwkrpicyrHJlWWPIm/Q+Nn2SWInil01oT0mbu96U4GgoRtCYQD9CzJQgju+lA==}
+  playwright-core@1.65.1:
+    resolution: {integrity: sha512-hqPpz7blSMPxWVdoeE1yiBSzXsKiVOd2k+kjCvmUywD2GPO2Dd9HfcWnq9NN0GHbNZDFgZ9JfBFr+X5/BLo0qw==}
     engines: {node: '>=20'}
     hasBin: true
 
@@ -3971,7 +3971,7 @@ snapshots:
       sonic-boom: 4.2.1
       thread-stream: 4.2.1
 
-  playwright-core@1.65.0: {}
+  playwright-core@1.65.1: {}
 
   postcss@8.5.32:
     dependencies:
