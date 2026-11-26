@@ -361,14 +361,14 @@ importers:
         specifier: ^11.2.2
         version: 11.2.2
       '@fastify/swagger':
-        specifier: ^9.9.3
-        version: 9.9.3
+        specifier: ^9.9.5
+        version: 9.9.5
       fastify:
         specifier: ^5.12.8
         version: 5.12.8
       fastify-type-provider-zod:
         specifier: ^7.0.0
-        version: 7.0.0(@fastify/swagger@9.9.3)(fastify@5.12.8)(openapi-types@12.1.3)(zod@4.6.7)
+        version: 7.0.0(@fastify/swagger@9.9.5)(fastify@5.12.8)(openapi-types@12.1.3)(zod@4.6.7)
       tsx:
         specifier: ^4.23.15
         version: 4.23.15
@@ -1059,8 +1059,8 @@ packages:
   '@fastify/rate-limit@11.2.2':
     resolution: {integrity: sha512-Ynxk9BU82Y5Ux7NOk9NqyZpTMdFes8EY8quXrN6ePDsbtG4G9Afb3l9mD8Vw2nv0hXg0iFjV+gkdABReFPlShw==}
 
-  '@fastify/swagger@9.9.3':
-    resolution: {integrity: sha512-1whjjguZlh4VV6OP2SD7w7ZNXXuLPwLcxbKIu7GckhHGgCyIYwtOyBskc3TLZa7LsaRmZZRiB1nz/JTaCI5grQ==}
+  '@fastify/swagger@9.9.5':
+    resolution: {integrity: sha512-2X/MXoTv3Jhxegju9DwjOTKcDT86q0SDPIuuZDx9DHfRsHzpVfxVIXzP73X+qcEA1j7N+k7Cm95h9esGy/oBgA==}
 
   '@humanfs/core@0.19.2':
     resolution: {integrity: sha512-UhXNm+CFMWcbChXywFwkmhqjs3PRCmcSa/hfBgLIb7oQ5HNb1wS0icWsGtSAUNgefHeI+eBrA8I1fxmbHsGdvA==}
@@ -2971,7 +2971,7 @@ snapshots:
       ip-address: 10.7.6
       toad-cache: 3.7.4
 
-  '@fastify/swagger@9.9.3':
+  '@fastify/swagger@9.9.5':
     dependencies:
       fastify-plugin: 6.0.1
       json-schema-resolver: 3.0.0
@@ -3605,10 +3605,10 @@ snapshots:
 
   fastify-plugin@6.0.1: {}
 
-  fastify-type-provider-zod@7.0.0(@fastify/swagger@9.9.3)(fastify@5.12.8)(openapi-types@12.1.3)(zod@4.6.7):
+  fastify-type-provider-zod@7.0.0(@fastify/swagger@9.9.5)(fastify@5.12.8)(openapi-types@12.1.3)(zod@4.6.7):
     dependencies:
       '@fastify/error': 4.2.1
-      '@fastify/swagger': 9.9.3
+      '@fastify/swagger': 9.9.5
       fastify: 5.12.8
       openapi-types: 12.1.3
       zod: 4.6.7
