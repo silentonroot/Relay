@@ -73,6 +73,8 @@ export const JOB_ERROR_CODES = [
   'login_window_closed',
   'vault_unavailable',
   'vault_denied',
+  // Phase 4. The database constraint gains it with migration 0006 (step C1).
+  'stale_version',
 ] as const;
 /** `revoked` is terminal: a trigger (migration 0005) refuses any change out of it. */
 export const VAULT_SECRET_STATUSES = ['pending', 'active', 'deleted', 'revoked'] as const;

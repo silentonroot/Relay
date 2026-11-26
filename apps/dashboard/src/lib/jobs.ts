@@ -40,4 +40,6 @@ export const JOB_ERROR_TEXT: Record<JobErrorCode, string> = {
     'The vault could not be reached, so the stored session was not used and nothing was done. You can try again.',
   vault_denied:
     'The vault refused access to the stored session, so nothing was done. Submit the request again.',
+  stale_version:
+    'The target changed after approval, so nothing was written. Propose the change again.',
 };

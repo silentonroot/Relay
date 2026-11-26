@@ -65,6 +65,12 @@ export const JobErrorCode = z.enum([
   'vault_unavailable',
   /** The vault refused the job's capability (ADR-014 section 9). */
   'vault_denied',
+  /**
+   * A write was approved for one version of its target, and the target showed another version
+   * before anything was submitted (Phase 4, ADR-015 section 8). Nothing was written; the approval
+   * stays consumed and a new proposal is needed.
+   */
+  'stale_version',
 ]);
 export type JobErrorCode = z.infer<typeof JobErrorCode>;
 
@@ -173,6 +179,63 @@ export function jobArgumentsHashInput(binding: JobArgumentsBinding): string {
     JOB_ARGUMENTS_HASH_DOMAIN +
     canonicalJson({
       agentId: binding.agentId,
+      arguments: binding.arguments,
+      connectionId: binding.connectionId,
+      operation: binding.operation,
+      organizationId: binding.organizationId,
+      policyDecisionId: binding.policyDecisionId,
+      retrySafe: binding.retrySafe,
+      timeoutMs: binding.timeoutMs,
+    })
+  );
+}
+
+/**
+ * Which layout of the job arguments hash a job row uses (`execution_jobs.arguments_hash_layout`,
+ * Phase 4). The supervisor picks the layout from the row; a write job with layout 1 is refused.
+ */
+export const JobArgumentsHashLayout = z.union([z.literal(1), z.literal(2)]);
+export type JobArgumentsHashLayout = z.infer<typeof JobArgumentsHashLayout>;
+
+/**
+ * Domain-separation prefix of layout 2 of the job arguments hash. v1 is never reused or changed:
+ * jobs created before Phase 4 keep verifying under `JOB_ARGUMENTS_HASH_DOMAIN`.
+ */
+export const JOB_ARGUMENTS_HASH_DOMAIN_V2 = 'aab.job-arguments.v2\n';
+
+/**
+ * Layout 2 binds everything layout 1 binds, plus the approval that released the job and the
+ * action hash of that approval (both null for a read). The job hash and the approval's action
+ * hash are different values; the job hash covers the action hash, which chains job to approval.
+ */
+export interface JobArgumentsBindingV2 extends JobArgumentsBinding {
+  /** The approval that released the job; null for a read. */
+  approvalRequestId: string | null;
+  /** Lowercase hex action hash of that approval; null exactly when `approvalRequestId` is. */
+  actionHash: string | null;
+}
+
+const ACTION_HASH_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * The exact text whose SHA-256 is `execution_jobs.arguments_hash` for a layout 2 job: the v2
+ * domain prefix and the canonical JSON of the ten keys of layout 1 plus `actionHash` and
+ * `approvalRequestId`. Throws when exactly one of the two approval fields is null, or when the
+ * action hash is not 64 lowercase hex digits, so a half-bound job cannot be hashed.
+ */
+export function jobArgumentsHashInputV2(binding: JobArgumentsBindingV2): string {
+  if ((binding.approvalRequestId === null) !== (binding.actionHash === null)) {
+    throw new TypeError('jobArgumentsHashInputV2: approvalRequestId and actionHash go together');
+  }
+  if (binding.actionHash !== null && !ACTION_HASH_PATTERN.test(binding.actionHash)) {
+    throw new TypeError('jobArgumentsHashInputV2: actionHash is not lowercase hex SHA-256');
+  }
+  return (
+    JOB_ARGUMENTS_HASH_DOMAIN_V2 +
+    canonicalJson({
+      actionHash: binding.actionHash,
+      agentId: binding.agentId,
+      approvalRequestId: binding.approvalRequestId,
       arguments: binding.arguments,
       connectionId: binding.connectionId,
       operation: binding.operation,

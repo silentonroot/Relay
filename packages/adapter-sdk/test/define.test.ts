@@ -78,6 +78,164 @@ describe('defineOperation', () => {
     expect(() => defineOperation(writeOperation(overrides))).toThrow(message);
   });
 
+  describe('resource and version arguments of an approved write (Phase 4)', () => {
+    it('accepts a write that names both arguments (positive control)', () => {
+      const operation = defineOperation(writeOperation());
+      expect(operation.resourceArgument).toBe('ticketId');
+      expect(operation.versionArgument).toBe('expectedVersion');
+    });
+
+    it.each<[string, Partial<OperationDefinition>]>([
+      ['a write without versionArgument', { versionArgument: undefined }],
+      ['a write without resourceArgument', { resourceArgument: undefined }],
+      [
+        'a destructive operation without versionArgument',
+        { sensitivity: 'destructive', versionArgument: undefined },
+      ],
+      [
+        'a destructive operation without resourceArgument',
+        { sensitivity: 'destructive', resourceArgument: undefined },
+      ],
+    ])('rejects %s', (_label, overrides) => {
+      expect(() => defineOperation(writeOperation(overrides))).toThrow(AdapterContractError);
+      expect(() => defineOperation(writeOperation(overrides))).toThrow(
+        /resourceArgument and versionArgument/,
+      );
+    });
+
+    it('rejects a versionArgument or resourceArgument that is not an input key', () => {
+      expect(() => defineOperation(writeOperation({ versionArgument: 'version' }))).toThrow(
+        /versionArgument that is not a key of its input schema/,
+      );
+      expect(() => defineOperation(writeOperation({ resourceArgument: 'id' }))).toThrow(
+        /resourceArgument that is not a key of its input schema/,
+      );
+    });
+
+    it('does not ask a read for either argument', () => {
+      expect(() => defineOperation(readOperation())).not.toThrow();
+    });
+
+    it('refuses a write or destructive operation that does not require approval, so policy can never allow one', () => {
+      // Positive control first: the same definition with approval loads.
+      expect(() => defineOperation(writeOperation())).not.toThrow();
+      expect(() => defineOperation(writeOperation({ requiresApproval: false }))).toThrow(
+        /must require approval/,
+      );
+      expect(() =>
+        defineOperation(
+          writeOperation({
+            requiresApproval: false,
+            resourceArgument: undefined,
+            versionArgument: undefined,
+          }),
+        ),
+      ).toThrow(AdapterContractError);
+      expect(() =>
+        defineOperation(writeOperation({ sensitivity: 'destructive', requiresApproval: false })),
+      ).toThrow(/destructive and must require approval/);
+    });
+
+    it.each<[string, Partial<OperationDefinition>, RegExp]>([
+      [
+        'an optional versionArgument',
+        {
+          input: z.object({
+            ticketId: z.string().regex(/^T-\d+$/),
+            expectedVersion: z.number().int().min(0).optional(),
+          }),
+        },
+        /versionArgument that is a required/,
+      ],
+      [
+        'an optional resourceArgument',
+        {
+          input: z.object({
+            ticketId: z
+              .string()
+              .regex(/^T-\d+$/)
+              .optional(),
+            expectedVersion: z.number().int().min(0),
+          }),
+        },
+        /resourceArgument that is a required string/,
+      ],
+      [
+        'a versionArgument that is an object',
+        {
+          input: z.object({
+            ticketId: z.string().regex(/^T-\d+$/),
+            expectedVersion: z.object({ n: z.number() }),
+          }),
+        },
+        /versionArgument that is a required/,
+      ],
+      [
+        'a resourceArgument that is a number',
+        {
+          input: z.object({
+            ticketId: z.number().int().min(0),
+            expectedVersion: z.number().int().min(0),
+          }),
+        },
+        /resourceArgument that is a required string/,
+      ],
+      [
+        'a versionArgument that is an unbounded number or a fraction',
+        {
+          input: z.object({ ticketId: z.string().regex(/^T-\d+$/), expectedVersion: z.number() }),
+        },
+        /versionArgument that is a required/,
+      ],
+      [
+        'a bounded but fractional versionArgument',
+        {
+          input: z.object({
+            ticketId: z.string().regex(/^T-\d+$/),
+            expectedVersion: z.number().min(0).max(1000),
+          }),
+        },
+        /versionArgument that is a required/,
+      ],
+      [
+        'an unbounded string resourceArgument',
+        {
+          input: z.object({ ticketId: z.string(), expectedVersion: z.number().int().min(0) }),
+        },
+        /resourceArgument that is a required string/,
+      ],
+      [
+        'both names the same key',
+        {
+          input: z.object({ ticketId: z.string().regex(/^T-\d+$/) }),
+          versionArgument: 'ticketId',
+        },
+        /same key/,
+      ],
+    ])('rejects %s', (_label, overrides, message) => {
+      expect(() => defineOperation(writeOperation(overrides))).toThrow(AdapterContractError);
+      expect(() => defineOperation(writeOperation(overrides))).toThrow(message);
+    });
+
+    it('accepts a bounded string version (positive control)', () => {
+      expect(() =>
+        defineOperation(
+          writeOperation({
+            input: z.object({
+              ticketId: z.string().regex(/^T-\d+$/),
+              expectedVersion: z.string().min(1).max(40),
+            }),
+          }),
+        ),
+      ).not.toThrow();
+    });
+
+    it('still loads the helpdesk fixture adapter', () => {
+      expect(isDefinedAdapter(helpdesk)).toBe(true);
+      expect(isDefinedAdapter(defineAdapter(adapterDefinition()))).toBe(true);
+    });
+  });
+
   it('returns a frozen definition', () => {
     const operation = defineOperation(readOperation());
     expect(Object.isFrozen(operation)).toBe(true);
@@ -155,6 +313,7 @@ describe('toOperationDescriptors', () => {
         sensitivity: 'write',
         requiresApproval: true,
         resourceArgument: 'ticketId',
+        versionArgument: 'expectedVersion',
       },
     ]);
     for (const descriptor of descriptors) {

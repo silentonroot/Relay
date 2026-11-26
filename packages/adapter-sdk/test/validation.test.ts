@@ -183,7 +183,7 @@ describe('validateOperationInput is non-transforming (F-3)', () => {
     for (const [name, args] of [
       ['tickets.list', { status: 'open', limit: 10 }],
       ['tickets.list', {}],
-      ['tickets.close', { ticketId: 'T-42' }],
+      ['tickets.close', { ticketId: 'T-42', expectedVersion: 1 }],
     ] as const) {
       const result = validateOperationInput(helpdesk, name, args);
       if (!result.ok) throw result.error;

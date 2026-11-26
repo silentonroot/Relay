@@ -109,8 +109,13 @@ function validateOperation(definition: OperationDefinition): void {
         : 'changes the target application and must list its side effects',
     );
   }
+  // Every operation that changes the target needs approval, so the policy engine can never
+  // answer `allow` for one (ADR-015 section 5). A read may or may not.
   if (definition.sensitivity === 'destructive' && !definition.requiresApproval) {
     fail(subject, 'is destructive and must require approval');
+  }
+  if (definition.sensitivity !== 'read' && !definition.requiresApproval) {
+    fail(subject, 'changes the target application and must require approval');
   }
 
   if (!Array.isArray(definition.allowedPaths) || definition.allowedPaths.length === 0) {
@@ -122,15 +127,71 @@ function validateOperation(definition: OperationDefinition): void {
     }
   }
 
+  if (definition.sensitivity !== 'read') {
+    if (definition.resourceArgument === undefined || definition.versionArgument === undefined) {
+      fail(subject, 'changes the target, so it must declare resourceArgument and versionArgument');
+    }
+  }
+
   const inputKeys = Object.keys(definition.input.shape);
-  for (const field of ['resourceArgument', 'limitArgument'] as const) {
+  for (const field of ['resourceArgument', 'versionArgument', 'limitArgument'] as const) {
     const argument = definition[field];
     if (argument !== undefined && !inputKeys.includes(argument)) {
       fail(subject, `names a ${field} that is not a key of its input schema`);
     }
   }
+
+  const { resourceArgument, versionArgument } = definition;
+  if (resourceArgument !== undefined && resourceArgument === versionArgument) {
+    fail(subject, 'names the same key as resourceArgument and versionArgument');
+  }
+  // Reads that name a resource keep their schemas as they are; only a write is approved by it.
+  if (definition.sensitivity === 'read') return;
+  if (resourceArgument !== undefined) {
+    const schema = definition.input.shape[resourceArgument];
+    if (!isRequiredStringSchema(schema)) {
+      fail(subject, 'needs a resourceArgument that is a required string of 1 to 200 characters');
+    }
+  }
+  if (versionArgument !== undefined) {
+    const schema = definition.input.shape[versionArgument];
+    if (!isRequiredStringSchema(schema) && !isRequiredSafeIntegerSchema(schema)) {
+      fail(
+        subject,
+        'needs a versionArgument that is a required string of 1 to 200 characters or a required non-negative safe integer',
+      );
+    }
+  }
 }
 
+function schemaType(schema: unknown): string | undefined {
+  return (schema as { def?: { type?: string } } | undefined)?.def?.type;
+}
+
+function accepts(schema: unknown, value: unknown): boolean {
+  return (schema as { safeParse(input: unknown): { success: boolean } }).safeParse(value).success;
+}
+
+/**
+ * What `ApprovalRequest.targetResourceId` can hold: a string schema (not optional, nullable or
+ * defaulted, which would let the key be absent) that refuses the empty string and 201 characters.
+ */
+function isRequiredStringSchema(schema: unknown): boolean {
+  return (
+    schemaType(schema) === 'string' && !accepts(schema, '') && !accepts(schema, 'x'.repeat(201))
+  );
+}
+
+/** An integer schema that refuses fractions, negatives and values beyond the safe range. */
+function isRequiredSafeIntegerSchema(schema: unknown): boolean {
+  return (
+    schemaType(schema) === 'number' &&
+    accepts(schema, 0) &&
+    !accepts(schema, 1.5) &&
+    !accepts(schema, -1) &&
+    !accepts(schema, Number.MAX_SAFE_INTEGER + 1)
+  );
+}
 function freezeOperation<Definition extends OperationDefinition>(
   definition: Definition,
 ): Definition {
@@ -235,6 +296,9 @@ export function toOperationDescriptors(adapter: ApplicationAdapter): OperationDe
     ...(operation.resourceArgument === undefined
       ? {}
       : { resourceArgument: operation.resourceArgument }),
+    ...(operation.versionArgument === undefined
+      ? {}
+      : { versionArgument: operation.versionArgument }),
     ...(operation.limitArgument === undefined ? {} : { limitArgument: operation.limitArgument }),
   }));
 }

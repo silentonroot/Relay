@@ -298,12 +298,19 @@ describe('operation jobs', () => {
       await expectNotRun(jobId, 'denied');
     });
 
-    it('a write operation is refused in phase 2 even with an allow grant', async () => {
+    it('a write is refused in phase 2 even with an allow grant: policy answers approval_required', async () => {
+      // The read test at the top of this file is the positive control for this world.
       const connection = await activeConnection(world, { operation: 'orders.cancel' });
-      const jobId = await queueOperation(world, connection.id, { operation: 'orders.cancel' });
+      const jobId = await queueOperation(world, connection.id, {
+        operation: 'orders.cancel',
+        arguments: { orderId: 'order-1', expectedVersion: 1 },
+      });
       await expectNotRun(jobId, 'denied');
-      const denied = (await auditEvents(world)).find((e) => e.eventType === 'operation.denied')!;
-      expect(denied.metadata).toMatchObject({ reasonCode: 'operation_not_executable' });
+      const denied = (await auditEvents(world)).find(
+        (e) =>
+          e.eventType === 'operation.denied' && e.metadata.policyOutcome === 'approval_required',
+      )!;
+      expect(denied.metadata).toMatchObject({ reasonCode: 'approval_required' });
     });
   });
 

@@ -81,6 +81,7 @@ export const LOGIN_FAILURE_REASONS: Readonly<Record<JobErrorCode, string>> = {
   unexpected_page: 'The application showed a page the adapter did not expect; try again.',
   vault_unavailable: 'The vault could not be reached, so the login could not be stored; try again.',
   vault_denied: 'The vault refused to store the login; start the login again.',
+  stale_version: 'The login could not be completed; start the login again.',
 };
 
 /** A login job whose lease expired (the worker stopped) and was ended by recovery. */

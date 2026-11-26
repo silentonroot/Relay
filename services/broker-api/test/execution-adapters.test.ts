@@ -45,10 +45,15 @@ const fakeshop = defineAdapter({
       ...common,
       name: 'items.rename',
       description: 'Renames an item.',
+      // A write always requires approval (defineOperation refuses one that does not), so policy
+      // can only answer approval_required for it, never allow.
+      input: z.object({ id: z.string().min(1).max(20), version: z.number().int().min(0) }),
       sensitivity: 'write',
-      requiresApproval: false,
-      idempotent: true,
+      requiresApproval: true,
+      idempotent: false,
       sideEffects: ['renames an item'],
+      resourceArgument: 'id',
+      versionArgument: 'version',
     }),
     'items.audit': defineOperation({
       ...common,
@@ -75,12 +80,16 @@ describe('operations the adapter declares but Phase 2 does not run', () => {
       headers: session.headers,
       ...(payload === undefined ? {} : { payload }),
     });
-  const execute = (operation: string, key: string) =>
+  const execute = (
+    operation: string,
+    key: string,
+    args: Record<string, unknown> = { id: 'item-1' },
+  ) =>
     post(path(Routes.operationsExecute), {
       agentId,
       connectionId,
       operation,
-      arguments: { id: 'item-1' },
+      arguments: args,
       idempotencyKey: key,
     });
   const jobCount = async () => (await h.database.db.select().from(schema.executionJobs)).length;
@@ -124,11 +133,17 @@ describe('operations the adapter declares but Phase 2 does not run', () => {
     await h.close();
   });
 
-  it('refuses an allowed write with 403 denied, no job, and a deny audit event', async () => {
-    const response = await execute('items.rename', 'write-key-1');
-    const body = expectError(response, 403, 'denied');
-    expect(body.error.message).toMatch(/read operations/);
-    expect(await jobCount()).toBe(0);
+  it('answers 403 approval_required for a write, never allow, with no job (phase 2 runs no writes)', async () => {
+    // Positive control: the same connection and agent run a read through the same route.
+    expect((await execute('items.read', 'write-control-1')).statusCode).toBe(202);
+    const jobsBefore = await jobCount();
+    const body = expectError(
+      await execute('items.rename', 'write-key-1', { id: 'item-1', version: 1 }),
+      403,
+      'approval_required',
+    );
+    expect(body.error.message).toMatch(/later phase/);
+    expect(await jobCount()).toBe(jobsBefore);
     const decision = (
       await h.repos.audit.list(
         { organizationId: session.organizationId, userId: session.userId },
@@ -136,23 +151,20 @@ describe('operations the adapter declares but Phase 2 does not run', () => {
       )
     ).items[0]!;
     expect(decision).toMatchObject({
-      decision: 'deny',
-      metadata: {
-        operation: 'items.rename',
-        reasonCode: 'operation_not_executable',
-        policyOutcome: 'allow',
-      },
+      decision: 'approval_required',
+      metadata: { operation: 'items.rename', reasonCode: 'approval_required' },
     });
   });
 
   it('answers 403 approval_required for an operation that needs approval, with no job', async () => {
+    const jobsBefore = await jobCount();
     const body = expectError(
       await execute('items.audit', 'approval-key-1'),
       403,
       'approval_required',
     );
     expect(body.error.message).toMatch(/later phase/);
-    expect(await jobCount()).toBe(0);
+    expect(await jobCount()).toBe(jobsBefore);
     const decision = (
       await h.repos.audit.list(
         { organizationId: session.organizationId, userId: session.userId },

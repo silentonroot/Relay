@@ -29,7 +29,10 @@ export function writeOperation(overrides: Partial<OperationDefinition> = {}): Op
   return {
     name: 'tickets.close',
     description: 'Closes one synthetic ticket.',
-    input: z.object({ ticketId: z.string().regex(/^T-\d+$/) }),
+    input: z.object({
+      ticketId: z.string().regex(/^T-\d+$/),
+      expectedVersion: z.number().int().min(0),
+    }),
     output: z.object({ id: z.string(), status: z.literal('closed') }),
     sensitivity: 'write',
     requiresApproval: true,
@@ -38,6 +41,7 @@ export function writeOperation(overrides: Partial<OperationDefinition> = {}): Op
     timeoutMs: 20_000,
     allowedPaths: ['/tickets/:ticketId', '/tickets/:ticketId/close'],
     resourceArgument: 'ticketId',
+    versionArgument: 'expectedVersion',
     ...overrides,
   };
 }

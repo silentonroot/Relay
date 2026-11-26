@@ -159,6 +159,21 @@ export const AuditEventType = z.enum([
   'vault.request_refused',
   'vault.secret_revoked',
   'vault.secret_rewrapped',
+  // Phase 4 (ADR-015 section 10). Metadata holds ids, key names, codes and the approval id;
+  // never an argument value, an action hash or a MAC.
+  'approval.proposed',
+  'approval.approved',
+  'approval.denied',
+  'approval.expired',
+  'approval.revoked',
+  'approval.redeemed',
+  'approval.refused',
+  /** Written by the supervisor immediately before it starts the runner for a write job. */
+  'operation.write_dispatched',
+  /** The vault sealed an approval decision with its MAC (`decideApproval`). */
+  'vault.approval_sealed',
+  /** The vault refused to authorize a write job because the approval failed its checks. */
+  'vault.approval_rejected',
 ]);
 export type AuditEventType = z.infer<typeof AuditEventType>;
 

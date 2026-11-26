@@ -13,6 +13,11 @@ export const OperationDescriptor = z.object({
   requiresApproval: z.boolean(),
   /** Name of the argument that identifies the target resource, if the operation has one. */
   resourceArgument: z.string().min(1).optional(),
+  /**
+   * Name of the argument that holds the expected version of the target resource. Required, with
+   * `resourceArgument`, on a write or destructive operation that needs approval (Phase 4).
+   */
+  versionArgument: z.string().min(1).optional(),
   /** Name of the argument that bounds result size, if the operation has one. */
   limitArgument: z.string().min(1).optional(),
 });

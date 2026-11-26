@@ -34,16 +34,26 @@ function operation(name: string, sensitivity: 'read' | 'write') {
   return defineOperation({
     name,
     description: `test operation ${name}`,
-    input: z.object({ limit: z.number().int().min(1).max(100).optional() }),
+    input:
+      sensitivity === 'read'
+        ? z.object({ limit: z.number().int().min(1).max(100).optional() })
+        : // A write names the resource and version it changes (defineOperation requires both).
+          z.object({
+            orderId: z.string().min(1).max(40),
+            expectedVersion: z.number().int().min(0),
+          }),
     output: z.object({ items: z.array(z.string()), note: z.string().optional() }),
     sensitivity,
-    requiresApproval: false,
+    // A write always requires approval, so policy answers approval_required, never allow.
+    requiresApproval: sensitivity !== 'read',
     idempotent: sensitivity === 'read',
     sideEffects: sensitivity === 'read' ? [] : ['changes orders'],
     timeoutMs: 30_000,
     allowedPaths: ['/orders'],
     // So a maxResults grant can name the limit it caps.
-    ...(sensitivity === 'read' ? { limitArgument: 'limit' } : {}),
+    ...(sensitivity === 'read'
+      ? { limitArgument: 'limit' }
+      : { resourceArgument: 'orderId', versionArgument: 'expectedVersion' }),
   });
 }
 

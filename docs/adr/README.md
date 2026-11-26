@@ -20,6 +20,7 @@ the decision is not needed yet; the record holds a recommendation and the eviden
 | [012](ADR-012-synthetic-only-dependency-review.md)  | Synthetic-only development and dependency review        | Accepted | Phase 0   |
 | [013](ADR-013-per-job-sandbox-egress-proxy.md)      | Per-job sandbox and egress proxy                        | Accepted | Phase 2   |
 | [014](ADR-014-vault-service.md)                     | Vault service, service identity and worker capabilities | Accepted | Phase 3   |
+| [015](ADR-015-approvals.md)                         | Approval of the exact action                            | Proposed | Phase 4   |
 
 ## Writing a new record
 

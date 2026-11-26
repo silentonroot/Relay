@@ -175,6 +175,7 @@ export const JOB_ERROR_MESSAGES: Readonly<Record<JobErrorCode, string>> = {
   unexpected_page: 'the application showed a page the adapter did not expect',
   vault_unavailable: 'the vault could not be reached',
   vault_denied: 'the vault refused access to the secret',
+  stale_version: 'the target changed after the approval, so nothing was written',
 };
 
 export function jobError(code: JobErrorCode): JobError {

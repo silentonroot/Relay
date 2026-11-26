@@ -35,6 +35,12 @@ export interface OperationDefinition<
   readonly allowedPaths: readonly string[];
   /** Input key that identifies the target resource, if the operation has one. */
   readonly resourceArgument?: string;
+  /**
+   * Input key that holds the expected version of the target resource. A write or destructive
+   * operation that needs approval must declare it, with `resourceArgument`: the approval binds
+   * the action to that resource at that version.
+   */
+  readonly versionArgument?: string;
   /** Input key that bounds the result size, if the operation has one. */
   readonly limitArgument?: string;
 }
