@@ -1,6 +1,6 @@
 # ADR-015: Approval of the exact action
 
-- **Status:** Proposed (drafted 2026-11-26 in Phase 4 step C0; the owner accepts it before step C1). The
+- **Status:** Accepted by the owner on 2026-11-26 (drafted in Phase 4 step C0, commit `faad876`). The
   owner accepted every default of decisions D1 to D15 in [docs/phase-4.md](../phase-4.md) section 5
   on 2026-11-25; this record states those decisions and what they cost. Nothing below is implemented
   except the contract types, the hash functions and the descriptor rule of step C0.

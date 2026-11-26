@@ -327,7 +327,7 @@ broken. The answers are in P4-20 to P4-22:
 - **Approvals are decided in the dashboard only.** The approval view renders no agent-supplied URL as
   a link, and no link carries a decision: a `GET` never approves or denies (P4-22).
 
-### 3.10 ADR-015: approvals (outline, not yet written)
+### 3.10 ADR-015: approvals (written in C0, accepted 2026-11-26)
 
 Drafted in step C0, accepted by the owner before C1. Sections: Context (spec §8.2, INV-9, what exists);
 Decision (the record and its states; the action hash layout and why it excludes ids created later; the
